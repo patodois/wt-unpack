@@ -61,6 +61,18 @@ enum Command {
     },
     /// Parse every DynModel and skeleton in the .grp packs of a folder and summarise failures
     Check { dir: PathBuf },
+    /// Load every tank, aircraft and ship through the rewrite-bridge provider and validate it
+    #[cfg(feature = "bridge")]
+    CheckBridge {
+        #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
+        game: PathBuf,
+        /// Only vehicles whose id contains this text
+        #[arg(long, default_value = "")]
+        filter: String,
+        /// Only print the ids
+        #[arg(long)]
+        list: bool,
+    },
     /// Print one BLK file (a loose file, or `archive.vromfs.bin:path/inside.blk`)
     Cat {
         target: String,
@@ -84,6 +96,8 @@ fn main() -> Result<()> {
         Command::Grp { pack, model } => grp_cmd(&pack, model.as_deref()),
         Command::Check { dir } => check_cmd(&dir),
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
+        #[cfg(feature = "bridge")]
+        Command::CheckBridge { game, filter, list } => check_bridge(&game, &filter, list),
     }
 }
 
@@ -302,4 +316,81 @@ fn check_cmd(dir: &Path) -> Result<()> {
         println!("{:>5}  {msg}\n       e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
     }
     Ok(())
+}
+
+/// Peak resident memory of this process so far, in bytes
+#[cfg(feature = "bridge")]
+fn peak_rss() -> u64 {
+    // Safety: getrusage only writes the struct it is given
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    let max = usage.ru_maxrss as u64;
+    // macOS reports bytes, Linux kilobytes
+    if cfg!(target_os = "macos") { max } else { max * 1024 }
+}
+
+#[cfg(feature = "bridge")]
+fn check_bridge(game: &Path, filter: &str, list_only: bool) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+    use rewrite_bridge::Provider;
+    use wt_unpack::bridge::WarThunder;
+
+    let start = Instant::now();
+    let wt = WarThunder::new(game);
+    let assets = wt.list(filter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!("{} vehicles listed in {:.1} s", assets.len(), start.elapsed().as_secs_f32());
+    if list_only {
+        for a in &assets {
+            println!("{}", a.id);
+        }
+        return Ok(());
+    }
+    // Per folder: (ok, failed); and how often each error came up, with one example
+    let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut errors: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let (mut triangles, mut nodes) = (0usize, 0usize);
+    for (i, a) in assets.iter().enumerate() {
+        let folder = a.id.split('/').next().unwrap_or("");
+        let entry = counts.entry(bridge_folder(folder)).or_default();
+        // One model at a time: each is dropped before the next loads
+        match wt.load(&a.id) {
+            Ok(model) => {
+                entry.0 += 1;
+                triangles += model.meshes.iter().map(|m| m.indices.len() / 3).sum::<usize>();
+                nodes += model.nodes.len();
+            }
+            Err(e) => {
+                entry.1 += 1;
+                eprintln!("{}: {e}", a.id);
+                // Group by message with the model's name taken out
+                let msg = e.to_string().replace(&a.name, "<model>");
+                let slot = errors.entry(msg).or_insert((0, a.id.clone()));
+                slot.0 += 1;
+            }
+        }
+        if (i + 1) % 250 == 0 {
+            eprintln!("{}/{} ({:.0} s, peak {} MB)", i + 1, assets.len(), start.elapsed().as_secs_f32(), peak_rss() >> 20);
+        }
+    }
+    let (ok, failed) = counts.values().fold((0, 0), |(o, f), c| (o + c.0, f + c.1));
+    for (folder, (o, f)) in &counts {
+        println!("{folder}: {o} ok, {f} failed");
+    }
+    for (msg, (n, example)) in &errors {
+        println!("  {n}x {msg} (e.g. {example})");
+    }
+    println!(
+        "{ok}/{} vehicles loaded and valid ({failed} failed), {triangles} LOD0 triangles, {nodes} nodes, {:.0} s, peak RSS {} MB",
+        ok + failed,
+        start.elapsed().as_secs_f32(),
+        peak_rss() >> 20
+    );
+    Ok(())
+}
+
+/// The listing's folder names, as static strings for the summary
+#[cfg(feature = "bridge")]
+fn bridge_folder(folder: &str) -> &'static str {
+    wt_unpack::bridge::FOLDERS.iter().find(|f| **f == folder).copied().unwrap_or("other")
 }

@@ -114,3 +114,53 @@ fn sherman_unit_names_its_turret_nodes_and_drive_train() {
     // The model has no unit
     assert!(tank::load(&game, "no_such_model", None).unwrap().is_none());
 }
+
+/// The Sherman through the rewrite-bridge provider: valid, facing +Z, with a turret and gun to turn
+#[cfg(feature = "bridge")]
+#[test]
+fn sherman_loads_through_the_bridge() {
+    use rewrite_bridge::{AssetKind, Provider};
+    let Some(game) = game() else { return };
+    let wt = wt_unpack::bridge::WarThunder::new(&game);
+    let listed = wt.list("m4a1_76w_sherman").unwrap();
+    let id = "tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman";
+    assert!(listed.iter().any(|a| a.id == id && a.kind == AssetKind::Vehicle), "{listed:?}");
+    // Damage and x-ray variants are not listed
+    assert!(listed.iter().all(|a| !a.id.ends_with("_dmg") && !a.id.ends_with("_xray")));
+
+    let m = wt.load(id).unwrap();
+    m.validate().unwrap();
+    // Node frames carry no rotation, so a node's place in the model is the sum of the translations
+    let mut world = vec![[0f32; 3]; m.nodes.len()];
+    for (i, n) in m.nodes.iter().enumerate() {
+        let base = n.parent.map_or([0.0; 3], |p| world[p]);
+        world[i] = [0, 1, 2].map(|k| base[k] + n.translation[k]);
+        assert_eq!((n.rotation, n.scale), ([0.0, 0.0, 0.0, 1.0], [1.0; 3]));
+    }
+    let node = |name: &str| m.nodes.iter().position(|n| n.name == name).unwrap_or_else(|| panic!("no node {name}"));
+    let (turret, gun) = (node("bone_turret"), node("bone_gun"));
+    assert_eq!(m.nodes[gun].parent, Some(turret));
+    assert!(m.meshes.iter().any(|x| x.node == turret) && m.meshes.iter().any(|x| x.node == gun));
+
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for mesh in &m.meshes {
+        let at = if mesh.skin.is_some() { [0.0; 3] } else { world[mesh.node] };
+        for p in &mesh.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k] + at[k]);
+                hi[k] = hi[k].max(p[k] + at[k]);
+            }
+        }
+    }
+    // About 7 m long along Z with the gun, about 2.7 m wide along X
+    let size: Vec<f32> = (0..3).map(|k| hi[k] - lo[k]).collect();
+    assert!((6.5..7.5).contains(&size[2]) && (2.5..3.0).contains(&size[0]), "{size:?}");
+    // The front faces +Z: the muzzle is far forward, the gun points along +Z, and the left wheels
+    // are at +X (glTF's front +Z with +Y up puts the model's left at +X)
+    assert!(world[node("emtr_gun_flame")][2] > 3.5, "{:?}", world[node("emtr_gun_flame")]);
+    assert!(world[node("emtr_gun_flame")][2] > world[gun][2] + 2.5);
+    assert!(world[node("wheel_l_01")][0] > 1.0 && world[node("wheel_r_01")][0] < -1.0);
+    // The tracks are skinned, the glass blends
+    assert_eq!(m.skins.len(), 3, "track_l, track_r and the antenna");
+    assert!(m.materials.iter().any(|x| x.name.contains("glass") && x.alpha == rewrite_bridge::AlphaMode::Blend));
+}

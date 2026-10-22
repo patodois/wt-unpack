@@ -132,6 +132,7 @@ mod tests {
             meshes: vec![Mesh {
                 material: 0,
                 node: 0,
+                skinned: false,
                 positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
                 normals: vec![[0., 0., 1.]; 3],
                 uvs: vec![[0., 0.], [1., 0.], [0., 1.]],

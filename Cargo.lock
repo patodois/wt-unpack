@@ -5014,6 +5014,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "rewrite-bridge"
+version = "0.1.0"
+
+[[package]]
 name = "rodio"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6778,8 +6782,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "md-5",
+ "memmap2",
  "png",
+ "rewrite-bridge",
  "serde_json",
  "wt_blk",
  "zstd",

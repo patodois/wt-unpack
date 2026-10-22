@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use memmap2::Mmap;
 
 use wt_blk::dxp_and_grp::{
     dynmodel::{DynModel, Elem, Lod},
@@ -53,6 +54,8 @@ pub struct Mesh {
     /// Skeleton node the mesh is attached to (an index into `Vehicle::nodes`); positions are still in
     /// model space
     pub node: usize,
+    /// A skinned mesh (tracks, cables), in its bind pose
+    pub skinned: bool,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
@@ -125,10 +128,18 @@ pub fn texture_index(game: &Path) -> Result<HashMap<String, PathBuf>> {
     Ok(index)
 }
 
-/// Decodes textures by name, preferring the high-quality copy, caching opened packs
+/// Maps a game file into memory. Packs reach 1.2 GB; mapped, only the pages actually read are loaded,
+/// and the system can drop them again under memory pressure.
+pub fn map(path: &Path) -> Result<Mmap> {
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // Safety: the game's files are not modified while we read them
+    unsafe { Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))
+}
+
+/// Decodes textures by name, preferring the high-quality copy, keeping opened packs mapped
 struct TextureSource<'a> {
     index: &'a HashMap<String, PathBuf>,
-    packs: HashMap<PathBuf, Vec<u8>>,
+    packs: HashMap<PathBuf, Mmap>,
 }
 
 impl TextureSource<'_> {
@@ -140,7 +151,7 @@ impl TextureSource<'_> {
             return Ok(None);
         };
         if !self.packs.contains_key(&path) {
-            self.packs.insert(path.clone(), fs::read(&path)?);
+            self.packs.insert(path.clone(), map(&path)?);
         }
         let pack = wt_blk::dxp_and_grp::dxp::DxpPack::parse(&self.packs[&path])?;
         let i = pack
@@ -184,18 +195,22 @@ impl MatInfo {
     }
 }
 
-/// Materials and texture names of a model, from dynModelDesc.bin (patched copy first)
-fn material_infos(game: &Path, name: &str) -> Result<Vec<MatInfo>> {
-    let mut desc = None;
+/// Material descriptions of every model, from dynModelDesc.bin (patched copy first)
+fn model_descs(game: &Path) -> Result<HashMap<String, blk::Block>> {
+    let mut descs = HashMap::new();
     for rel in ["patch/content/base/res/dynModelDesc.bin", "content/base/res/dynModelDesc.bin"] {
         let Ok(raw) = fs::read(game.join(rel)) else { continue };
         let root = blk::parse(&raw, None).with_context(|| format!("parsing {rel}"))?;
-        if let Some(b) = root.blocks.into_iter().find(|b| b.name == name) {
-            desc = Some(b);
-            break;
+        for b in root.blocks {
+            descs.entry(b.name.clone()).or_insert(b);
         }
     }
-    let desc = desc.with_context(|| format!("{name} not found in dynModelDesc.bin"))?;
+    Ok(descs)
+}
+
+/// Materials and texture names of a model
+fn material_infos(descs: &HashMap<String, blk::Block>, name: &str) -> Result<Vec<MatInfo>> {
+    let desc = descs.get(name).with_context(|| format!("{name} not found in dynModelDesc.bin"))?;
     let child = |n: &str| desc.blocks.iter().find(|b| b.name == n);
     let tex_names: Vec<String> = child("tex")
         .map(|b| {
@@ -284,6 +299,7 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
             let mesh = meshes.entry((node_index, material_base + e.material)).or_default();
             mesh.material = material_base + e.material;
             mesh.node = node_index;
+            mesh.skinned = !placed;
             let vd = &vdata[e.vdata];
             let mut remap: HashMap<u32, u32> = HashMap::new();
             for tri in vd.indices[e.first_index..e.first_index + e.triangles * 3].chunks_exact(3) {
@@ -358,8 +374,30 @@ fn split_packed_normal(img: &Image) -> (Image, Image) {
     (size(mr), size(nrm))
 }
 
+/// What loading vehicles needs from the game folder, gathered once: where each texture is, and every
+/// model's material description
+pub struct Library {
+    textures: HashMap<String, PathBuf>,
+    descs: HashMap<String, blk::Block>,
+}
+
+/// Opens the game folder and loads one vehicle; use [`Library`] to load several
 pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
-    let file = fs::read(pack).with_context(|| format!("reading {}", pack.display()))?;
+    Library::open(game)?.load(pack, name, lod)
+}
+
+impl Library {
+    pub fn open(game: &Path) -> Result<Self> {
+        Ok(Self { textures: texture_index(game)?, descs: model_descs(game)? })
+    }
+
+    pub fn load(&self, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
+        load_from(self, pack, name, lod)
+    }
+}
+
+fn load_from(library: &Library, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
+    let file = map(pack)?;
     let grp = GrpPack::parse(&file)?;
     let find = |res: &str, class: u32| {
         grp.find(res, class).map(|r| grp.data(r)).with_context(|| format!("{res} not found in {}", pack.display()))
@@ -367,7 +405,7 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
     let model = DynModel::parse(find(name, class_id::DYN_MODEL)?)?;
     let tree = GeomNodeTree::parse(find(&format!("{name}_skeleton"), class_id::GEOM_NODE_TREE)?)?;
     let lod = model.lods.get(lod).context("no such LOD")?;
-    let infos = material_infos(game, name)?;
+    let infos = material_infos(&library.descs, name)?;
     let skin_material_base = infos.iter().position(|m| m.skinned).unwrap_or(infos.len());
 
     // UV triangles of every material that needs baking, grouped by texture combination
@@ -395,8 +433,7 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
         }
     }
 
-    let index = texture_index(game)?;
-    let mut source = TextureSource { index: &index, packs: HashMap::new() };
+    let mut source = TextureSource { index: &library.textures, packs: HashMap::new() };
     let mut materials = Vec::with_capacity(infos.len());
     for info in &infos {
         let bake_key = info.bake_key();

@@ -66,6 +66,20 @@ km/h forward and 5.0 km/h reverse for the M4A1 (76) W), and the hull turns by ru
 pivoting with one track in first gear at a standstill. The wheels roll with their track, and the track
 texture runs along the static track mesh.
 
+## Bridge to other game rewrites
+
+With the `bridge` feature, `wt_unpack::bridge::WarThunder` implements the `Provider` of the
+rewrite-bridge crate (checked out next to this repository, as `../rewrite-bridge`), so other Rust game rewrites can load War Thunder's
+vehicles into their scenes. Ids look like `tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman`. Models
+follow glTF's conventions: Dagor's `(x, y, z)` becomes `(z, y, x)`, so vehicles face +Z. The turret,
+gun and wheels stay separate nodes, turning about their pivots in the vehicle's axes. Tracks are skins
+bound wholly to their own node, and glass blends.
+
+```sh
+cargo build --release --features bridge
+wt-unpack check-bridge              # load and validate every tank, aircraft and ship
+```
+
 ## How it works
 
 - The vromfs and BLK readers in `src/` are written from the open-source

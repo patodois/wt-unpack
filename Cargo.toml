@@ -16,6 +16,13 @@ zstd = "0.13"
 # switch to crates.io once they are released
 wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "c7fd584a73384f8de70c76b6a5635f47f42986dc", features = ["png"] }
 png = "0.18.1"
+memmap2 = "0.9"
+# The bridge to other game rewrites (see src/bridge.rs), and the peak memory report of `check-bridge`
+rewrite-bridge = { path = "../rewrite-bridge", optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+bridge = ["dep:rewrite-bridge", "dep:libc"]
 
 [workspace]
 members = ["viewer"]

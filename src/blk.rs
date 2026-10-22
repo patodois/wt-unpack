@@ -18,6 +18,7 @@
 //! finally varint-packed block descriptors in breadth-first order.
 
 use std::fmt::Write as _;
+use std::io::Read as _;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{Map, Value as Json};
@@ -99,9 +100,9 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
         5 => {
             let ctx = need_shared()?;
             let dict = ctx.dict.as_deref().context("this BLK needs the archive's zstd dictionary")?;
-            let mut dec = zstd::bulk::Decompressor::with_dictionary(dict)?;
-            let packed = r.rest();
-            let raw = dec.decompress(packed, packed.len().max(1 << 16) * 64)?;
+            // Stream it: the unpacked size is not stored and the ratio has no upper bound
+            let mut raw = Vec::new();
+            zstd::stream::read::Decoder::with_dictionary(r.rest(), dict)?.read_to_end(&mut raw)?;
             parse_dump(&mut Reader::new(&raw), &ctx.names, false)
         }
         other => bail!("not a binary BLK (format byte {other:#04x})"),
@@ -444,6 +445,36 @@ mod tests {
         assert_eq!(root.blocks[0].name, "engine");
         assert_eq!(root.blocks[0].params, vec![("name".into(), Value::Str("V12".into()))]);
         assert_eq!(root.to_text(), "speed:r=1.5\nengine{\n  name:t=\"V12\"\n}\n");
+    }
+
+    /// Format 5 (shared name map, zstd with dictionary) whose dump unpacks to far more than 64x
+    /// its packed size: one string param holding 5 MB of the same byte.
+    #[test]
+    fn parses_highly_compressed_dict_blk() {
+        let value = vec![b'a'; 5 << 20];
+        let mut dump = vec![1u8, 2, b'v', 0]; // own names: "v"
+        dump.extend_from_slice(&[1, 1]); // 1 block, 1 param
+        let mut size = value.len() as u32 + 1; // complex data: the string and its NUL
+        while size >= 0x80 {
+            dump.push(size as u8 | 0x80);
+            size >>= 7;
+        }
+        dump.push(size as u8);
+        dump.extend_from_slice(&value);
+        dump.push(0);
+        dump.extend_from_slice(&(1u32 << 24).to_le_bytes()); // name 0, type string
+        dump.extend_from_slice(&0u32.to_le_bytes()); // offset 0 in complex data
+        dump.extend_from_slice(&[0, 1, 0]); // root: 1 param, no blocks
+
+        let dict = b"a dictionary made of plain bytes, used as raw content".repeat(4);
+        let packed = zstd::bulk::Compressor::with_dictionary(19, &dict).unwrap().compress(&dump).unwrap();
+        assert!(packed.len() * 64 < dump.len());
+        let mut file = vec![5u8];
+        file.extend_from_slice(&packed);
+
+        let ctx = SharedContext { names: Vec::new(), dict: Some(dict) };
+        let root = parse(&file, Some(&ctx)).unwrap();
+        assert_eq!(root.params, vec![("v".into(), Value::Str("a".repeat(5 << 20)))]);
     }
 
     #[test]

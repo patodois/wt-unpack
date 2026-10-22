@@ -61,6 +61,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         lod: usize,
     },
+    /// Parse every DynModel and skeleton in the .grp packs of a folder and summarise failures
+    Check { dir: PathBuf },
     /// Print one BLK file (a loose file, or `archive.vromfs.bin:path/inside.blk`)
     Cat {
         target: String,
@@ -82,6 +84,7 @@ fn main() -> Result<()> {
         Command::Extract { archive, out, blk, filter } => extract(&archive, &out, blk, filter.as_deref()),
         Command::Cat { target, blk } => cat(&target, blk),
         Command::Grp { pack, model } => grp_cmd(&pack, model.as_deref()),
+        Command::Check { dir } => check_cmd(&dir),
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
     }
 }
@@ -417,4 +420,51 @@ fn apply_camo(base: &mut [u8], camo: &[u8], opaque: bool) {
             p[3] = 255;
         }
     }
+}
+
+fn check_cmd(dir: &Path) -> Result<()> {
+    let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let (mut models, mut ok, mut skeletons, mut tris) = (0, 0, 0, 0usize);
+    let mut paths: Vec<_> = fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "grp")).collect();
+    paths.sort();
+    for path in paths {
+        let file = fs::read(&path)?;
+        let entries = match grp::parse(&file) {
+            Ok(e) => e,
+            Err(e) => {
+                errors.entry(format!("grp: {e:#}")).or_default().push(path.display().to_string());
+                continue;
+            }
+        };
+        for e in &entries {
+            let data = &file[e.offset..e.offset + e.size];
+            let result = match e.class_id {
+                grp::DYN_MODEL => {
+                    models += 1;
+                    dynmodel::DynModel::parse(data).map(|m| {
+                        tris += m.lods[0].rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum::<usize>();
+                    })
+                }
+                grp::GEOM_NODE_TREE => {
+                    skeletons += 1;
+                    dynmodel::parse_skeleton(data).map(|_| ())
+                }
+                _ => continue,
+            };
+            match result {
+                Ok(()) if e.class_id == grp::DYN_MODEL => ok += 1,
+                Ok(()) => {}
+                Err(err) => {
+                    // Group by message without numbers so similar failures land together
+                    let key: String = format!("{err:#}").chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+                    errors.entry(key).or_default().push(format!("{}:{}", path.file_name().unwrap().to_string_lossy(), e.name));
+                }
+            }
+        }
+    }
+    println!("{ok}/{models} DynModels parsed ({tris} LOD0 rigid triangles), {skeletons} skeletons");
+    for (msg, list) in &errors {
+        println!("{:>5}  {msg}\n       e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+    }
+    Ok(())
 }

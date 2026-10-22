@@ -119,6 +119,31 @@ fn f32_at(b: &[u8], ofs: usize) -> f32 {
     f32::from_le_bytes(b[ofs..ofs + 4].try_into().unwrap())
 }
 
+/// Reads a ShaderMatVdata block whose header size word also encodes the compression
+/// (`ShaderMatVdata::loadMatVdata`): top bits 0b110 zstd/Oodle block, 0 stored, negative zlib, bit 30 lzma
+fn read_mat_vdata(r: &mut Reader, hdr_word: u32) -> Result<Vec<VData>> {
+    if hdr_word & 0xE000_0000 == 0xC000_0000 {
+        let vd = unpack_block(read_block(r)?)?;
+        return read_vdata(&vd, (hdr_word & !0xC000_0000) as usize);
+    }
+    ensure!(hdr_word & 0xC000_0000 == 0, "zlib/lzma packed vertex data is not handled yet");
+    // Stored: header, then each vdata's vertices and indices; the header tells the payload size
+    let hdr_size = hdr_word as usize;
+    let header = r.bytes(hdr_size)?;
+    let mut h = Reader::at(header, 16)?;
+    let (tab_ofs, count) = (h.u32()? as usize, h.u32()? as usize);
+    let mut payload = 0;
+    for i in 0..count {
+        let mut e = Reader::at(header, tab_ofs + i * 32)?;
+        let (vert_num, w1, w2, flags) = (e.u32()? as usize, e.u32()?, e.u32()?, e.u32()?);
+        let idx = if flags & VDATA_PACKED_IB != 0 { ((w1 >> 8) | ((w2 >> 28) << 24)) as usize } else { (w2 & 0x0FFF_FFFF) as usize };
+        payload += vert_num * (w1 & 0xFF) as usize + idx;
+    }
+    let mut all = header.to_vec();
+    all.extend_from_slice(r.bytes(payload)?);
+    read_vdata(&all, hdr_size)
+}
+
 fn read_vdata(vd: &[u8], payload_start: usize) -> Result<Vec<VData>> {
     let mut h = Reader::new(vd);
     h.skip(16)?; // material table, empty when materials come from dynModelDesc.bin
@@ -201,9 +226,7 @@ impl DynModel {
         let lods_dump_size = r.u32()? as usize;
         let (tex_count, _mat_count, _vdata_count, hdr_size) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
         ensure!(tex_count == 0xFFFF_FFFF, "models with embedded materials are not handled yet");
-        ensure!(hdr_size & 0xE000_0000 == 0xC000_0000, "uncompressed vertex data is not handled yet");
-        let vd = unpack_block(read_block(&mut r)?)?;
-        let vdata = read_vdata(&vd, (hdr_size & !0xC000_0000) as usize)?;
+        let vdata = read_mat_vdata(&mut r, hdr_size)?;
 
         let lods_dump = r.bytes(lods_dump_size)?;
         let pos_offset = [f32_at(lods_dump, 0x28), f32_at(lods_dump, 0x2C), f32_at(lods_dump, 0x30)];
@@ -339,9 +362,7 @@ fn read_skins(r: &mut Reader, lods: &mut [Lod], counts: &[usize], node_names: &[
 
     let (tex_count, _mat_count, _vdata_count, hdr_size) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
     ensure!(tex_count == 0xFFFF_FFFF, "skins with embedded materials are not handled yet");
-    ensure!(hdr_size & 0xE000_0000 == 0xC000_0000, "uncompressed skin vertex data is not handled yet");
-    let vd = unpack_block(read_block(r)?)?;
-    let vdata = read_vdata(&vd, (hdr_size & !0xC000_0000) as usize)?;
+    let vdata = read_mat_vdata(r, hdr_size)?;
 
     let end = section + 8 + total;
     let zipped = r.bytes(end.checked_sub(r.pos()).context("skin section overrun")?)?;

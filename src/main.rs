@@ -67,6 +67,25 @@ enum Command {
         #[arg(long, value_enum, default_value_t = BlkFormat::Text)]
         blk: BlkFormat,
     },
+    /// Follow a running game through its read-only telemetry API on localhost:8111 (needs the `live`
+    /// feature)
+    Live {
+        /// Server to poll
+        #[arg(long, default_value = wt_unpack::live::DEFAULT_URL)]
+        url: String,
+        /// Polls per second during a match
+        #[arg(long, default_value_t = 5.0)]
+        hz: f64,
+        /// Also append one JSON line per poll to this file
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Serve a built-in demo (a tank driving a circle) on a local port and poll that instead
+        #[arg(long)]
+        mock: bool,
+        /// Stop after this many polls
+        #[arg(long)]
+        count: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -84,6 +103,7 @@ fn main() -> Result<()> {
         Command::Grp { pack, model } => grp_cmd(&pack, model.as_deref()),
         Command::Check { dir } => check_cmd(&dir),
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
+        Command::Live { url, hz, log, mock, count } => live_cmd(&url, hz, log.as_deref(), mock, count),
     }
 }
 
@@ -300,6 +320,61 @@ fn check_cmd(dir: &Path) -> Result<()> {
     println!("{ok}/{models} DynModels parsed ({tris} LOD0 rigid triangles), {skeletons} skeletons, index checksum {index_sum}");
     for (msg, list) in &errors {
         println!("{:>5}  {msg}\n       e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "live"))]
+fn live_cmd(_url: &str, _hz: f64, _log: Option<&Path>, _mock: bool, _count: Option<usize>) -> Result<()> {
+    anyhow::bail!("built without live telemetry; rebuild with `--features live`")
+}
+
+#[cfg(feature = "live")]
+fn live_cmd(url: &str, hz: f64, log: Option<&Path>, mock: bool, count: Option<usize>) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    use std::time::{Duration, Instant};
+    use wt_unpack::live::{mock::MockServer, Client, Poller, Status};
+
+    let server = mock.then(|| MockServer::start(wt_unpack::live::mock::driving_demo())).transpose()?;
+    let url = server.as_ref().map_or_else(|| url.to_string(), MockServer::url);
+    if server.is_some() {
+        eprintln!("mock server on {url}");
+    }
+    let mut log = match log {
+        Some(p) => Some(std::io::BufWriter::new(
+            fs::OpenOptions::new().create(true).append(true).open(p).with_context(|| format!("opening {}", p.display()))?,
+        )),
+        None => None,
+    };
+    // On a terminal the vehicle line rewrites itself; piped output gets one line per poll
+    let tty = std::io::stdout().is_terminal();
+    let poller = Poller::new(Client::new(&url, Duration::from_millis(500)), hz);
+    let (start, mut last_status) = (Instant::now(), None);
+    let mut out = std::io::stdout().lock();
+    for snap in poller.take(count.unwrap_or(usize::MAX)) {
+        if let Some(log) = &mut log {
+            serde_json::to_writer(&mut *log, &snap.to_log_json(start.elapsed().as_secs_f64()))?;
+            log.write_all(b"\n")?;
+            log.flush()?;
+        }
+        let changed = last_status != Some(snap.status);
+        if changed && tty && last_status == Some(Status::InMatch) {
+            writeln!(out)?;
+        }
+        last_status = Some(snap.status);
+        match snap.player() {
+            Some(p) if tty => write!(out, "\r{:<100}", p.line())?,
+            Some(p) => writeln!(out, "{}", p.line())?,
+            None if changed => match snap.status {
+                Status::GameNotRunning => writeln!(out, "waiting for the game on {url} (not running)")?,
+                _ => writeln!(out, "game is running, not in a match; start a test drive or a battle")?,
+            },
+            None => {}
+        }
+        out.flush()?;
+    }
+    if tty && last_status == Some(Status::InMatch) {
+        writeln!(out)?;
     }
     Ok(())
 }

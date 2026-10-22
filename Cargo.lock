@@ -2842,15 +2842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "float-cmp"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3925,18 +3916,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "meshopt"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a403c16e3ca5752600e1d4c5ba3ba2a6496f407ded66e767f05279514363f461"
-dependencies = [
- "bitflags 2.13.2",
- "cc",
- "float-cmp",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -6799,10 +6778,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "flate2",
  "md-5",
- "meshopt",
- "oozextract",
  "png",
  "serde_json",
  "wt_blk",
@@ -6821,6 +6797,7 @@ dependencies = [
 [[package]]
 name = "wt_blk"
 version = "0.3.1"
+source = "git+https://github.com/patodois/wt_blk?rev=0c1c59fa14d11648a3e8a7da4a57efb9c69611e4#0c1c59fa14d11648a3e8a7da4a57efb9c69611e4"
 dependencies = [
  "cfg-if",
  "color-eyre",

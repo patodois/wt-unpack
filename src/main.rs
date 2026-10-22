@@ -7,7 +7,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use wt_unpack::blk::SharedContext;
 use wt_unpack::vromfs::Vromfs;
-use wt_unpack::{blk, dynmodel, gltf, grp, vehicle, vromfs};
+use wt_blk::dxp_and_grp::{
+    dynmodel::DynModel,
+    geom_node_tree::GeomNodeTree,
+    grp_pack::{class_id, GrpPack},
+};
+use wt_unpack::{blk, gltf, vehicle, vromfs};
 
 #[derive(Parser)]
 #[command(version, about = "Read Dagor Engine vromfs archives and binary BLK files")]
@@ -183,64 +188,38 @@ fn cat(target: &str, format: BlkFormat) -> Result<()> {
 
 fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
     let file = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let entries = grp::parse(&file)?;
+    let pack = GrpPack::parse(&file)?;
     let Some(model) = model else {
-        for e in &entries {
-            println!("{:08X} {:>10} {:>10}  {}", e.class_id, e.offset, e.size, e.name);
+        for r in &pack.resources {
+            println!("{:08X} {:>10}  {}", r.class_id, pack.data(r).len(), r.name);
         }
         return Ok(());
     };
-    let e = entries
-        .iter()
-        .find(|e| e.name == model && e.class_id == grp::DYN_MODEL)
-        .with_context(|| format!("no DynModel named {model}"))?;
-    let dm = dynmodel::DynModel::parse(&file[e.offset..e.offset + e.size])?;
-    for (i, vd) in dm.vdata.iter().enumerate() {
-        let n = vd.vertices.len() / vd.stride;
-        let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
-        for v in 0..n {
-            let vx = dm.vertex(i, v);
-            let uv = [vx.uv[0], vx.uv[1], vx.uv1[0], vx.uv1[1]];
-            for k in 0..4 {
-                lo[k] = lo[k].min(uv[k]);
-                hi[k] = hi[k].max(uv[k]);
+    let res = pack.find(model, class_id::DYN_MODEL).with_context(|| format!("no DynModel named {model}"))?;
+    let dm = DynModel::parse(pack.data(res))?;
+    for (label, list) in [("vdata", &dm.vdata), ("skin vdata", &dm.skin_vdata)] {
+        for (i, vd) in list.iter().enumerate() {
+            let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
+            for v in 0..vd.vertex_count() {
+                let vx = dm.vertex(vd, v)?;
+                for (k, x) in [vx.uv[0], vx.uv[1], vx.uv1[0], vx.uv1[1]].into_iter().enumerate() {
+                    lo[k] = lo[k].min(x);
+                    hi[k] = hi[k].max(x);
+                }
             }
+            let decl: Vec<String> = vd.channels.iter().map(|c| format!("t{} u{}.{}", c.ty, c.usage, c.index)).collect();
+            println!(
+                "{label} {i}: {} verts x {}, {} indices, uv0+uv1 {lo:?}..{hi:?}, channels {}",
+                vd.vertex_count(),
+                vd.stride,
+                vd.indices.len(),
+                decl.join(", ")
+            );
         }
-        let max_idx = vd.indices.iter().max().copied().unwrap_or(0);
-        println!("vdata {i}: {n} verts, {} indices (max {max_idx}), raw uv0+uv1 {lo:?}..{hi:?}", vd.indices.len());
-    }
-    for (i, vd) in dm.skin_vdata.iter().enumerate() {
-        let decl: Vec<String> = vd.channels.iter().map(|c| format!("t{} u{}.{}", c.ty, c.usage, c.index)).collect();
-        println!("skin vdata {i}: {} verts x {}, {} indices: {}", vd.vertices.len() / vd.stride, vd.stride, vd.indices.len(), decl.join(", "));
     }
     for (l, lod) in dm.lods.iter().enumerate() {
         let tris: usize = lod.rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum();
-        println!("lod {l}: range {} m, {} rigids, {tris} triangles", lod.range, lod.rigids.len());
-        for s in &lod.skins {
-            println!("  skin on node {}: {:?}", s.node, s.elems);
-        }
-        if l == 0 && std::env::var_os("WT_PARTS").is_some() {
-            for r in &lod.rigids {
-                let mats: Vec<String> = r
-                    .elems
-                    .iter()
-                    .map(|e| {
-                        let vd = &dm.vdata[e.vdata];
-                        let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
-                        for &i in &vd.indices[e.first_index..e.first_index + e.triangles * 3] {
-                            let v = dm.vertex(e.vdata, i as usize + e.base_vertex);
-                            for (k, x) in [v.uv[0], v.uv[1], v.uv1[0], v.uv1[1]].into_iter().enumerate() {
-                                lo[k] = lo[k].min(x / 4096.0);
-                                hi[k] = hi[k].max(x / 4096.0);
-                            }
-                        }
-                        let r2 = |a: [f32; 4]| a.map(|x| (x * 100.0).round() / 100.0);
-                        format!("m{}x{} uv1? {} uv {:?}..{:?}", e.material, e.triangles, vd.has_uv1(), r2(lo), r2(hi))
-                    })
-                    .collect();
-                println!("  part {}: {}", r.node, mats.join(" | "));
-            }
-        }
+        println!("lod {l}: range {} m, {} rigids, {} skins, {tris} rigid triangles", lod.range, lod.rigids.len(), lod.skins.len());
     }
     Ok(())
 }
@@ -260,20 +239,20 @@ fn check_cmd(dir: &Path) -> Result<()> {
     paths.sort();
     for path in paths {
         let file = fs::read(&path)?;
-        let entries = match grp::parse(&file) {
-            Ok(e) => e,
+        let pack = match GrpPack::parse(&file) {
+            Ok(p) => p,
             Err(e) => {
-                errors.entry(format!("grp: {e:#}")).or_default().push(path.display().to_string());
+                errors.entry(format!("grp: {e}")).or_default().push(path.display().to_string());
                 continue;
             }
         };
-        for e in &entries {
-            let data = &file[e.offset..e.offset + e.size];
-            let result = match e.class_id {
-                grp::DYN_MODEL => {
+        for r in &pack.resources {
+            let data = pack.data(r);
+            let result = match r.class_id {
+                class_id::DYN_MODEL => {
                     models += 1;
-                    dynmodel::DynModel::parse(data).map(|m| {
-                        tris += m.lods[0].rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum::<usize>();
+                    DynModel::parse(data).map(|m| {
+                        tris += m.lods.first().map_or(0, |l| l.rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum::<usize>());
                         for vd in m.vdata.iter().chain(&m.skin_vdata) {
                             for &i in &vd.indices {
                                 index_sum = index_sum.wrapping_add(u64::from(i));
@@ -281,19 +260,19 @@ fn check_cmd(dir: &Path) -> Result<()> {
                         }
                     })
                 }
-                grp::GEOM_NODE_TREE => {
+                class_id::GEOM_NODE_TREE => {
                     skeletons += 1;
-                    dynmodel::parse_skeleton(data).map(|_| ())
+                    GeomNodeTree::parse(data).map(|_| ())
                 }
                 _ => continue,
             };
             match result {
-                Ok(()) if e.class_id == grp::DYN_MODEL => ok += 1,
+                Ok(()) if r.class_id == class_id::DYN_MODEL => ok += 1,
                 Ok(()) => {}
                 Err(err) => {
                     // Group by message without numbers so similar failures land together
-                    let key: String = format!("{err:#}").chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
-                    errors.entry(key).or_default().push(format!("{}:{}", path.file_name().unwrap().to_string_lossy(), e.name));
+                    let key: String = err.to_string().chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+                    errors.entry(key).or_default().push(format!("{}:{}", path.file_name().unwrap().to_string_lossy(), r.name));
                 }
             }
         }

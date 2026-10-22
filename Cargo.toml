@@ -10,13 +10,11 @@ readme = "README.md"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 md-5 = "0.10"
-meshopt = "0.7.0"
-oozextract = "0.5.5"
 serde_json = { version = "1", features = ["preserve_order"] }
 zstd = "0.13"
-# Texture decoding from the wt_blk PR (Warthunder-Open-Source-Foundation/wt_blk#28); switch to git/crates.io once merged
-wt_blk = { path = "../wt-contrib/wt_blk", features = ["png"] }
-flate2 = "1.1.10"
+# Texture and model readers from Warthunder-Open-Source-Foundation/wt_blk#28 and #29 (fork branch);
+# switch to crates.io once they are released
+wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "0c1c59fa14d11648a3e8a7da4a57efb9c69611e4", features = ["png"] }
 png = "0.18.1"
 
 [workspace]

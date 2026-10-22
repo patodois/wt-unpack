@@ -11,7 +11,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::{blk, bytes, camo, dynmodel, grp};
+use wt_blk::dxp_and_grp::{
+    dynmodel::{DynModel, Elem, Lod},
+    geom_node_tree::GeomNodeTree,
+    grp_pack::{class_id, GrpPack},
+};
+
+use crate::{blk, bytes, camo};
 
 pub struct Image {
     pub width: u32,
@@ -237,8 +243,8 @@ fn right_handed(p: [f32; 3]) -> [f32; 3] {
 
 /// Builds one mesh per material. `skin_material_base` is where matS materials start.
 fn build_meshes(
-    model: &dynmodel::DynModel,
-    lod: &dynmodel::Lod,
+    model: &DynModel,
+    lod: &Lod,
     nodes: &HashMap<String, [f32; 16]>,
     skin_material_base: usize,
 ) -> Vec<Mesh> {
@@ -274,10 +280,11 @@ fn build_meshes(
                     let src = i + e.base_vertex as u32;
                     let next = mesh.positions.len() as u32;
                     let dst = *remap.entry(src).or_insert_with(|| {
-                        let v = model.vertex_in(vd, src as usize);
+                        // Elements are validated by DynModel::parse, so indices are in range
+                        let v = model.vertex(vd, src as usize).unwrap_or_default();
                         mesh.positions.push(right_handed(transform(tm, v.pos, 1.0)));
                         mesh.normals.push(right_handed(normalize(transform(tm, v.normal, 0.0))));
-                        mesh.uvs.push(v.uv.map(|x| x / 4096.0));
+                        mesh.uvs.push(v.uv);
                         next
                     });
                     mesh.indices.push(dst);
@@ -312,16 +319,13 @@ fn split_packed_normal(img: &Image) -> (Image, Image) {
 
 pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
     let file = fs::read(pack).with_context(|| format!("reading {}", pack.display()))?;
-    let entries = grp::parse(&file)?;
+    let grp = GrpPack::parse(&file)?;
     let find = |res: &str, class: u32| {
-        entries
-            .iter()
-            .find(|e| e.name == res && e.class_id == class)
-            .map(|e| &file[e.offset..e.offset + e.size])
-            .with_context(|| format!("{res} not found in {}", pack.display()))
+        grp.find(res, class).map(|r| grp.data(r)).with_context(|| format!("{res} not found in {}", pack.display()))
     };
-    let model = dynmodel::DynModel::parse(find(name, grp::DYN_MODEL)?)?;
-    let nodes = dynmodel::parse_skeleton(find(&format!("{name}_skeleton"), grp::GEOM_NODE_TREE)?)?;
+    let model = DynModel::parse(find(name, class_id::DYN_MODEL)?)?;
+    let tree = GeomNodeTree::parse(find(&format!("{name}_skeleton"), class_id::GEOM_NODE_TREE)?)?;
+    let nodes: HashMap<String, [f32; 16]> = tree.nodes.into_iter().map(|n| (n.name, n.wtm)).collect();
     let lod = model.lods.get(lod).context("no such LOD")?;
     let infos = material_infos(game, name)?;
     let skin_material_base = infos.iter().position(|m| m.skinned).unwrap_or(infos.len());
@@ -331,7 +335,7 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
     for info in &infos {
         let Some(key) = info.bake_key() else { continue };
         let tris = bake_tris.entry(key).or_default();
-        let (elems, vdata): (Vec<&dynmodel::Elem>, _) = if info.skinned {
+        let (elems, vdata): (Vec<&Elem>, _) = if info.skinned {
             (lod.skins.iter().flat_map(|s| &s.elems).collect(), &model.skin_vdata)
         } else {
             (lod.rigids.iter().flat_map(|r| &r.elems).collect(), &model.vdata)
@@ -344,8 +348,8 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
             }
             for t in vd.indices[e.first_index..e.first_index + e.triangles * 3].chunks_exact(3) {
                 tris.push([0, 1, 2].map(|k| {
-                    let v = model.vertex_in(vd, t[k] as usize + e.base_vertex);
-                    [v.uv[0], v.uv[1], v.uv1[0], v.uv1[1]].map(|x| x / 4096.0)
+                    let v = model.vertex(vd, t[k] as usize + e.base_vertex).unwrap_or_default();
+                    [v.uv[0], v.uv[1], v.uv1[0], v.uv1[1]]
                 }));
             }
         }

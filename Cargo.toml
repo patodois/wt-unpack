@@ -30,3 +30,8 @@ debug = false
 
 [profile.dev]
 debug = "line-tables-only"
+
+# oozextract 0.5.5 on crates.io lacks the fix for valid streams it rejected (lvlvllvlvllvlvl/oozextract#3);
+# use the fixed revision until a release is out (lvlvllvlvllvlvl/oozextract#5)
+[patch.crates-io]
+oozextract = { git = "https://github.com/lvlvllvlvllvlvl/oozextract", rev = "71ca5f5" }

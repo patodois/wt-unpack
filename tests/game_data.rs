@@ -51,9 +51,9 @@ fn sherman_assembles_and_exports() {
     let pack = game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp");
     let v = vehicle::load(&game, &pack, "m4a1_76w_sherman", 0).unwrap();
 
-    // 126,420 rigid triangles plus 5,272 in the tracks and the flexible antenna
+    // 126,900 rigid triangles (480 of them glass) plus 5,272 in the tracks and the flexible antenna
     let triangles: usize = v.meshes.iter().map(|m| m.indices.len() / 3).sum();
-    assert_eq!(triangles, 131_692);
+    assert_eq!(triangles, 132_172);
     assert_eq!(v.materials.len(), 20);
     for m in &v.meshes {
         assert_eq!(m.positions.len(), m.normals.len());

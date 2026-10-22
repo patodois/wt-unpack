@@ -14,7 +14,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 zstd = "0.13"
 # Texture and model readers from Warthunder-Open-Source-Foundation/wt_blk#28 and #29 (fork branch);
 # switch to crates.io once they are released
-wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "0c1c59fa14d11648a3e8a7da4a57efb9c69611e4", features = ["png"] }
+wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "c7fd584a73384f8de70c76b6a5635f47f42986dc", features = ["png"] }
 png = "0.18.1"
 
 [workspace]

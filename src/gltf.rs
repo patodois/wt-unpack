@@ -1,4 +1,4 @@
-//! Minimal glTF 2.0 writer for a [`Vehicle`]: one mesh primitive per material, PNG textures next to
+//! Minimal glTF 2.0 writer for a [`Vehicle`]: one mesh primitive per node and material, PNG textures next to
 //! the `.gltf`.
 
 use std::fs;
@@ -122,7 +122,7 @@ pub fn write(vehicle: &Vehicle, out_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vehicle::{Material, Mesh};
+    use crate::vehicle::{Material, Mesh, Node};
 
     #[test]
     fn writes_a_consistent_document() {
@@ -131,6 +131,7 @@ mod tests {
             name: "box".into(),
             meshes: vec![Mesh {
                 material: 0,
+                node: 0,
                 positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
                 normals: vec![[0., 0., 1.]; 3],
                 uvs: vec![[0., 0.], [1., 0.], [0., 1.]],
@@ -146,6 +147,7 @@ mod tests {
                 color_key: Some("paint_c".into()),
                 pbr_key: None,
             }],
+            nodes: vec![Node { name: String::new(), parent: None, pivot: [0.0; 3] }],
         };
         let out = std::env::temp_dir().join(format!("wt-unpack-gltf-test-{}", std::process::id()));
         write(&vehicle, &out).unwrap();

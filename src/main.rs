@@ -221,6 +221,26 @@ fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
         let tris: usize = lod.rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum();
         println!("lod {l}: range {} m, {} rigids, {} skins, {tris} rigid triangles", lod.range, lod.rigids.len(), lod.skins.len());
     }
+    // The skeleton: each node with its parent, model-space position and the LOD0 parts it carries
+    if let Some(res) = pack.find(&format!("{model}_skeleton"), class_id::GEOM_NODE_TREE) {
+        let tree = GeomNodeTree::parse(pack.data(res))?;
+        let lod0 = dm.lods.first();
+        for (i, n) in tree.nodes.iter().enumerate() {
+            let parts = lod0.map_or(0, |l| l.rigids.iter().filter(|r| r.node == n.name).count());
+            let parent = n.parent.map_or("-".to_string(), |p| tree.nodes[p].name.clone());
+            let [x, y, z] = [n.wtm[12], n.wtm[13], n.wtm[14]];
+            // Most nodes are axis-aligned; show the axes of those that are not
+            let m = &n.wtm;
+            let identity = [0, 1, 2].iter().all(|&c| (0..3).all(|r| (m[c * 4 + r] - f32::from(u8::from(r == c))).abs() < 1e-4));
+            let axes = if identity {
+                String::new()
+            } else {
+                let axis = |c: usize| format!("[{:.3}, {:.3}, {:.3}]", m[c * 4], m[c * 4 + 1], m[c * 4 + 2]);
+                format!(", axes x {} y {} z {}", axis(0), axis(1), axis(2))
+            };
+            println!("node {i} {} (parent {parent}) at [{x:.3}, {y:.3}, {z:.3}], {parts} rigids{axes}", n.name);
+        }
+    }
     Ok(())
 }
 

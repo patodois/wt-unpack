@@ -50,17 +50,32 @@ pub struct Material {
 #[derive(Default)]
 pub struct Mesh {
     pub material: usize,
+    /// Skeleton node the mesh is attached to (an index into `Vehicle::nodes`); positions are still in
+    /// model space
+    pub node: usize,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
 }
 
+/// A skeleton node. Only its origin is kept: the axes of Dagor's nodes vary (many are mirrored), and
+/// animating a part only needs the point it turns about.
+pub struct Node {
+    pub name: String,
+    /// Parent node; parents come before their children
+    pub parent: Option<usize>,
+    /// Origin in model space
+    pub pivot: [f32; 3],
+}
+
 pub struct Vehicle {
     pub name: String,
-    /// One mesh per material
+    /// One mesh per node and material
     pub meshes: Vec<Mesh>,
     pub materials: Vec<Material>,
+    /// The skeleton; node 0 is the model origin
+    pub nodes: Vec<Node>,
 }
 
 /// Texture name (without anything from the `*` on) -> pack holding a non-empty copy of it
@@ -241,15 +256,11 @@ fn right_handed(p: [f32; 3]) -> [f32; 3] {
     [p[0], p[1], -p[2]]
 }
 
-/// Builds one mesh per material. `skin_material_base` is where matS materials start.
-fn build_meshes(
-    model: &DynModel,
-    lod: &Lod,
-    nodes: &HashMap<String, [f32; 16]>,
-    skin_material_base: usize,
-) -> Vec<Mesh> {
+/// Builds one mesh per node and material. `skin_material_base` is where matS materials start.
+fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_base: usize) -> Vec<Mesh> {
     const IDENTITY: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
-    let mut meshes: HashMap<usize, Mesh> = HashMap::new();
+    let index: HashMap<&str, usize> = tree.nodes.iter().enumerate().map(|(i, n)| (n.name.as_str(), i)).collect();
+    let mut meshes: HashMap<(usize, usize), Mesh> = HashMap::new();
     let mut missing_nodes = Vec::new();
     // Rigid parts are placed by their skeleton node; skinned meshes are stored in bind pose, in model space
     let parts = lod
@@ -258,20 +269,21 @@ fn build_meshes(
         .map(|r| (r.node.as_str(), &r.elems, &model.vdata, 0, true))
         .chain(lod.skins.iter().map(|s| (s.node.as_str(), &s.elems, &model.skin_vdata, skin_material_base, false)));
     for (node, elems, vdata, material_base, placed) in parts {
-        let tm = if !placed {
-            &IDENTITY
-        } else {
-            // "@root" is the model origin
-            nodes.get(node).unwrap_or_else(|| {
+        // "@root" is the model origin; parts without a node go there too
+        let (node_index, wtm) = match index.get(node) {
+            Some(&i) => (i, &tree.nodes[i].wtm),
+            None => {
                 if node != "@root" {
                     missing_nodes.push(node);
                 }
-                &IDENTITY
-            })
+                (0, &IDENTITY)
+            }
         };
+        let tm = if placed { wtm } else { &IDENTITY };
         for e in elems {
-            let mesh = meshes.entry(material_base + e.material).or_default();
+            let mesh = meshes.entry((node_index, material_base + e.material)).or_default();
             mesh.material = material_base + e.material;
+            mesh.node = node_index;
             let vd = &vdata[e.vdata];
             let mut remap: HashMap<u32, u32> = HashMap::new();
             for tri in vd.indices[e.first_index..e.first_index + e.triangles * 3].chunks_exact(3) {
@@ -296,8 +308,37 @@ fn build_meshes(
         eprintln!("warning: parts without a skeleton node, left untransformed: {missing_nodes:?}");
     }
     let mut out: Vec<Mesh> = meshes.into_values().collect();
-    out.sort_by_key(|m| m.material);
+    out.sort_by_key(|m| (m.material, m.node));
     out
+}
+
+/// How fast a track's texture runs along the track: the change in V per metre on the bottom run, which
+/// lies flat on the ground. None when the mesh has no bottom run to measure.
+///
+/// Track meshes are mapped with U across the track and V along it; V wraps once or more around the
+/// loop, so edges that cross a texture seam give outliers, which the median ignores.
+pub fn track_v_per_metre(mesh: &Mesh) -> Option<f32> {
+    let low = mesh.positions.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+    let on_bottom = |i: u32| mesh.positions[i as usize][1] < low + 0.05;
+    let mut slopes = Vec::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            if !on_bottom(a) || !on_bottom(b) {
+                continue;
+            }
+            let (a, b) = (a as usize, b as usize);
+            let dx = mesh.positions[b][0] - mesh.positions[a][0];
+            // Edges across the track say nothing about V along it
+            if dx.abs() > 0.02 {
+                slopes.push((mesh.uvs[b][1] - mesh.uvs[a][1]) / dx);
+            }
+        }
+    }
+    if slopes.is_empty() {
+        return None;
+    }
+    slopes.sort_by(f32::total_cmp);
+    Some(slopes[slopes.len() / 2])
 }
 
 /// Dagor packs the normal in A/G, smoothness in R and metalness in B (see `unpack_ag_normal`)
@@ -325,7 +366,6 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
     };
     let model = DynModel::parse(find(name, class_id::DYN_MODEL)?)?;
     let tree = GeomNodeTree::parse(find(&format!("{name}_skeleton"), class_id::GEOM_NODE_TREE)?)?;
-    let nodes: HashMap<String, [f32; 16]> = tree.nodes.into_iter().map(|n| (n.name, n.wtm)).collect();
     let lod = model.lods.get(lod).context("no such LOD")?;
     let infos = material_infos(game, name)?;
     let skin_material_base = infos.iter().position(|m| m.skinned).unwrap_or(infos.len());
@@ -388,5 +428,40 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
         });
     }
 
-    Ok(Vehicle { name: name.to_string(), meshes: build_meshes(&model, lod, &nodes, skin_material_base), materials })
+    let meshes = build_meshes(&model, lod, &tree, skin_material_base);
+    let mut nodes: Vec<Node> = tree
+        .nodes
+        .into_iter()
+        .map(|n| Node { pivot: right_handed([n.wtm[12], n.wtm[13], n.wtm[14]]), name: n.name, parent: n.parent })
+        .collect();
+    // Meshes refer to node 0 at least
+    if nodes.is_empty() {
+        nodes.push(Node { name: String::new(), parent: None, pivot: [0.0; 3] });
+    }
+    Ok(Vehicle { name: name.to_string(), meshes, materials, nodes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_texture_rate_comes_from_the_bottom_run() {
+        // A 2 m bottom run at y = 0 in 0.5 m strips across a 0.4 m wide track, V = 0.6 per metre, with
+        // one strip crossing a texture seam (V jumps back by 1), and a top run 0.8 m up mapped the other way
+        let mut m = Mesh::default();
+        for i in 0..5 {
+            let x = i as f32 * 0.5;
+            let v = 0.6 * x - if i >= 3 { 1.0 } else { 0.0 };
+            m.positions.extend([[x, 0.0, 0.0], [x, 0.0, 0.4], [x, 0.8, 0.0], [x, 0.8, 0.4]]);
+            m.uvs.extend([[0.0, v], [1.0, v], [0.0, -v], [1.0, -v]]);
+        }
+        for i in 0..4u32 {
+            let (a, b) = (i * 4, i * 4 + 4);
+            m.indices.extend([a, b, a + 1, a + 1, b, b + 1, a + 2, b + 2, a + 3]);
+        }
+        let rate = track_v_per_metre(&m).unwrap();
+        assert!((rate - 0.6).abs() < 1e-5, "{rate}");
+        assert_eq!(track_v_per_metre(&Mesh::default()), None);
+    }
 }

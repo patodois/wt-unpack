@@ -1,8 +1,13 @@
 mod blk;
 mod bytes;
+mod dynmodel;
+mod gltf;
+mod grp;
 mod vromfs;
 
+use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -35,6 +40,27 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// List the resources of a .grp pack, or inspect one DynModel in it
+    Grp {
+        pack: PathBuf,
+        /// Name of a DynModel to inspect
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Export a DynModel (e.g. a tank) to glTF with its textures
+    Model {
+        /// The .grp pack holding the model
+        pack: PathBuf,
+        /// Model name, e.g. m4a1_76w_sherman
+        name: String,
+        /// Game folder with content/ and patch/ (used for dynModelDesc.bin and texture packs)
+        #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
+        game: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        lod: usize,
+    },
     /// Print one BLK file (a loose file, or `archive.vromfs.bin:path/inside.blk`)
     Cat {
         target: String,
@@ -55,6 +81,8 @@ fn main() -> Result<()> {
         Command::List { archive } => list(&archive),
         Command::Extract { archive, out, blk, filter } => extract(&archive, &out, blk, filter.as_deref()),
         Command::Cat { target, blk } => cat(&target, blk),
+        Command::Grp { pack, model } => grp_cmd(&pack, model.as_deref()),
+        Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
     }
 }
 
@@ -154,5 +182,161 @@ fn cat(target: &str, format: BlkFormat) -> Result<()> {
     let out = if blk::is_binary(&data) { render(&data, shared.as_ref(), format)? } else { data };
     use std::io::Write;
     std::io::stdout().write_all(&out)?;
+    Ok(())
+}
+
+fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
+    let file = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let entries = grp::parse(&file)?;
+    let Some(model) = model else {
+        for e in &entries {
+            println!("{:08X} {:>10} {:>10}  {}", e.class_id, e.offset, e.size, e.name);
+        }
+        return Ok(());
+    };
+    let e = entries
+        .iter()
+        .find(|e| e.name == model && e.class_id == grp::DYN_MODEL)
+        .with_context(|| format!("no DynModel named {model}"))?;
+    let dm = dynmodel::DynModel::parse(&file[e.offset..e.offset + e.size])?;
+    for (i, vd) in dm.vdata.iter().enumerate() {
+        let n = vd.vertices.len() / vd.stride;
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for v in 0..n {
+            let uv = dm.vertex(i, v).uv;
+            for k in 0..2 {
+                lo[k] = lo[k].min(uv[k]);
+                hi[k] = hi[k].max(uv[k]);
+            }
+        }
+        let max_idx = vd.indices.iter().max().copied().unwrap_or(0);
+        println!("vdata {i}: {n} verts, {} indices (max {max_idx}), uv raw {lo:?}..{hi:?}", vd.indices.len());
+    }
+    for (l, lod) in dm.lods.iter().enumerate() {
+        let tris: usize = lod.rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum();
+        println!("lod {l}: range {} m, {} rigids, {} skins, {tris} triangles", lod.range, lod.rigids.len(), lod.skins);
+    }
+    Ok(())
+}
+
+/// Texture name (without the trailing `*`) -> pack holding it, from the table dumps of every DXP pack
+fn texture_index(game: &Path) -> Result<HashMap<String, PathBuf>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.to_string_lossy().ends_with(".dxp.bin") {
+                out.push(p);
+            }
+        }
+    }
+    let mut packs = Vec::new();
+    walk(game, &mut packs);
+    // Patched packs override the originals
+    packs.sort_by_key(|p| p.to_string_lossy().contains("/patch/"));
+    let mut index = HashMap::new();
+    for path in packs {
+        let mut f = fs::File::open(&path)?;
+        let mut head = [0u8; 16];
+        if f.read_exact(&mut head).is_err() || &head[..4] != b"DxP2" {
+            continue;
+        }
+        let dump_size = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+        let mut dump = vec![0u8; dump_size];
+        f.read_exact(&mut dump)?;
+        let mut r = bytes::Reader::new(&dump);
+        let (ofs, count) = (r.u32()? as usize, r.u32()? as usize);
+        r.skip(8)?;
+        let headers = r.u32()? as usize;
+        for i in 0..count {
+            // Skip placeholder entries, whose DDSx header is empty apart from the label
+            let mut h = bytes::Reader::at(&dump, headers + i * 32 + 4)?;
+            if h.u32()? == 0 && h.u32()? == 0 && h.u32()? == 0 {
+                continue;
+            }
+            let name_ofs = bytes::Reader::at(&dump, ofs + i * 8)?.u64()? as usize;
+            let name = bytes::Reader::at(&dump, name_ofs)?.cstr()?;
+            index.insert(name.trim_end_matches('*').to_string(), path.clone());
+        }
+    }
+    Ok(index)
+}
+
+fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Result<()> {
+    let file = fs::read(pack).with_context(|| format!("reading {}", pack.display()))?;
+    let entries = grp::parse(&file)?;
+    let find = |res: &str, class: u32| {
+        entries
+            .iter()
+            .find(|e| e.name == res && e.class_id == class)
+            .map(|e| &file[e.offset..e.offset + e.size])
+            .with_context(|| format!("{res} not found in {}", pack.display()))
+    };
+    let model = dynmodel::DynModel::parse(find(name, grp::DYN_MODEL)?)?;
+    let nodes = dynmodel::parse_skeleton(find(&format!("{name}_skeleton"), grp::GEOM_NODE_TREE)?)?;
+    let lod = model.lods.get(lod).context("no such LOD")?;
+    // Materials and texture names come from dynModelDesc.bin, patched copy first
+    let desc_paths = ["patch/content/base/res/dynModelDesc.bin", "content/base/res/dynModelDesc.bin"];
+    let mut desc = None;
+    for rel in desc_paths {
+        let Ok(raw) = fs::read(game.join(rel)) else { continue };
+        let root = blk::parse(&raw, None).with_context(|| format!("parsing {rel}"))?;
+        if let Some(b) = root.blocks.into_iter().find(|b| b.name == name) {
+            desc = Some(b);
+            break;
+        }
+    }
+    let desc = desc.with_context(|| format!("{name} not found in dynModelDesc.bin"))?;
+    let child = |n: &str| desc.blocks.iter().find(|b| b.name == n);
+    let tex_names: Vec<String> = child("tex")
+        .map(|b| b.params.iter().filter_map(|(_, v)| match v { blk::Value::Str(s) => Some(s.trim_end_matches('*').to_string()), _ => None }).collect())
+        .unwrap_or_default();
+
+    eprintln!("indexing texture packs...");
+    let index = texture_index(game)?;
+    let mut packs: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut decode_png = |tex: &str| -> Result<Option<String>> {
+        let Some((full, path)) = [format!("{tex}$hq"), tex.to_string()].into_iter().find_map(|n| index.get(&n).map(|p| (n, p.clone()))) else {
+            return Ok(None);
+        };
+        let data = match packs.get(&path) {
+            Some(d) => d,
+            None => packs.entry(path.clone()).or_insert(fs::read(&path)?),
+        };
+        let pack = wt_blk::dxp_and_grp::dxp::DxpPack::parse(data)?;
+        let i = pack.entries.iter().position(|e| e.name.trim_end_matches('*') == full).context("texture vanished")?;
+        let png = pack.texture(i)?.to_png()?;
+        let file_name = format!("{tex}.png");
+        fs::create_dir_all(out)?;
+        fs::write(out.join(&file_name), png)?;
+        Ok(Some(file_name))
+    };
+
+    let mut materials = Vec::new();
+    if let Some(mat_r) = child("matR") {
+        for (i, m) in mat_r.blocks.iter().enumerate() {
+            let get = |k: &str| m.params.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+            let class = match get("cls") { Some(blk::Value::Str(s)) => s.clone(), _ => String::new() };
+            let color = match get("t0") { Some(blk::Value::Int(t)) => tex_names.get(*t as usize).cloned(), _ => None };
+            let color_png = match &color {
+                Some(t) => decode_png(t).unwrap_or_else(|e| {
+                    eprintln!("texture {t}: {e:#}");
+                    None
+                }),
+                None => None,
+            };
+            eprintln!("material {i}: {class} -> {}", color.as_deref().unwrap_or("(no texture)"));
+            materials.push(gltf::Material {
+                name: format!("{i}_{class}"),
+                color_png,
+                double_sided: matches!(get("two_sided"), Some(blk::Value::Bool(true))),
+                alpha_mask: class.contains("atest"),
+            });
+        }
+    }
+    gltf::write(&model, lod, &nodes, &materials, out, name)?;
+    eprintln!("wrote {}", out.join(format!("{name}.gltf")).display());
     Ok(())
 }

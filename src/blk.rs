@@ -87,7 +87,9 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
             let size = r.bytes(3)?;
             let size = usize::from(size[0]) | usize::from(size[1]) << 8 | usize::from(size[2]) << 16;
             let raw = zstd::stream::decode_all(r.bytes(size)?)?;
-            parse_dump(&mut Reader::new(&raw), &[], false)
+            // The unpacked stream repeats the format byte of a plain full BLK
+            ensure!(raw.first() == Some(&1), "packed BLK does not unpack to format 1");
+            parse_dump(&mut Reader::new(&raw[1..]), &[], false)
         }
         3 => parse_dump(&mut r, &need_shared()?.names, false),
         4 => {

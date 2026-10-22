@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use wt_unpack::{blk, gltf, vehicle, vromfs::Vromfs};
+use wt_unpack::{blk, gltf, tank, vehicle, vromfs::Vromfs};
 
 fn game() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("WT_GAME_DIR")?);
@@ -83,4 +83,34 @@ fn sherman_assembles_and_exports() {
         assert!(out.join(image["uri"].as_str().unwrap()).exists());
     }
     fs::remove_dir_all(&out).unwrap();
+}
+
+#[test]
+fn sherman_unit_names_its_turret_nodes_and_drive_train() {
+    let Some(game) = game() else { return };
+    let t = tank::load(&game, "m4a1_76w_sherman", None).unwrap().expect("a unit uses the Sherman model");
+    assert!(t.unit.ends_with("_m4a1_76w_sherman"), "{}", t.unit);
+    let turret = t.turret.unwrap();
+    assert_eq!((turret.head.as_str(), turret.gun.as_str()), ("bone_turret", "bone_gun"));
+    assert_eq!((turret.yaw, turret.pitch), ([-180.0, 180.0], [-10.0, 25.0]));
+    // 400 hp, 2400 RPM, top gear 0.733: 38.6 km/h
+    let d = t.drive.unwrap();
+    assert_eq!((d.horse_powers, d.max_rpm), (400.0, 2400.0));
+    assert!((d.top_speed() * 3.6 - 38.6).abs() < 0.1);
+
+    // The skeleton carries the nodes the unit names, the wheels and the tracks
+    let pack = game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp");
+    let v = vehicle::load(&game, &pack, "m4a1_76w_sherman", 0).unwrap();
+    let node = |name: &str| v.nodes.iter().position(|n| n.name == name).unwrap_or_else(|| panic!("no node {name}"));
+    let (head, gun) = (node(&turret.head), node(&turret.gun));
+    assert_eq!(v.nodes[gun].parent, Some(head));
+    assert!(v.meshes.iter().any(|m| m.node == head) && v.meshes.iter().any(|m| m.node == gun));
+    let wheels = v.nodes.iter().enumerate().filter(|(i, n)| n.name.starts_with("wheel_") && v.meshes.iter().any(|m| m.node == *i)).count();
+    assert_eq!(wheels, 22);
+    for side in ["track_l", "track_r"] {
+        let track = v.meshes.iter().find(|m| m.node == node(side)).unwrap();
+        assert!(vehicle::track_v_per_metre(track).is_some_and(|r| r.abs() > 0.1));
+    }
+    // The model has no unit
+    assert!(tank::load(&game, "no_such_model", None).unwrap().is_none());
 }

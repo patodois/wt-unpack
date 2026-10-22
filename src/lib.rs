@@ -4,5 +4,6 @@ pub mod blk;
 pub mod bytes;
 pub mod camo;
 pub mod gltf;
+pub mod tank;
 pub mod vehicle;
 pub mod vromfs;

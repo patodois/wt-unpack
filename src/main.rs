@@ -512,6 +512,7 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
 fn check_cmd(dir: &Path) -> Result<()> {
     let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let (mut models, mut ok, mut skeletons, mut tris) = (0, 0, 0, 0usize);
+    let mut index_sum = 0u64;
     let mut paths: Vec<_> = fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "grp")).collect();
     paths.sort();
     for path in paths {
@@ -530,6 +531,11 @@ fn check_cmd(dir: &Path) -> Result<()> {
                     models += 1;
                     dynmodel::DynModel::parse(data).map(|m| {
                         tris += m.lods[0].rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum::<usize>();
+                        for vd in m.vdata.iter().chain(&m.skin_vdata) {
+                            for &i in &vd.indices {
+                                index_sum = index_sum.wrapping_add(u64::from(i));
+                            }
+                        }
                     })
                 }
                 grp::GEOM_NODE_TREE => {
@@ -549,7 +555,7 @@ fn check_cmd(dir: &Path) -> Result<()> {
             }
         }
     }
-    println!("{ok}/{models} DynModels parsed ({tris} LOD0 rigid triangles), {skeletons} skeletons");
+    println!("{ok}/{models} DynModels parsed ({tris} LOD0 rigid triangles), {skeletons} skeletons, index checksum {index_sum}");
     for (msg, list) in &errors {
         println!("{:>5}  {msg}\n       e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
     }

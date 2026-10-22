@@ -18,6 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::io::Read;
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -66,14 +67,21 @@ pub struct Rigid {
     pub elems: Vec<Elem>,
 }
 
+/// A skinned mesh (tracks, cables): elements index into `DynModel::skin_vdata`
+pub struct Skin {
+    pub node: String,
+    pub elems: Vec<Elem>,
+}
+
 pub struct Lod {
     pub range: f32,
     pub rigids: Vec<Rigid>,
-    pub skins: usize,
+    pub skins: Vec<Skin>,
 }
 
 pub struct DynModel {
     pub vdata: Vec<VData>,
+    pub skin_vdata: Vec<VData>,
     pub pos_offset: [f32; 3],
     pub pos_scale: [f32; 3],
     pub lods: Vec<Lod>,
@@ -167,8 +175,9 @@ fn read_vdata(vd: &[u8], payload_start: usize) -> Result<Vec<VData>> {
     Ok(out)
 }
 
-fn read_mesh(dump: &[u8]) -> Result<Vec<Elem>> {
-    let mut r = Reader::new(dump);
+/// ShaderMesh at `at` inside `dump`; its pointers are relative to the start of `dump`
+fn read_mesh(dump: &[u8], at: usize) -> Result<Vec<Elem>> {
+    let mut r = Reader::at(dump, at)?;
     let (elems_ofs, count) = (r.u32()? as usize, r.u32()? as usize);
     let mut elems = Vec::with_capacity(count);
     for i in 0..count {
@@ -218,6 +227,7 @@ impl DynModel {
         let mut lt = Reader::new(lods_dump);
         let (lod_ofs, lod_count) = (lt.u32()? as usize, lt.u32()? as usize);
         let mut lods = Vec::with_capacity(lod_count);
+        let mut skin_counts = Vec::with_capacity(lod_count);
         for l in 0..lod_count {
             let mut rec = Reader::at(lods_dump, lod_ofs + l * 16)?;
             let scene_size = rec.u64()? as usize;
@@ -227,7 +237,7 @@ impl DynModel {
             let (rig_ofs, rig_n) = (sr.u32()? as usize, sr.u32()? as usize);
             sr.skip(8)?;
             let _skins_ofs = sr.u32()?;
-            let skins = sr.u32()? as usize;
+            let skin_count = sr.u32()? as usize;
             let mut rigids = Vec::with_capacity(rig_n);
             for i in 0..rig_n {
                 let mut ro = Reader::at(scene, rig_ofs + i * 32)?;
@@ -235,15 +245,25 @@ impl DynModel {
                 ro.skip(16)?; // bounding sphere
                 let node = ro.u32()? as usize;
                 let node = node_names.get(node).cloned().context("rigid node id out of range")?;
-                rigids.push(Rigid { node, elems: read_mesh(r.bytes(mesh_size)?)? });
+                rigids.push(Rigid { node, elems: read_mesh(r.bytes(mesh_size)?, 0)? });
             }
-            lods.push(Lod { range, rigids, skins });
+            lods.push(Lod { range, rigids, skins: Vec::with_capacity(skin_count) });
+            skin_counts.push(skin_count);
         }
-        Ok(DynModel { vdata, pos_offset, pos_scale, lods })
+
+        let mut skin_vdata = Vec::new();
+        if skin_counts.iter().any(|&n| n > 0) {
+            skin_vdata = read_skins(&mut r, &mut lods, &skin_counts, &node_names)?;
+        }
+        Ok(DynModel { vdata, skin_vdata, pos_offset, pos_scale, lods })
     }
 
     pub fn vertex(&self, vdata: usize, index: usize) -> Vertex {
-        let vd = &self.vdata[vdata];
+        self.vertex_in(&self.vdata[vdata], index)
+    }
+
+    /// Decodes vertex `index` of any vertex data of this model (rigid or skinned)
+    pub fn vertex_in(&self, vd: &VData, index: usize) -> Vertex {
         let v = &vd.vertices[index * vd.stride..(index + 1) * vd.stride];
         let i16_at = |o: usize| i16::from_le_bytes([v[o], v[o + 1]]);
         let mut out = Vertex::default();
@@ -297,4 +317,46 @@ pub fn parse_skeleton(res: &[u8]) -> Result<HashMap<String, [f32; 16]>> {
         out.insert(Reader::at(&data, name_ofs)?.cstr()?, wtm);
     }
     Ok(out)
+}
+
+/// Skinned meshes follow the LODs: a table of variants per GPU constant budget, a vertex data block
+/// like the rigid one, then a zlib stream with, per LOD, the skin node ids, the mesh sizes and the
+/// ShaderSkinnedMesh dumps (bone tables followed by a ShaderMesh at +0x38)
+fn read_skins(r: &mut Reader, lods: &mut [Lod], counts: &[usize], node_names: &[String]) -> Result<Vec<VData>> {
+    const MAX_VS_CONSTS: u32 = 4096;
+    let section = r.pos();
+    let (variants, total) = (r.u32()?, r.u32()? as usize);
+    let mut chosen = false;
+    for _ in 0..variants {
+        let (consts, skip) = (r.u32()?, r.u32()? as usize);
+        if consts <= MAX_VS_CONSTS {
+            r.skip(skip)?;
+            chosen = true;
+            break;
+        }
+    }
+    ensure!(chosen, "no skinned mesh variant fits");
+
+    let (tex_count, _mat_count, _vdata_count, hdr_size) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+    ensure!(tex_count == 0xFFFF_FFFF, "skins with embedded materials are not handled yet");
+    ensure!(hdr_size & 0xE000_0000 == 0xC000_0000, "uncompressed skin vertex data is not handled yet");
+    let vd = unpack_block(read_block(r)?)?;
+    let vdata = read_vdata(&vd, (hdr_size & !0xC000_0000) as usize)?;
+
+    let end = section + 8 + total;
+    let zipped = r.bytes(end.checked_sub(r.pos()).context("skin section overrun")?)?;
+    let mut unzipped = Vec::new();
+    flate2::read::ZlibDecoder::new(zipped).read_to_end(&mut unzipped)?;
+    let mut z = Reader::new(&unzipped);
+    for (lod, &count) in lods.iter_mut().zip(counts) {
+        let nodes = (0..count).map(|_| z.u32()).collect::<Result<Vec<_>>>()?;
+        let sizes = (0..count).map(|_| z.u64()).collect::<Result<Vec<_>>>()?;
+        for (node, size) in nodes.into_iter().zip(sizes) {
+            ensure!(size & 0x4000_0000 != 0, "obsolete skinned mesh format");
+            let dump = z.bytes((size & !0x4000_0000) as usize)?;
+            let node = node_names.get(node as usize).cloned().context("skin node id out of range")?;
+            lod.skins.push(Skin { node, elems: read_mesh(dump, 0x38)? });
+        }
+    }
+    Ok(vdata)
 }

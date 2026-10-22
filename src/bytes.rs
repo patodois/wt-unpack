@@ -19,6 +19,10 @@ impl<'a> Reader<'a> {
         Ok(Reader { buf, pos })
     }
 
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).context("length overflow")?;
         let out = self

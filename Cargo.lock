@@ -1237,9 +1237,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "md-5",
  "meshopt",
  "oozextract",
+ "png",
  "serde_json",
  "wt_blk",
  "zstd",

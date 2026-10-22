@@ -16,3 +16,5 @@ serde_json = { version = "1", features = ["preserve_order"] }
 zstd = "0.13"
 # Texture decoding from the wt_blk PR (Warthunder-Open-Source-Foundation/wt_blk#28); switch to git/crates.io once merged
 wt_blk = { path = "../wt-contrib/wt_blk", features = ["png"] }
+flate2 = "1.1.10"
+png = "0.18.1"

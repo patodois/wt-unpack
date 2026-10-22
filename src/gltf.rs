@@ -40,28 +40,40 @@ fn to_gltf(p: [f32; 3]) -> [f32; 3] {
     [p[0], p[1], -p[2]]
 }
 
+/// `materials` lists the rigid materials first, then the skin materials (`skin_material_base` onwards)
 pub fn write(
     model: &DynModel,
     lod: &Lod,
     nodes: &HashMap<String, [f32; 16]>,
     materials: &[Material],
+    skin_material_base: usize,
     out_dir: &Path,
     name: &str,
 ) -> Result<()> {
     const IDENTITY: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
     let mut prims: HashMap<usize, Primitive> = HashMap::new();
     let mut missing_nodes = Vec::new();
-    for rigid in &lod.rigids {
-        // "@root" is the model origin
-        let tm = nodes.get(&rigid.node).unwrap_or_else(|| {
-            if rigid.node != "@root" {
-                missing_nodes.push(rigid.node.as_str());
-            }
+    // Rigid parts are placed by their skeleton node; skinned meshes are stored in bind pose, in model space
+    let parts = lod
+        .rigids
+        .iter()
+        .map(|r| (r.node.as_str(), &r.elems, &model.vdata, 0, true))
+        .chain(lod.skins.iter().map(|s| (s.node.as_str(), &s.elems, &model.skin_vdata, skin_material_base, false)));
+    for (node, elems, vdata, material_base, placed) in parts {
+        let tm = if !placed {
             &IDENTITY
-        });
-        for e in &rigid.elems {
-            let prim = prims.entry(e.material).or_default();
-            let vd = &model.vdata[e.vdata];
+        } else {
+            // "@root" is the model origin
+            nodes.get(node).unwrap_or_else(|| {
+                if node != "@root" {
+                    missing_nodes.push(node);
+                }
+                &IDENTITY
+            })
+        };
+        for e in elems {
+            let prim = prims.entry(material_base + e.material).or_default();
+            let vd = &vdata[e.vdata];
             let mut remap: HashMap<u32, u32> = HashMap::new();
             let tri_indices = &vd.indices[e.first_index..e.first_index + e.triangles * 3];
             for tri in tri_indices.chunks_exact(3) {
@@ -70,7 +82,7 @@ pub fn write(
                     let src = i + e.base_vertex as u32;
                     let next = prim.positions.len() as u32;
                     let dst = *remap.entry(src).or_insert_with(|| {
-                        let v = model.vertex(e.vdata, src as usize);
+                        let v = model.vertex_in(vd, src as usize);
                         prim.positions.push(to_gltf(transform(tm, v.pos, 1.0)));
                         prim.normals.push(to_gltf(normalize(transform(tm, v.normal, 0.0))));
                         prim.uvs.push(v.uv.map(|x| x / 4096.0));

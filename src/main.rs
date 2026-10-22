@@ -212,9 +212,16 @@ fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
         let max_idx = vd.indices.iter().max().copied().unwrap_or(0);
         println!("vdata {i}: {n} verts, {} indices (max {max_idx}), uv raw {lo:?}..{hi:?}", vd.indices.len());
     }
+    for (i, vd) in dm.skin_vdata.iter().enumerate() {
+        let decl: Vec<String> = vd.channels.iter().map(|c| format!("t{} u{}.{}", c.ty, c.usage, c.index)).collect();
+        println!("skin vdata {i}: {} verts x {}, {} indices: {}", vd.vertices.len() / vd.stride, vd.stride, vd.indices.len(), decl.join(", "));
+    }
     for (l, lod) in dm.lods.iter().enumerate() {
         let tris: usize = lod.rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum();
-        println!("lod {l}: range {} m, {} rigids, {} skins, {tris} triangles", lod.range, lod.rigids.len(), lod.skins);
+        println!("lod {l}: range {} m, {} rigids, {tris} triangles", lod.range, lod.rigids.len());
+        for s in &lod.skins {
+            println!("  skin on node {}: {:?}", s.node, s.elems);
+        }
     }
     Ok(())
 }
@@ -258,7 +265,9 @@ fn texture_index(game: &Path) -> Result<HashMap<String, PathBuf>> {
             }
             let name_ofs = bytes::Reader::at(&dump, ofs + i * 8)?.u64()? as usize;
             let name = bytes::Reader::at(&dump, name_ofs)?.cstr()?;
-            index.insert(name.trim_end_matches('*').to_string(), path.clone());
+            // Names look like "tex_c*", "tex_c$hq*" or "tex_c*?q0-1-1u01"
+            let key = name.split('*').next().unwrap_or(&name).to_string();
+            index.insert(key, path.clone());
         }
     }
     Ok(index)
@@ -297,7 +306,7 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
     eprintln!("indexing texture packs...");
     let index = texture_index(game)?;
     let mut packs: HashMap<PathBuf, Vec<u8>> = HashMap::new();
-    let mut decode_png = |tex: &str| -> Result<Option<String>> {
+    let mut decode_rgba = |tex: &str| -> Result<Option<(u32, u32, Vec<u8>)>> {
         let Some((full, path)) = [format!("{tex}$hq"), tex.to_string()].into_iter().find_map(|n| index.get(&n).map(|p| (n, p.clone()))) else {
             return Ok(None);
         };
@@ -306,37 +315,106 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
             None => packs.entry(path.clone()).or_insert(fs::read(&path)?),
         };
         let pack = wt_blk::dxp_and_grp::dxp::DxpPack::parse(data)?;
-        let i = pack.entries.iter().position(|e| e.name.trim_end_matches('*') == full).context("texture vanished")?;
-        let png = pack.texture(i)?.to_png()?;
-        let file_name = format!("{tex}.png");
+        let i = pack
+            .entries
+            .iter()
+            .position(|e| e.name.split('*').next() == Some(full.as_str()) && !e.header.is_empty())
+            .context("texture vanished")?;
+        let texture = pack.texture(i)?;
+        Ok(Some((texture.width(), texture.height(), texture.to_rgba()?)))
+    };
+    let write_png = |file_name: &str, (w, h, rgba): &(u32, u32, Vec<u8>)| -> Result<()> {
         fs::create_dir_all(out)?;
-        fs::write(out.join(&file_name), png)?;
-        Ok(Some(file_name))
+        let mut buf = Vec::new();
+        let mut enc = png::Encoder::new(&mut buf, *w, *h);
+        enc.set_color(png::ColorType::Rgba);
+        let mut writer = enc.write_header()?;
+        writer.write_image_data(rgba)?;
+        writer.finish()?;
+        fs::write(out.join(file_name), buf)?;
+        Ok(())
     };
 
     let mut materials = Vec::new();
-    if let Some(mat_r) = child("matR") {
-        for (i, m) in mat_r.blocks.iter().enumerate() {
+    let mut skin_material_base = 0;
+    for block in ["matR", "matS"] {
+        if block == "matS" {
+            skin_material_base = materials.len();
+        }
+        let Some(list) = child(block) else { continue };
+        for (i, m) in list.blocks.iter().enumerate() {
             let get = |k: &str| m.params.iter().find(|(n, _)| n == k).map(|(_, v)| v);
             let class = match get("cls") { Some(blk::Value::Str(s)) => s.clone(), _ => String::new() };
-            let color = match get("t0") { Some(blk::Value::Int(t)) => tex_names.get(*t as usize).cloned(), _ => None };
-            let color_png = match &color {
-                Some(t) => decode_png(t).unwrap_or_else(|e| {
+            let tex = |k: &str| match get(k) { Some(blk::Value::Int(t)) => tex_names.get(*t as usize).cloned(), _ => None };
+            // Masked tank shaders take the camouflage in t1; other masked shaders use t1 for something else
+            let camo = tex("t1").filter(|t| class.contains("masked") && t.contains("_camo"));
+            let color = tex("t0");
+            let mut decode = |t: &Option<String>| match t {
+                Some(t) => decode_rgba(t).unwrap_or_else(|e| {
                     eprintln!("texture {t}: {e:#}");
                     None
                 }),
                 None => None,
             };
-            eprintln!("material {i}: {class} -> {}", color.as_deref().unwrap_or("(no texture)"));
+            let (base, camo_rgba) = (decode(&color), decode(&camo));
+            let color_png = match (base, &color) {
+                (Some(mut img), Some(c)) => {
+                    let file_name = match (&camo, camo_rgba) {
+                        (Some(k), Some(camo_img)) => {
+                            apply_camo(&mut img.2, &camo_img.2, !class.contains("atest"));
+                            format!("{c}__{k}.png")
+                        }
+                        _ => format!("{c}.png"),
+                    };
+                    if !out.join(&file_name).exists() {
+                        write_png(&file_name, &img)?;
+                    }
+                    Some(file_name)
+                }
+                _ => None,
+            };
+            eprintln!("{block} {i}: {class} -> {} {}", color.as_deref().unwrap_or("(no texture)"), camo.as_deref().map(|k| format!("+ camo {k}")).unwrap_or_default());
             materials.push(gltf::Material {
-                name: format!("{i}_{class}"),
+                name: format!("{block}{i}_{class}"),
                 color_png,
                 double_sided: matches!(get("two_sided"), Some(blk::Value::Bool(true))),
                 alpha_mask: class.contains("atest"),
             });
         }
     }
-    gltf::write(&model, lod, &nodes, &materials, out, name)?;
+    gltf::write(&model, lod, &nodes, &materials, skin_material_base, out, name)?;
     eprintln!("wrote {}", out.join(format!("{name}.gltf")).display());
     Ok(())
+}
+
+/// Approximates Dagor's masked tank materials: the base texture's alpha marks painted areas, where the
+/// camouflage colour is applied and modulated by the base texture's detail (dirt, scratches).
+/// Uses the camouflage's average colour, which is exact for single-colour schemes like US olive drab.
+fn apply_camo(base: &mut [u8], camo: &[u8], opaque: bool) {
+    let mean = |px: &mut dyn Iterator<Item = &[u8]>| {
+        let (mut s, mut n) = ([0f64; 3], 0f64);
+        for p in px {
+            for k in 0..3 {
+                s[k] += f64::from(p[k]);
+            }
+            n += 1.0;
+        }
+        if n > 0.0 { s.map(|x| x / n) } else { [128.0; 3] }
+    };
+    let camo_mean = mean(&mut camo.chunks_exact(4));
+    // Average detail of the fully painted areas maps to the plain camouflage colour
+    let painted = mean(&mut base.chunks_exact(4).filter(|p| p[3] > 200));
+    let painted_luma = (painted[0] + painted[1] + painted[2]) / 3.0;
+    for p in base.chunks_exact_mut(4) {
+        let mask = f64::from(p[3]) / 255.0;
+        let luma = (f64::from(p[0]) + f64::from(p[1]) + f64::from(p[2])) / 3.0;
+        let detail = luma / painted_luma.max(1.0);
+        for k in 0..3 {
+            let paint = (camo_mean[k] * detail).min(255.0);
+            p[k] = (f64::from(p[k]) * (1.0 - mask) + paint * mask).round() as u8;
+        }
+        if opaque {
+            p[3] = 255;
+        }
+    }
 }

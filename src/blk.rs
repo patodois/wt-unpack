@@ -275,7 +275,7 @@ impl Value {
 
     fn text(&self) -> String {
         match self {
-            Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")),
+            Value::Str(s) => quote_string(s),
             Value::Int(x) => x.to_string(),
             Value::Real(x) => fmt_f(*x),
             Value::Point2(p) => join(p, |x| fmt_f(*x)),
@@ -359,12 +359,53 @@ impl Block {
     }
 }
 
+/// Names made only of Dagor identifier characters are written bare, anything else is quoted.
 fn quote_name(name: &str) -> String {
-    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.~@".contains(c)) {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || "_-.~".contains(c);
+    if !name.is_empty() && name.chars().all(is_ident) {
         name.to_string()
     } else {
-        format!("\"{}\"", name.replace('"', "\\\""))
+        quote_string(name)
     }
+}
+
+/// Quotes a string the way Dagor's `writeStringValue` does, so its text parser reads it back
+/// unchanged: `~` is the escape character (`~~`, `~"`, `~'`, `~t`, `~n`, `~r`), backslashes are
+/// literal, a string holding `"` but no `'` is put in single quotes, and strings with line breaks
+/// use triple quotes.
+fn quote_string(s: &str) -> String {
+    let has_ln = s.contains(['\n', '\r']);
+    let has_quot = s.contains('"');
+    let has_tick = s.contains('\'');
+    let (open, close) = if has_ln && (!has_quot || has_tick) {
+        ("\"\"\"\n", "\n\"\"\"")
+    } else if has_ln {
+        ("'''\n", "\n'''")
+    } else if has_quot && !has_tick {
+        ("'", "'")
+    } else {
+        ("\"", "\"")
+    };
+    let single = open.len() == 1;
+    let q = open.chars().next().unwrap();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push_str(open);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '~' => out.push_str("~~"),
+            c if c == q && (single || chars.peek() == Some(&c)) => {
+                out.push('~');
+                out.push(c);
+            }
+            '\r' if single => out.push_str("~r"),
+            '\n' if single => out.push_str("~n"),
+            '\t' => out.push_str("~t"),
+            c => out.push(c),
+        }
+    }
+    out.push_str(close);
+    out
 }
 
 #[cfg(test)]
@@ -403,6 +444,41 @@ mod tests {
         assert_eq!(root.blocks[0].name, "engine");
         assert_eq!(root.blocks[0].params, vec![("name".into(), Value::Str("V12".into()))]);
         assert_eq!(root.to_text(), "speed:r=1.5\nengine{\n  name:t=\"V12\"\n}\n");
+    }
+
+    #[test]
+    fn text_strings_use_dagor_escapes() {
+        let s = |v: &str| Value::Str(v.into());
+        let blk = Block {
+            name: String::new(),
+            params: vec![
+                ("path".into(), s(r"..\..\prog\scripts")),
+                ("anim".into(), s("~hatch_hide")),
+                ("quoted".into(), s(r#"say "hi""#)),
+                ("both".into(), s(r#"it's "x""#)),
+                ("tab".into(), s("a\tb")),
+                ("lines".into(), s("one\ntwo")),
+                ("@override".into(), s("")),
+                ("rendinst::tm".into(), Value::Bool(true)),
+                ("".into(), Value::Int(1)),
+            ],
+            blocks: vec![Block { name: "a b".into(), ..Block::default() }],
+        };
+        let expected = [
+            r#"path:t="..\..\prog\scripts""#,
+            r#"anim:t="~~hatch_hide""#,
+            r#"quoted:t='say "hi"'"#,
+            r#"both:t="it's ~"x~"""#,
+            r#"tab:t="a~tb""#,
+            "lines:t=\"\"\"\none\ntwo\n\"\"\"",
+            r#""@override":t="""#,
+            r#""rendinst::tm":b=yes"#,
+            r#""":i=1"#,
+            r#""a b"{"#,
+            "}",
+            "",
+        ];
+        assert_eq!(blk.to_text(), expected.join("\n"));
     }
 
     #[test]

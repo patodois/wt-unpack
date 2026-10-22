@@ -1,105 +1,28 @@
-//! Minimal glTF 2.0 writer: one mesh primitive per material, PNG textures next to the `.gltf`.
+//! Minimal glTF 2.0 writer for a [`Vehicle`]: one mesh primitive per material, PNG textures next to
+//! the `.gltf`.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::dynmodel::{DynModel, Lod};
+use crate::vehicle::{Image, Vehicle};
 
-#[derive(Default)]
-struct Primitive {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    uvs: Vec<[f32; 2]>,
-    indices: Vec<u32>,
+fn write_png(path: &Path, img: &Image) -> Result<()> {
+    let mut buf = Vec::new();
+    let mut enc = png::Encoder::new(&mut buf, img.width, img.height);
+    enc.set_color(png::ColorType::Rgba);
+    let mut writer = enc.write_header()?;
+    writer.write_image_data(&img.rgba)?;
+    writer.finish()?;
+    fs::write(path, buf)?;
+    Ok(())
 }
 
-pub struct Material {
-    pub name: String,
-    /// File name of the base color PNG, relative to the output directory
-    pub color_png: Option<String>,
-    /// glTF metallic-roughness texture (G roughness, B metalness)
-    pub metal_rough_png: Option<String>,
-    /// Tangent-space normal map
-    pub normal_png: Option<String>,
-    pub double_sided: bool,
-    pub alpha_mask: bool,
-}
-
-/// Column-major 4x4 node transform
-fn transform(m: &[f32; 16], p: [f32; 3], w: f32) -> [f32; 3] {
-    [0, 1, 2].map(|r| m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r] * w)
-}
-
-fn normalize(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 0.0 { v.map(|x| x / len) } else { [0.0, 1.0, 0.0] }
-}
-
-/// Dagor is left-handed with Y up; glTF is right-handed. Mirror Z and flip the winding.
-fn to_gltf(p: [f32; 3]) -> [f32; 3] {
-    [p[0], p[1], -p[2]]
-}
-
-/// `materials` lists the rigid materials first, then the skin materials (`skin_material_base` onwards)
-pub fn write(
-    model: &DynModel,
-    lod: &Lod,
-    nodes: &HashMap<String, [f32; 16]>,
-    materials: &[Material],
-    skin_material_base: usize,
-    out_dir: &Path,
-    name: &str,
-) -> Result<()> {
-    const IDENTITY: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
-    let mut prims: HashMap<usize, Primitive> = HashMap::new();
-    let mut missing_nodes = Vec::new();
-    // Rigid parts are placed by their skeleton node; skinned meshes are stored in bind pose, in model space
-    let parts = lod
-        .rigids
-        .iter()
-        .map(|r| (r.node.as_str(), &r.elems, &model.vdata, 0, true))
-        .chain(lod.skins.iter().map(|s| (s.node.as_str(), &s.elems, &model.skin_vdata, skin_material_base, false)));
-    for (node, elems, vdata, material_base, placed) in parts {
-        let tm = if !placed {
-            &IDENTITY
-        } else {
-            // "@root" is the model origin
-            nodes.get(node).unwrap_or_else(|| {
-                if node != "@root" {
-                    missing_nodes.push(node);
-                }
-                &IDENTITY
-            })
-        };
-        for e in elems {
-            let prim = prims.entry(material_base + e.material).or_default();
-            let vd = &vdata[e.vdata];
-            let mut remap: HashMap<u32, u32> = HashMap::new();
-            let tri_indices = &vd.indices[e.first_index..e.first_index + e.triangles * 3];
-            for tri in tri_indices.chunks_exact(3) {
-                // Reverse the winding to match the mirrored axis
-                for &i in &[tri[0], tri[2], tri[1]] {
-                    let src = i + e.base_vertex as u32;
-                    let next = prim.positions.len() as u32;
-                    let dst = *remap.entry(src).or_insert_with(|| {
-                        let v = model.vertex_in(vd, src as usize);
-                        prim.positions.push(to_gltf(transform(tm, v.pos, 1.0)));
-                        prim.normals.push(to_gltf(normalize(transform(tm, v.normal, 0.0))));
-                        prim.uvs.push(v.uv.map(|x| x / 4096.0));
-                        next
-                    });
-                    prim.indices.push(dst);
-                }
-            }
-        }
-    }
-    if !missing_nodes.is_empty() {
-        eprintln!("warning: parts without a skeleton node, left untransformed: {missing_nodes:?}");
-    }
+pub fn write(vehicle: &Vehicle, out_dir: &Path) -> Result<()> {
+    fs::create_dir_all(out_dir)?;
+    let name = &vehicle.name;
 
     let mut bin: Vec<u8> = Vec::new();
     let mut views = Vec::new();
@@ -114,57 +37,61 @@ pub fn write(
         views.len() - 1
     };
 
-    let mut keys: Vec<_> = prims.keys().copied().collect();
-    keys.sort();
-    for mat in keys {
-        let p = &prims[&mat];
+    for m in &vehicle.meshes {
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for v in &p.positions {
+        for v in &m.positions {
             for k in 0..3 {
                 lo[k] = lo[k].min(v[k]);
                 hi[k] = hi[k].max(v[k]);
             }
         }
-        let floats = |v: &[[f32; 3]]| v.iter().flatten().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
-        let pos_view = push_view(&mut bin, &floats(&p.positions), 34962);
-        let nrm_view = push_view(&mut bin, &floats(&p.normals), 34962);
-        let uv_bytes: Vec<u8> = p.uvs.iter().flatten().flat_map(|f| f.to_le_bytes()).collect();
+        let floats3 = |v: &[[f32; 3]]| v.iter().flatten().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let pos_view = push_view(&mut bin, &floats3(&m.positions), 34962);
+        let nrm_view = push_view(&mut bin, &floats3(&m.normals), 34962);
+        let uv_bytes: Vec<u8> = m.uvs.iter().flatten().flat_map(|f| f.to_le_bytes()).collect();
         let uv_view = push_view(&mut bin, &uv_bytes, 34962);
-        let idx_bytes: Vec<u8> = p.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let idx_bytes: Vec<u8> = m.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
         let idx_view = push_view(&mut bin, &idx_bytes, 34963);
 
-        let n = p.positions.len();
+        let n = m.positions.len();
         let base = accessors.len();
         accessors.push(json!({"bufferView": pos_view, "componentType": 5126, "count": n, "type": "VEC3", "min": lo, "max": hi}));
         accessors.push(json!({"bufferView": nrm_view, "componentType": 5126, "count": n, "type": "VEC3"}));
         accessors.push(json!({"bufferView": uv_view, "componentType": 5126, "count": n, "type": "VEC2"}));
-        accessors.push(json!({"bufferView": idx_view, "componentType": 5125, "count": p.indices.len(), "type": "SCALAR"}));
+        accessors.push(json!({"bufferView": idx_view, "componentType": 5125, "count": m.indices.len(), "type": "SCALAR"}));
         gl_prims.push(json!({
             "attributes": {"POSITION": base, "NORMAL": base + 1, "TEXCOORD_0": base + 2},
             "indices": base + 3,
-            "material": mat.min(materials.len().saturating_sub(1)),
+            "material": m.material,
         }));
     }
 
-    let mut images = Vec::new();
-    let mut gl_materials = Vec::new();
-    for m in materials {
-        let mut pbr = json!({"metallicFactor": 0.0, "roughnessFactor": 0.85});
-        if let Some(png) = &m.color_png {
-            images.push(json!({"uri": png}));
-            pbr["baseColorTexture"] = json!({"index": images.len() - 1});
+    let mut images: Vec<Value> = Vec::new();
+    let mut add_image = |file: String, img: &Image| -> Result<usize> {
+        let path = out_dir.join(&file);
+        if !path.exists() {
+            write_png(&path, img)?;
         }
-        if let Some(png) = &m.metal_rough_png {
-            images.push(json!({"uri": png}));
-            pbr["metallicRoughnessTexture"] = json!({"index": images.len() - 1});
+        if let Some(i) = images.iter().position(|v| v["uri"] == file.as_str()) {
+            return Ok(i);
+        }
+        images.push(json!({ "uri": file }));
+        Ok(images.len() - 1)
+    };
+    let mut gl_materials = Vec::new();
+    for m in &vehicle.materials {
+        let mut pbr = json!({"metallicFactor": 0.0, "roughnessFactor": 0.85});
+        if let (Some(img), Some(key)) = (&m.color, &m.color_key) {
+            pbr["baseColorTexture"] = json!({"index": add_image(format!("{key}.png"), img)?});
+        }
+        let mut mat = json!({"name": m.name, "doubleSided": m.double_sided});
+        if let (Some(mr), Some(n), Some(key)) = (&m.metal_rough, &m.normal, &m.pbr_key) {
+            pbr["metallicRoughnessTexture"] = json!({"index": add_image(format!("{key}_metal_rough.png"), mr)?});
             pbr["metallicFactor"] = json!(1.0);
             pbr["roughnessFactor"] = json!(1.0);
+            mat["normalTexture"] = json!({"index": add_image(format!("{key}_normal.png"), n)?});
         }
-        let mut mat = json!({"name": m.name, "pbrMetallicRoughness": pbr, "doubleSided": m.double_sided});
-        if let Some(png) = &m.normal_png {
-            images.push(json!({"uri": png}));
-            mat["normalTexture"] = json!({"index": images.len() - 1});
-        }
+        mat["pbrMetallicRoughness"] = pbr;
         if m.alpha_mask {
             mat["alphaMode"] = json!("MASK");
         }
@@ -187,7 +114,6 @@ pub fn write(
         "bufferViews": views,
         "buffers": [{"uri": bin_name, "byteLength": bin.len()}],
     });
-    fs::create_dir_all(out_dir)?;
     fs::write(out_dir.join(&bin_name), &bin)?;
     fs::write(out_dir.join(format!("{name}.gltf")), serde_json::to_vec_pretty(&doc)?)?;
     Ok(())

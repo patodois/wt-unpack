@@ -1,0 +1,14 @@
+[package]
+name = "wt-unpack"
+version = "0.1.0"
+edition = "2021"
+description = "Reader for Dagor Engine vromfs archives and binary BLK files (War Thunder game data)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+md-5 = "0.10"
+serde_json = { version = "1", features = ["preserve_order"] }
+zstd = "0.13"

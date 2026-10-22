@@ -1,0 +1,419 @@
+//! Reader for Dagor binary BLK files.
+//!
+//! A binary BLK starts with a format byte:
+//!
+//! | byte | meaning                                                     |
+//! |------|-------------------------------------------------------------|
+//! | 1    | full BLK with its own name map                              |
+//! | 2    | u24 packed size, then zstd-compressed full BLK              |
+//! | 3    | BLK using the archive's shared name map                     |
+//! | 4    | zstd-compressed BLK using the shared name map               |
+//! | 5    | zstd-compressed (with dictionary) BLK using shared name map |
+//! | 6    | like 1, but blocks carry explicit param offsets (dedup)     |
+//!
+//! Files that do not start with one of these bytes are plain-text BLK.
+//!
+//! The dump body is: name map, block/param counts, a "complex data" area
+//! (strings and values wider than 4 bytes), a table of 8-byte params and
+//! finally varint-packed block descriptors in breadth-first order.
+
+use std::fmt::Write as _;
+
+use anyhow::{bail, ensure, Context, Result};
+use serde_json::{Map, Value as Json};
+
+use crate::bytes::Reader;
+
+const IS_NAMEMAP_ID: u32 = 0x8000_0000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Str(String),
+    Int(i32),
+    Real(f32),
+    Point2([f32; 2]),
+    Point3([f32; 3]),
+    Point4([f32; 4]),
+    IPoint2([i32; 2]),
+    IPoint3([i32; 3]),
+    IPoint4([i32; 4]),
+    Bool(bool),
+    /// Stored as BGRA bytes; kept here as `[r, g, b, a]`.
+    Color([u8; 4]),
+    /// Four rows of three floats (`TMatrix`).
+    Matrix([[f32; 3]; 4]),
+    Int64(i64),
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Block {
+    pub name: String,
+    pub params: Vec<(String, Value)>,
+    pub blocks: Vec<Block>,
+}
+
+/// What kind of content a BLK file holds, judged from its first byte.
+pub fn is_binary(data: &[u8]) -> bool {
+    matches!(data.first(), Some(1..=6))
+}
+
+/// Shared names and zstd dictionary needed by slim BLK files (formats 3-5).
+#[derive(Default)]
+pub struct SharedContext {
+    pub names: Vec<String>,
+    pub dict: Option<Vec<u8>>,
+}
+
+impl SharedContext {
+    /// Parses the `\xff?nm` file: u64 names hash, 32-byte dictionary hash,
+    /// then a zstd stream holding a name map.
+    pub fn from_namemap(nm: &[u8]) -> Result<(Self, String)> {
+        ensure!(nm.len() >= 40, "shared name map is too short");
+        let dict_name = format!("{}.dict", hex(&nm[8..40]));
+        let raw = zstd::stream::decode_all(&nm[40..]).context("shared name map is not valid zstd")?;
+        let names = read_names(&mut Reader::new(&raw))?;
+        Ok((SharedContext { names, dict: None }, dict_name))
+    }
+}
+
+pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
+    let mut r = Reader::new(data);
+    let format = r.u8()?;
+    let need_shared = || shared.context("this BLK uses a shared name map; read it from inside its vromfs");
+    match format {
+        1 => parse_dump(&mut r, &[], false),
+        6 => parse_dump(&mut r, &[], true),
+        2 => {
+            let size = r.bytes(3)?;
+            let size = usize::from(size[0]) | usize::from(size[1]) << 8 | usize::from(size[2]) << 16;
+            let raw = zstd::stream::decode_all(r.bytes(size)?)?;
+            parse_dump(&mut Reader::new(&raw), &[], false)
+        }
+        3 => parse_dump(&mut r, &need_shared()?.names, false),
+        4 => {
+            let raw = zstd::stream::decode_all(r.rest())?;
+            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false)
+        }
+        5 => {
+            let ctx = need_shared()?;
+            let dict = ctx.dict.as_deref().context("this BLK needs the archive's zstd dictionary")?;
+            let mut dec = zstd::bulk::Decompressor::with_dictionary(dict)?;
+            let packed = r.rest();
+            let raw = dec.decompress(packed, packed.len().max(1 << 16) * 64)?;
+            parse_dump(&mut Reader::new(&raw), &ctx.names, false)
+        }
+        other => bail!("not a binary BLK (format byte {other:#04x})"),
+    }
+}
+
+fn read_names(r: &mut Reader) -> Result<Vec<String>> {
+    let count = r.varint()? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let size = r.varint()? as usize;
+    let mut area = Reader::new(r.bytes(size)?);
+    (0..count).map(|_| area.cstr()).collect()
+}
+
+fn type_size(ty: u8) -> Option<usize> {
+    Some(match ty {
+        1 | 2 | 3 | 10 => 4,
+        9 => 1,
+        4 | 7 | 12 => 8,
+        5 | 8 => 12,
+        6 | 13 => 16,
+        11 => 48,
+        _ => return None,
+    })
+}
+
+struct BlockInfo {
+    name_id: u32,
+    params: Vec<(String, Value)>,
+    blocks_count: usize,
+    first_block: usize,
+}
+
+fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Block> {
+    let own_names = read_names(r)?;
+    let name = |id: u32| -> Result<&str> {
+        let id = id as usize;
+        shared_names
+            .get(id)
+            .or_else(|| own_names.get(id - shared_names.len().min(id)))
+            .map(String::as_str)
+            .with_context(|| format!("name id {id} out of range"))
+    };
+
+    let blocks_count = r.varint()? as usize;
+    let params_count = r.varint()? as usize;
+    let complex_size = r.varint()? as usize;
+    ensure!(blocks_count > 0, "BLK has no root block");
+    let complex = r.bytes(complex_size)?;
+    let param_table = r.bytes(params_count.checked_mul(8).context("too many params")?)?;
+
+    let mut params = Vec::with_capacity(params_count);
+    for raw in param_table.chunks_exact(8) {
+        let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
+        let v = u32::from_le_bytes(raw[4..].try_into().unwrap());
+        let (name_id, ty) = (head & 0x00FF_FFFF, (head >> 24) as u8);
+        params.push((name(name_id)?.to_string(), decode_value(ty, v, complex, shared_names, &own_names)?));
+    }
+
+    let mut infos = Vec::with_capacity(blocks_count);
+    let mut next_param = 0usize;
+    for _ in 0..blocks_count {
+        let name_id = r.varint()?;
+        let pc = r.varint()? as usize;
+        let bc = r.varint()? as usize;
+        let first_block = if bc > 0 { r.varint()? as usize } else { 0 };
+        let start = if dedup {
+            if pc > 0 { r.varint()? as usize } else { 0 }
+        } else {
+            let s = next_param;
+            next_param += pc;
+            s
+        };
+        let slice = params.get(start..start + pc).context("block params out of range")?;
+        ensure!(bc == 0 || first_block + bc <= blocks_count, "block children out of range");
+        infos.push(BlockInfo { name_id, params: slice.to_vec(), blocks_count: bc, first_block });
+    }
+
+    // Children always come after their parent, so build the tree back to front.
+    let mut built: Vec<Option<Block>> = vec![None; blocks_count];
+    for i in (0..blocks_count).rev() {
+        let info = &infos[i];
+        let block_name = if info.name_id == 0 { String::new() } else { name(info.name_id - 1)?.to_string() };
+        let mut children = Vec::with_capacity(info.blocks_count);
+        for c in info.first_block..info.first_block + info.blocks_count {
+            ensure!(c > i, "block {i} references earlier block {c}");
+            children.push(built[c].take().context("block used twice")?);
+        }
+        built[i] = Some(Block { name: block_name, params: info.params.clone(), blocks: children });
+    }
+    Ok(built[0].take().unwrap())
+}
+
+fn decode_value(ty: u8, v: u32, complex: &[u8], shared: &[String], own: &[String]) -> Result<Value> {
+    let size = type_size(ty).with_context(|| format!("unknown param type {ty}"))?;
+    let at = |n: usize| -> Result<&[u8]> {
+        complex.get(v as usize..v as usize + n).context("param value outside complex data")
+    };
+    let inline = v.to_le_bytes();
+    let bytes: &[u8] = if size <= 4 || ty == 1 { &inline } else { at(size)? };
+    let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    let n = |i: usize| i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+
+    Ok(match ty {
+        1 => {
+            if v & IS_NAMEMAP_ID != 0 {
+                let id = (v & !IS_NAMEMAP_ID) as usize;
+                let s = shared.get(id).or_else(|| own.get(id.wrapping_sub(shared.len())));
+                Value::Str(s.context("string name id out of range")?.clone())
+            } else {
+                Value::Str(Reader::at(complex, v as usize)?.cstr()?)
+            }
+        }
+        2 => Value::Int(v as i32),
+        3 => Value::Real(f32::from_bits(v)),
+        4 => Value::Point2([f(0), f(1)]),
+        5 => Value::Point3([f(0), f(1), f(2)]),
+        6 => Value::Point4([f(0), f(1), f(2), f(3)]),
+        7 => Value::IPoint2([n(0), n(1)]),
+        8 => Value::IPoint3([n(0), n(1), n(2)]),
+        13 => Value::IPoint4([n(0), n(1), n(2), n(3)]),
+        9 => Value::Bool(v & 0xFF != 0),
+        10 => Value::Color([inline[2], inline[1], inline[0], inline[3]]),
+        11 => Value::Matrix([
+            [f(0), f(1), f(2)],
+            [f(3), f(4), f(5)],
+            [f(6), f(7), f(8)],
+            [f(9), f(10), f(11)],
+        ]),
+        12 => Value::Int64(i64::from_le_bytes(bytes.try_into().unwrap())),
+        _ => unreachable!(),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Output
+
+fn fmt_f(x: f32) -> String {
+    let s = format!("{x}");
+    if s.contains(['.', 'e', 'i', 'N']) { s } else { format!("{s}.0") }
+}
+
+fn join<T>(items: &[T], f: impl Fn(&T) -> String) -> String {
+    items.iter().map(f).collect::<Vec<_>>().join(", ")
+}
+
+impl Value {
+    fn type_tag(&self) -> &'static str {
+        match self {
+            Value::Str(_) => "t",
+            Value::Int(_) => "i",
+            Value::Real(_) => "r",
+            Value::Point2(_) => "p2",
+            Value::Point3(_) => "p3",
+            Value::Point4(_) => "p4",
+            Value::IPoint2(_) => "ip2",
+            Value::IPoint3(_) => "ip3",
+            Value::IPoint4(_) => "ip4",
+            Value::Bool(_) => "b",
+            Value::Color(_) => "c",
+            Value::Matrix(_) => "m",
+            Value::Int64(_) => "i64",
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")),
+            Value::Int(x) => x.to_string(),
+            Value::Real(x) => fmt_f(*x),
+            Value::Point2(p) => join(p, |x| fmt_f(*x)),
+            Value::Point3(p) => join(p, |x| fmt_f(*x)),
+            Value::Point4(p) => join(p, |x| fmt_f(*x)),
+            Value::IPoint2(p) => join(p, |x| x.to_string()),
+            Value::IPoint3(p) => join(p, |x| x.to_string()),
+            Value::IPoint4(p) => join(p, |x| x.to_string()),
+            Value::Bool(b) => if *b { "yes" } else { "no" }.to_string(),
+            Value::Color(c) => join(c, |x| x.to_string()),
+            Value::Matrix(m) => {
+                let rows: Vec<String> = m.iter().map(|row| format!("[{}]", join(row, |x| fmt_f(*x)))).collect();
+                format!("[{}]", rows.join(" "))
+            }
+            Value::Int64(x) => x.to_string(),
+        }
+    }
+
+    fn json(&self) -> Json {
+        let floats = |xs: &[f32]| Json::from(xs.iter().map(|x| f64::from(*x)).collect::<Vec<_>>());
+        match self {
+            Value::Str(s) => Json::from(s.as_str()),
+            Value::Int(x) => Json::from(*x),
+            Value::Real(x) => Json::from(f64::from(*x)),
+            Value::Point2(p) => floats(p),
+            Value::Point3(p) => floats(p),
+            Value::Point4(p) => floats(p),
+            Value::IPoint2(p) => Json::from(p.to_vec()),
+            Value::IPoint3(p) => Json::from(p.to_vec()),
+            Value::IPoint4(p) => Json::from(p.to_vec()),
+            Value::Bool(b) => Json::from(*b),
+            Value::Color(c) => Json::from(c.to_vec()),
+            Value::Matrix(m) => Json::from(m.iter().map(|row| floats(row)).collect::<Vec<_>>()),
+            Value::Int64(x) => Json::from(*x),
+        }
+    }
+}
+
+impl Block {
+    /// Dagor text BLK syntax (`name:type=value`, `name{ ... }`).
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.write_text(&mut out, 0);
+        out
+    }
+
+    fn write_text(&self, out: &mut String, depth: usize) {
+        let pad = "  ".repeat(depth);
+        for (name, value) in &self.params {
+            let _ = writeln!(out, "{pad}{}:{}={}", quote_name(name), value.type_tag(), value.text());
+        }
+        for child in &self.blocks {
+            let _ = writeln!(out, "{pad}{}{{", quote_name(&child.name));
+            child.write_text(out, depth + 1);
+            let _ = writeln!(out, "{pad}}}");
+        }
+    }
+
+    /// JSON object; repeated names become arrays so nothing is lost.
+    pub fn to_json(&self) -> Json {
+        let mut groups: Vec<(&str, Vec<Json>)> = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        let entries = self
+            .params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.json()))
+            .chain(self.blocks.iter().map(|b| (b.name.as_str(), b.to_json())));
+        for (key, value) in entries {
+            let i = *index.entry(key).or_insert_with(|| {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
+            });
+            groups[i].1.push(value);
+        }
+        let mut map = Map::new();
+        for (key, mut values) in groups {
+            let v = if values.len() == 1 { values.pop().unwrap() } else { Json::Array(values) };
+            map.insert(key.to_string(), v);
+        }
+        Json::Object(map)
+    }
+}
+
+fn quote_name(name: &str) -> String {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.~@".contains(c)) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\\\""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-built format-1 dump: root { speed:r=1.5 engine{ name:t="V12" } }
+    fn sample() -> Vec<u8> {
+        let mut d = vec![1u8];
+        // names: "speed", "engine", "name"
+        let names = b"speed\0engine\0name\0";
+        d.push(3);
+        d.push(names.len() as u8);
+        d.extend_from_slice(names);
+        d.extend_from_slice(&[2, 2]); // 2 blocks, 2 params
+        let complex = b"V12\0";
+        d.push(complex.len() as u8);
+        d.extend_from_slice(complex);
+        // param speed (name 0, type 3)
+        d.extend_from_slice(&(0u32 | 3 << 24).to_le_bytes());
+        d.extend_from_slice(&1.5f32.to_bits().to_le_bytes());
+        // param name (name 2, type 1) -> offset 0 in complex data
+        d.extend_from_slice(&(2u32 | 1 << 24).to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // root: name 0 (none), 1 param, 1 block starting at 1
+        d.extend_from_slice(&[0, 1, 1, 1]);
+        // engine: name id 1+1, 1 param, 0 blocks
+        d.extend_from_slice(&[2, 1, 0]);
+        d
+    }
+
+    #[test]
+    fn parses_hand_built_dump() {
+        let root = parse(&sample(), None).unwrap();
+        assert_eq!(root.params, vec![("speed".into(), Value::Real(1.5))]);
+        assert_eq!(root.blocks[0].name, "engine");
+        assert_eq!(root.blocks[0].params, vec![("name".into(), Value::Str("V12".into()))]);
+        assert_eq!(root.to_text(), "speed:r=1.5\nengine{\n  name:t=\"V12\"\n}\n");
+    }
+
+    #[test]
+    fn repeated_names_become_arrays() {
+        let blk = Block {
+            name: String::new(),
+            params: vec![
+                ("gun".into(), Value::Str("a".into())),
+                ("gun".into(), Value::Str("b".into())),
+                ("pos".into(), Value::Point2([1.0, 2.0])),
+            ],
+            blocks: vec![],
+        };
+        assert_eq!(blk.to_json().to_string(), r#"{"gun":["a","b"],"pos":[1.0,2.0]}"#);
+    }
+}

@@ -6779,6 +6779,7 @@ dependencies = [
  "anyhow",
  "clap",
  "md-5",
+ "oozextract",
  "png",
  "serde_json",
  "wt_blk",

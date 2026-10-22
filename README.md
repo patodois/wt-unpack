@@ -8,7 +8,10 @@ Rust tools for reading War Thunder's game data (Dagor Engine) from your own inst
 - **Vehicles:** tanks, aircraft and ships from `.grp` packs, assembled with their skeleton, tracks and
   materials. Textures come from `.dxp.bin` packs, with the camouflage and ambient occlusion baked in and
   Dagor's packed normal maps split into PBR metal/roughness and normal textures.
-- **Export:** vehicles to glTF 2.0, which opens in Blender, three.js, Godot and most 3D tools.
+- **Levels:** the binary level dumps in `levels/` (`DBLD`): their blocks, the terrain (the `HM2`
+  heightmap, or the landmesh's collision mesh) and the placed objects (rendinst) with their transforms.
+- **Export:** vehicles and terrain to glTF 2.0, which opens in Blender, three.js, Godot and most 3D tools;
+  terrain heights to 16-bit PNG.
 - **Viewer:** `wt-viewer`, a [Bevy](https://bevyengine.org) app that opens a vehicle straight from the
   game files, with no export step.
 
@@ -43,6 +46,16 @@ wt-unpack model $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_s
 # Parse every model in a folder and summarise failures (a regression check)
 wt-unpack check $GAME/content/base/res/tanks
 
+# The blocks of a level, its terrain as a 16-bit PNG (plus a JSON with its world placement) and as glTF,
+# and its placed objects
+wt-unpack level $GAME/levels/avg_berlin.bin
+wt-unpack level $GAME/levels/arcade_alps.bin --heightmap out/alps.png --gltf out/alps
+wt-unpack level $GAME/levels/avg_berlin.bin --terrain landmesh --heightmap out/berlin_wide.png
+wt-unpack level $GAME/levels/avg_berlin.bin --objects
+
+# Parse every level and summarise what decodes
+wt-unpack check-levels $GAME/levels
+
 # Open a vehicle in 3D: drag to orbit, scroll to zoom
 wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V_ausf_g_panther --game $GAME
 ```
@@ -60,6 +73,10 @@ wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V
 - Oodle-compressed data is decoded by [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract), pure
   Rust with no proprietary library.
 - Materials and texture names come from `dynModelDesc.bin`.
+- Level files follow Dagor's `loadLevel.cpp`, `lmeshManager.cpp`, `heightmapPhysHandler.cpp`,
+  `compressedHeightmap.cpp`, `landRayTracerSoA4.cpp`, `bvhIO.cpp` and `rendInstGen.cpp`. The `HM2`
+  heightmap covers the playable area (2 m per sample on tank maps); the landmesh's ray tracer
+  covers the whole map at its own resolution and is rasterised into the same kind of grid.
 - The camouflage blend is an approximation, because the game's shaders are not public. The base
   texture's alpha marks painted areas, and the camouflage and occlusion maps are sampled through the
   mesh's second UV set.
@@ -78,6 +95,7 @@ Checked against War Thunder 2.59.0.80 on macOS:
 | Files in the nine data archives | 38,737 extracted |
 | Textures | 148,335, all decoded except 375 stored as deltas to a paired base texture |
 | Models | tanks 3,656/3,656, aircraft 1,695/1,695, ships 1,925/1,925, with every skeleton |
+| Levels | 160/160 parse fully: terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
 
 ## Disclaimer
 

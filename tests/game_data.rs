@@ -6,6 +6,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use wt_unpack::level::Level;
+use wt_unpack::terrain::HeightGrid;
 use wt_unpack::{blk, gltf, vehicle, vromfs::Vromfs};
 
 fn game() -> Option<PathBuf> {
@@ -83,4 +85,54 @@ fn sherman_assembles_and_exports() {
         assert!(out.join(image["uri"].as_str().unwrap()).exists());
     }
     fs::remove_dir_all(&out).unwrap();
+}
+
+#[test]
+fn berlin_level_has_terrain_and_placed_objects() {
+    let Some(game) = game() else { return };
+    let raw = fs::read(game.join("levels/avg_berlin.bin")).unwrap();
+    let level = Level::parse(&raw).unwrap();
+    assert_eq!(level.blocks.last().unwrap().tag, "END");
+
+    // The tank battle area: 2048 x 2048 samples 2 m apart, heights within 13..77 m
+    let hm = level.heightmap().unwrap().unwrap();
+    assert_eq!((hm.width, hm.height, hm.cell_size), (2048, 2048, 2.0));
+    let grid = HeightGrid::from_heightmap(&hm);
+    let (lo, hi) = grid.range().unwrap();
+    assert!(lo >= 13.0 && hi <= 77.0 && hi - lo > 30.0, "{lo}..{hi}");
+
+    // The landmesh around it, from the legacy ray tracer
+    let lm = level.landmesh().unwrap().unwrap();
+    assert_eq!(lm.cells, [16, 16]);
+    let mesh = lm.tracer_mesh().unwrap().unwrap();
+    assert!(mesh.indices.len() / 3 > 100_000);
+    assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.positions.len()));
+
+    // Placed objects: every counted instance unpacks, trees among them
+    let layers = level.rendinst_layers().unwrap();
+    assert!(!layers.is_empty());
+    let mut total = 0;
+    for layer in &layers {
+        let instances = layer.instances().unwrap();
+        assert_eq!(instances.len(), layer.counts().iter().sum::<usize>());
+        total += instances.len();
+    }
+    assert!(total > 400_000, "{total}");
+    assert!(layers[0].pools.iter().any(|p| p.name.starts_with("liveoak_")));
+}
+
+#[test]
+fn kamchatka_terrain_comes_from_the_lts4_tracer() {
+    let Some(game) = game() else { return };
+    let raw = fs::read(game.join("levels/air_kamchatka.bin")).unwrap();
+    let level = Level::parse(&raw).unwrap();
+    assert!(level.heightmap().unwrap().is_none());
+    let lm = level.landmesh().unwrap().unwrap();
+    assert_eq!(lm.tracer_kind(), "LTS4");
+    let mesh = lm.tracer_mesh().unwrap().unwrap();
+    let grid = HeightGrid::rasterize(&mesh, 64.0).unwrap();
+    assert_eq!((grid.width, grid.height), (2048, 2048));
+    // Sea level up to the volcanoes, above 4 km
+    let (lo, hi) = grid.range().unwrap();
+    assert!(lo < 0.0 && hi > 4000.0, "{lo}..{hi}");
 }

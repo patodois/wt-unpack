@@ -8,10 +8,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use wt_unpack::blk::SharedContext;
 use wt_unpack::vromfs::Vromfs;
 use wt_blk::dxp_and_grp::{
+    ddsx::{DdsxHeader, Texture},
     dynmodel::DynModel,
     geom_node_tree::GeomNodeTree,
     grp_pack::{class_id, GrpPack},
 };
+use wt_unpack::level::Level;
+use wt_unpack::terrain::{self, HeightGrid};
 use wt_unpack::{blk, gltf, vehicle, vromfs};
 
 #[derive(Parser)]
@@ -61,12 +64,43 @@ enum Command {
     },
     /// Parse every DynModel and skeleton in the .grp packs of a folder and summarise failures
     Check { dir: PathBuf },
+    /// List the blocks of a level file (levels/*.bin), or export its terrain and placed objects
+    Level {
+        file: PathBuf,
+        /// Write the terrain heights as a 16-bit grayscale PNG, with its placement in a JSON next to it
+        #[arg(long)]
+        heightmap: Option<PathBuf>,
+        /// Export the terrain mesh to glTF in this directory
+        #[arg(long)]
+        gltf: Option<PathBuf>,
+        /// Terrain source; auto takes the HM2 heightmap when the level has one, else the landmesh
+        #[arg(long, value_enum, default_value_t = TerrainSource::Auto)]
+        terrain: TerrainSource,
+        /// Grid step in metres when rasterising the landmesh (default: its detail grid step)
+        #[arg(long)]
+        cell: Option<f32>,
+        /// List the placed objects (rendinst pools) with counts and sample transforms
+        #[arg(long)]
+        objects: bool,
+        /// Write the textures stored inside the level (e.g. its lightmap) as PNG files to this directory
+        #[arg(long)]
+        textures: Option<PathBuf>,
+    },
+    /// Parse every level file in a folder and summarise what decodes
+    CheckLevels { dir: PathBuf },
     /// Print one BLK file (a loose file, or `archive.vromfs.bin:path/inside.blk`)
     Cat {
         target: String,
         #[arg(long, value_enum, default_value_t = BlkFormat::Text)]
         blk: BlkFormat,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum TerrainSource {
+    Auto,
+    Hm2,
+    Landmesh,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -84,6 +118,10 @@ fn main() -> Result<()> {
         Command::Grp { pack, model } => grp_cmd(&pack, model.as_deref()),
         Command::Check { dir } => check_cmd(&dir),
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
+        Command::Level { file, heightmap, gltf, terrain, cell, objects, textures } => {
+            level_cmd(&file, heightmap.as_deref(), gltf.as_deref(), terrain, cell, objects, textures.as_deref())
+        }
+        Command::CheckLevels { dir } => check_levels(&dir),
     }
 }
 
@@ -281,5 +319,198 @@ fn check_cmd(dir: &Path) -> Result<()> {
     for (msg, list) in &errors {
         println!("{:>5}  {msg}\n       e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
     }
+    Ok(())
+}
+
+fn level_cmd(
+    path: &Path,
+    heightmap: Option<&Path>,
+    gltf_dir: Option<&Path>,
+    source: TerrainSource,
+    cell: Option<f32>,
+    objects: bool,
+    textures: Option<&Path>,
+) -> Result<()> {
+    let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let level = Level::parse(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    println!("textures declared: {}", level.tex_count);
+    println!("{} blocks:", level.blocks.len());
+    for b in &level.blocks {
+        println!("  {:<4} at {:#010x}  {:>10} bytes{}", b.tag, b.offset, b.data.len(), if b.codec != 0 { format!("  codec {}", b.codec) } else { String::new() });
+    }
+    if let Some(info) = level.export_info()? {
+        let sections: Vec<&str> = info.sections.iter().map(|(t, _)| t.as_str()).collect();
+        println!("exporter: {} (hashed sections: {})", info.version, sections.join(" "));
+    }
+    let resources = level.required_resources()?;
+    println!("required resources: {}", resources.len());
+    if let Some(refs) = level.texture_refs()? {
+        println!("texture names: {} (packs: {})", refs.textures.len(), if refs.packs.is_empty() { "-".into() } else { refs.packs.join(", ") });
+    }
+    for (name, ddsx) in level.inline_textures()? {
+        let header = DdsxHeader::parse(ddsx).map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
+        println!("inline texture: {name} ({}x{} {}, {} bytes)", header.width, header.height, header.format_name(), ddsx.len());
+        if let Some(dir) = textures {
+            let png = Texture::from_ddsx(header, &ddsx[DdsxHeader::SIZE..])
+                .and_then(|t| t.to_png())
+                .map_err(|e| anyhow::anyhow!("{name}: {e:?}"))?;
+            // Texture names end in '*' and may carry "?options"; keep a file-system-safe stem
+            let stem: String = name.split(['*', '?']).next().unwrap_or("texture").chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+            fs::create_dir_all(dir)?;
+            let out = dir.join(format!("{stem}.png"));
+            fs::write(&out, png)?;
+            eprintln!("wrote {}", out.display());
+        }
+    }
+    if let Some(b) = level.world_bbox()? {
+        println!("world box: ({:.0}, {:.0}, {:.0}) .. ({:.0}, {:.0}, {:.0})", b[0], b[1], b[2], b[3], b[4], b[5]);
+    }
+    let lmesh = level.landmesh()?;
+    if let Some(lm) = &lmesh {
+        let e = lm.extent();
+        println!(
+            "landmesh: {}x{} cells of {} m from ({}, {}) to ({}, {}), detail grid {} m, ray tracer: {}",
+            lm.cells[0], lm.cells[1], lm.land_cell_size, e[0], e[1], e[2], e[3], lm.grid_cell_size, lm.tracer_kind()
+        );
+    }
+    let hm = level.heightmap()?;
+    if let Some(h) = &hm {
+        println!(
+            "heightmap: {}x{} at {} m from ({}, {}), heights {} .. {} m, version {}{}",
+            h.width, h.height, h.cell_size, h.origin[0], h.origin[1], h.height_min, h.height_min + h.height_scale, h.version,
+            if h.mirrored { ", mirrored beyond its edges" } else { "" }
+        );
+    }
+
+    if heightmap.is_some() || gltf_dir.is_some() {
+        let use_hm2 = match source {
+            TerrainSource::Hm2 => true,
+            TerrainSource::Landmesh => false,
+            TerrainSource::Auto => hm.is_some(),
+        };
+        let name = path.file_stem().map_or("terrain".into(), |s| s.to_string_lossy().into_owned());
+        let (grid, mesh) = if use_hm2 {
+            let grid = HeightGrid::from_heightmap(hm.as_ref().context("the level has no HM2 heightmap")?);
+            // At most about 1024 vertices along each side
+            let step = grid.width.max(grid.height).div_ceil(1024).max(1);
+            let mesh = grid.mesh(step);
+            (grid, mesh)
+        } else {
+            let lm = lmesh.as_ref().context("the level has no landmesh")?;
+            let mesh = lm.tracer_mesh()?.context("the landmesh has no ray tracer")?;
+            eprintln!("landmesh ray tracer: {} vertices, {} triangles", mesh.positions.len(), mesh.indices.len() / 3);
+            let mut grid = HeightGrid::rasterize(&mesh, cell.unwrap_or(lm.grid_cell_size))?;
+            // The landmesh leaves out the cells the heightmap covers
+            if let Some(h) = &hm {
+                let filled = grid.fill_from(&HeightGrid::from_heightmap(h));
+                if filled > 0 {
+                    eprintln!("filled {filled} samples the landmesh leaves to the HM2 heightmap");
+                }
+            }
+            (grid, mesh)
+        };
+        if let Some(png) = heightmap {
+            grid.write_png(png)?;
+            let (lo, hi) = grid.range().unwrap_or_default();
+            eprintln!(
+                "wrote {} ({}x{} from {}, {:.1} .. {:.1} m, {:.1}% covered) and {}",
+                png.display(), grid.width, grid.height, grid.source, lo, hi,
+                100.0 * grid.covered() as f64 / grid.heights.len() as f64,
+                png.with_extension("json").display()
+            );
+        }
+        if let Some(dir) = gltf_dir {
+            let model = terrain::to_model(&name, &mesh);
+            gltf::write(&model, dir)?;
+            eprintln!("wrote {} ({} vertices, {} triangles)", dir.join(format!("{name}.gltf")).display(), mesh.positions.len(), mesh.indices.len() / 3);
+        }
+    }
+
+    if objects {
+        for (li, layer) in level.rendinst_layers()?.iter().enumerate() {
+            let counts = layer.counts();
+            let instances = layer.instances()?;
+            println!(
+                "rendinst layer {li}: {}x{} cells of {} m from ({}, {}), {} land classes, {} pools, {} placed objects",
+                layer.cells_w, layer.cells_h, layer.cell_size as f32 * layer.grid2world, layer.world0[0], layer.world0[1],
+                layer.land_classes.len(), layer.pools.len(), instances.len()
+            );
+            let mut order: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
+            for &i in order.iter().take(25) {
+                let p = &layer.pools[i];
+                println!("  {:>7}  {}{}", counts[i], p.name, if p.pos_only { "  (position + scale only)" } else { "" });
+            }
+            if order.len() > 25 {
+                println!("  ... {} more pools with objects", order.len() - 25);
+            }
+            let step = (instances.len() / 6).max(1);
+            for inst in instances.iter().step_by(step).take(6) {
+                let t = &inst.tm;
+                let scale = (t[0][0] * t[0][0] + t[0][1] * t[0][1] + t[0][2] * t[0][2]).sqrt();
+                println!(
+                    "  sample {}: pos ({:.1}, {:.1}, {:.1}), x axis ({:.3}, {:.3}, {:.3}), scale {:.2}",
+                    layer.pools[inst.pool].name, t[3][0], t[3][1], t[3][2], t[0][0], t[0][1], t[0][2], scale
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_levels(dir: &Path) -> Result<()> {
+    let mut paths: Vec<_> = fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "bin")).collect();
+    paths.sort();
+    let (mut full, mut hm2, mut tracer, mut no_terrain, mut objects) = (0, 0, 0, 0, 0usize);
+    for path in &paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let raw = fs::read(path)?;
+        let summary = (|| -> Result<String> {
+            let level = Level::parse(&raw)?;
+            level.export_info()?;
+            let res = level.required_resources()?.len();
+            let tex = level.texture_refs()?.map_or(0, |t| t.textures.len());
+            level.inline_textures()?;
+            level.world_bbox()?;
+            let mut terrain = Vec::new();
+            if let Some(h) = level.heightmap()? {
+                hm2 += 1;
+                terrain.push(format!("HM2 {}x{}", h.width, h.height));
+            }
+            let lm = level.landmesh()?.context("no landmesh")?;
+            if let Some(mesh) = lm.tracer_mesh()? {
+                tracer += 1;
+                terrain.push(format!("{} ray tracer {} tris", lm.tracer_kind(), mesh.indices.len() / 3));
+            }
+            if terrain.is_empty() {
+                no_terrain += 1;
+            }
+            let mut n = 0;
+            for layer in level.rendinst_layers()? {
+                let inst = layer.instances()?;
+                ensure_counts(&layer.counts(), inst.len())?;
+                n += inst.len();
+            }
+            objects += n;
+            Ok(format!("{} blocks, {res} resources, {tex} textures, {}, {n} objects", level.blocks.len(), terrain.join(", ")))
+        })();
+        match summary {
+            Ok(s) => {
+                full += 1;
+                println!("ok    {name}: {s}");
+            }
+            Err(e) => println!("FAIL  {name}: {e:#}"),
+        }
+    }
+    println!(
+        "{full}/{} levels parse fully; terrain: {hm2} with HM2, {tracer} with a land ray tracer, {no_terrain} with neither; {objects} placed objects",
+        paths.len()
+    );
+    Ok(())
+}
+
+fn ensure_counts(counts: &[usize], decoded: usize) -> Result<()> {
+    let total: usize = counts.iter().sum();
+    anyhow::ensure!(total == decoded, "counters promise {total} objects, {decoded} decoded");
     Ok(())
 }

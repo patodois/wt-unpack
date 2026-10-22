@@ -55,6 +55,22 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
 
+    pub fn i16(&mut self) -> Result<i16> {
+        Ok(i16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+
+    pub fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }

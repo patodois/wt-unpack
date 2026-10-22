@@ -16,6 +16,8 @@ zstd = "0.13"
 # switch to crates.io once they are released
 wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "c7fd584a73384f8de70c76b6a5635f47f42986dc", features = ["png"] }
 png = "0.18.1"
+# Oodle streams inside level files (the same decoder wt_blk uses)
+oozextract = "0.5.5"
 memmap2 = "0.9"
 # The bridge to other game rewrites (see src/bridge.rs), and the peak memory report of `check-bridge`
 rewrite-bridge = { path = "../rewrite-bridge", optional = true }

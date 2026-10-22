@@ -93,6 +93,8 @@ pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// Second texture coordinate set (camouflage mapping on tank hulls); zero when absent
+    pub uv1: [f32; 2],
 }
 
 fn read_block<'a>(r: &mut Reader<'a>) -> Result<&'a [u8]> {
@@ -310,6 +312,9 @@ impl DynModel {
                 }
                 (U_TC, 0, T_SHORT2) => {
                     out.uv = [f32::from(i16_at(c.offset)), f32::from(i16_at(c.offset + 2))];
+                }
+                (U_TC, 1, T_SHORT2) => {
+                    out.uv1 = [f32::from(i16_at(c.offset)), f32::from(i16_at(c.offset + 2))];
                 }
                 (U_TC, 0, T_FLOAT2) => out.uv = [f32_at(v, c.offset), f32_at(v, c.offset + 4)],
                 _ => {}

@@ -1,5 +1,6 @@
 mod blk;
 mod bytes;
+mod camo;
 mod dynmodel;
 mod gltf;
 mod grp;
@@ -204,16 +205,17 @@ fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
     let dm = dynmodel::DynModel::parse(&file[e.offset..e.offset + e.size])?;
     for (i, vd) in dm.vdata.iter().enumerate() {
         let n = vd.vertices.len() / vd.stride;
-        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
         for v in 0..n {
-            let uv = dm.vertex(i, v).uv;
-            for k in 0..2 {
+            let vx = dm.vertex(i, v);
+            let uv = [vx.uv[0], vx.uv[1], vx.uv1[0], vx.uv1[1]];
+            for k in 0..4 {
                 lo[k] = lo[k].min(uv[k]);
                 hi[k] = hi[k].max(uv[k]);
             }
         }
         let max_idx = vd.indices.iter().max().copied().unwrap_or(0);
-        println!("vdata {i}: {n} verts, {} indices (max {max_idx}), uv raw {lo:?}..{hi:?}", vd.indices.len());
+        println!("vdata {i}: {n} verts, {} indices (max {max_idx}), raw uv0+uv1 {lo:?}..{hi:?}", vd.indices.len());
     }
     for (i, vd) in dm.skin_vdata.iter().enumerate() {
         let decl: Vec<String> = vd.channels.iter().map(|c| format!("t{} u{}.{}", c.ty, c.usage, c.index)).collect();
@@ -338,88 +340,108 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
         Ok(())
     };
 
-    let mut materials = Vec::new();
+    // Pass 1: material descriptions from matR (rigid parts) and matS (skinned meshes)
+    struct MatInfo {
+        name: String,
+        class: String,
+        color: Option<String>,
+        camo: Option<String>,
+        double_sided: bool,
+        skinned: bool,
+        index: usize,
+    }
+    let mut infos = Vec::new();
     let mut skin_material_base = 0;
     for block in ["matR", "matS"] {
         if block == "matS" {
-            skin_material_base = materials.len();
+            skin_material_base = infos.len();
         }
         let Some(list) = child(block) else { continue };
         for (i, m) in list.blocks.iter().enumerate() {
             let get = |k: &str| m.params.iter().find(|(n, _)| n == k).map(|(_, v)| v);
-            let class = match get("cls") { Some(blk::Value::Str(s)) => s.clone(), _ => String::new() };
             let tex = |k: &str| match get(k) { Some(blk::Value::Int(t)) => tex_names.get(*t as usize).cloned(), _ => None };
+            let class = match get("cls") { Some(blk::Value::Str(s)) => s.clone(), _ => String::new() };
             // Masked tank shaders take the camouflage in t1; other masked shaders use t1 for something else
             let camo = tex("t1").filter(|t| class.contains("masked") && t.contains("_camo"));
-            let color = tex("t0");
-            let mut decode = |t: &Option<String>| match t {
-                Some(t) => decode_rgba(t).unwrap_or_else(|e| {
-                    eprintln!("texture {t}: {e:#}");
-                    None
-                }),
-                None => None,
-            };
-            let (base, camo_rgba) = (decode(&color), decode(&camo));
-            let color_png = match (base, &color) {
-                (Some(mut img), Some(c)) => {
-                    let file_name = match (&camo, camo_rgba) {
-                        (Some(k), Some(camo_img)) => {
-                            apply_camo(&mut img.2, &camo_img.2, !class.contains("atest"));
-                            format!("{c}__{k}.png")
-                        }
-                        _ => format!("{c}.png"),
-                    };
-                    if !out.join(&file_name).exists() {
-                        write_png(&file_name, &img)?;
-                    }
-                    Some(file_name)
-                }
-                _ => None,
-            };
-            eprintln!("{block} {i}: {class} -> {} {}", color.as_deref().unwrap_or("(no texture)"), camo.as_deref().map(|k| format!("+ camo {k}")).unwrap_or_default());
-            materials.push(gltf::Material {
+            infos.push(MatInfo {
                 name: format!("{block}{i}_{class}"),
-                color_png,
+                color: tex("t0"),
+                camo,
                 double_sided: matches!(get("two_sided"), Some(blk::Value::Bool(true))),
-                alpha_mask: class.contains("atest"),
+                skinned: block == "matS",
+                index: i,
+                class,
             });
         }
+    }
+
+    // Pass 2: UV triangles of every camouflaged material, grouped by (base texture, camouflage)
+    let mut camo_tris: HashMap<(String, String), Vec<camo::UvTriangle>> = HashMap::new();
+    for info in &infos {
+        let (Some(color), Some(camo_name)) = (&info.color, &info.camo) else { continue };
+        let tris = camo_tris.entry((color.clone(), camo_name.clone())).or_default();
+        let (elems, vdata): (Vec<&dynmodel::Elem>, _) = if info.skinned {
+            (lod.skins.iter().flat_map(|s| &s.elems).collect(), &model.skin_vdata)
+        } else {
+            (lod.rigids.iter().flat_map(|r| &r.elems).collect(), &model.vdata)
+        };
+        for e in elems.into_iter().filter(|e| e.material == info.index) {
+            let vd = &vdata[e.vdata];
+            for t in vd.indices[e.first_index..e.first_index + e.triangles * 3].chunks_exact(3) {
+                tris.push([0, 1, 2].map(|k| {
+                    let v = model.vertex_in(vd, t[k] as usize + e.base_vertex);
+                    [v.uv[0], v.uv[1], v.uv1[0], v.uv1[1]].map(|x| x / 4096.0)
+                }));
+            }
+        }
+    }
+
+    // Pass 3: textures, baking the camouflage where there is one
+    let mut materials = Vec::new();
+    for info in &infos {
+        let mut decode = |t: &Option<String>| match t {
+            Some(t) => decode_rgba(t).unwrap_or_else(|e| {
+                eprintln!("texture {t}: {e:#}");
+                None
+            }),
+            None => None,
+        };
+        let color_png = match &info.color {
+            Some(c) => {
+                let file_name = match &info.camo {
+                    Some(k) => format!("{c}__{k}.png"),
+                    None => format!("{c}.png"),
+                };
+                if out.join(&file_name).exists() {
+                    Some(file_name)
+                } else {
+                    match decode(&info.color) {
+                        Some(mut img) => {
+                            if let (Some(k), Some(camo_img)) = (&info.camo, decode(&info.camo)) {
+                                let tris = &camo_tris[&(c.clone(), k.clone())];
+                                let camo_view = camo::Image { width: camo_img.0 as usize, height: camo_img.1 as usize, rgba: &camo_img.2 };
+                                camo::bake(&mut img.2, img.0 as usize, img.1 as usize, &camo_view, tris, !info.class.contains("atest"));
+                                eprintln!("baked {k} into {c} from {} triangles", tris.len());
+                            }
+                            write_png(&file_name, &img)?;
+                            Some(file_name)
+                        }
+                        None => None,
+                    }
+                }
+            }
+            None => None,
+        };
+        materials.push(gltf::Material {
+            name: info.name.clone(),
+            color_png,
+            double_sided: info.double_sided,
+            alpha_mask: info.class.contains("atest"),
+        });
     }
     gltf::write(&model, lod, &nodes, &materials, skin_material_base, out, name)?;
     eprintln!("wrote {}", out.join(format!("{name}.gltf")).display());
     Ok(())
-}
-
-/// Approximates Dagor's masked tank materials: the base texture's alpha marks painted areas, where the
-/// camouflage colour is applied and modulated by the base texture's detail (dirt, scratches).
-/// Uses the camouflage's average colour, which is exact for single-colour schemes like US olive drab.
-fn apply_camo(base: &mut [u8], camo: &[u8], opaque: bool) {
-    let mean = |px: &mut dyn Iterator<Item = &[u8]>| {
-        let (mut s, mut n) = ([0f64; 3], 0f64);
-        for p in px {
-            for k in 0..3 {
-                s[k] += f64::from(p[k]);
-            }
-            n += 1.0;
-        }
-        if n > 0.0 { s.map(|x| x / n) } else { [128.0; 3] }
-    };
-    let camo_mean = mean(&mut camo.chunks_exact(4));
-    // Average detail of the fully painted areas maps to the plain camouflage colour
-    let painted = mean(&mut base.chunks_exact(4).filter(|p| p[3] > 200));
-    let painted_luma = (painted[0] + painted[1] + painted[2]) / 3.0;
-    for p in base.chunks_exact_mut(4) {
-        let mask = f64::from(p[3]) / 255.0;
-        let luma = (f64::from(p[0]) + f64::from(p[1]) + f64::from(p[2])) / 3.0;
-        let detail = luma / painted_luma.max(1.0);
-        for k in 0..3 {
-            let paint = (camo_mean[k] * detail).min(255.0);
-            p[k] = (f64::from(p[k]) * (1.0 - mask) + paint * mask).round() as u8;
-        }
-        if opaque {
-            p[3] = 255;
-        }
-    }
 }
 
 fn check_cmd(dir: &Path) -> Result<()> {

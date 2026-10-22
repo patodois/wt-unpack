@@ -131,3 +131,48 @@ pub fn bake(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2x2 RGBA image of one colour
+    fn solid(rgba: [u8; 4]) -> Vec<u8> {
+        rgba.repeat(4)
+    }
+
+    /// Two triangles covering the whole texture, mapping UV1 onto the same square
+    fn full_square() -> Vec<UvTriangle> {
+        let c = |u: f32, v: f32| [u, v, u, v];
+        vec![[c(0., 0.), c(1., 0.), c(1., 1.)], [c(0., 0.), c(1., 1.), c(0., 1.)]]
+    }
+
+    #[test]
+    fn painted_texels_take_the_camouflage_colour() {
+        // Fully painted base whose detail equals the painted average: result is the camouflage colour
+        let mut base = solid([100, 100, 100, 255]);
+        let camo = solid([80, 70, 50, 255]);
+        let camo = Image { width: 2, height: 2, rgba: &camo };
+        bake(&mut base, 2, 2, Some(&camo), None, &full_square(), true);
+        assert!(base.chunks_exact(4).all(|p| p == [80, 70, 50, 255]), "{base:?}");
+    }
+
+    #[test]
+    fn unpainted_texels_keep_the_base_and_occlusion_darkens() {
+        let mut base = solid([120, 60, 30, 0]);
+        let ao = solid([128, 128, 128, 255]);
+        let ao = Image { width: 2, height: 2, rgba: &ao };
+        bake(&mut base, 2, 2, None, Some(&ao), &full_square(), false);
+        // Alpha 0 means no paint; 128/255 occlusion roughly halves the colour; alpha is kept
+        assert!(base.chunks_exact(4).all(|p| p == [60, 30, 15, 0]), "{base:?}");
+    }
+
+    #[test]
+    fn uncovered_texels_get_the_average_camouflage() {
+        let mut base = solid([100, 100, 100, 255]);
+        let camo: Vec<u8> = [[0, 0, 0, 255], [200, 100, 0, 255], [0, 0, 0, 255], [200, 100, 0, 255]].concat();
+        let camo = Image { width: 2, height: 2, rgba: &camo };
+        bake(&mut base, 2, 2, Some(&camo), None, &[], true);
+        assert!(base.chunks_exact(4).all(|p| p == [100, 50, 0, 255]), "{base:?}");
+    }
+}

@@ -118,3 +118,45 @@ pub fn write(vehicle: &Vehicle, out_dir: &Path) -> Result<()> {
     fs::write(out_dir.join(format!("{name}.gltf")), serde_json::to_vec_pretty(&doc)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle::{Material, Mesh};
+
+    #[test]
+    fn writes_a_consistent_document() {
+        let red = Image { width: 1, height: 1, rgba: vec![255, 0, 0, 255] };
+        let vehicle = Vehicle {
+            name: "box".into(),
+            meshes: vec![Mesh {
+                material: 0,
+                positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
+                normals: vec![[0., 0., 1.]; 3],
+                uvs: vec![[0., 0.], [1., 0.], [0., 1.]],
+                indices: vec![0, 1, 2],
+            }],
+            materials: vec![Material {
+                name: "paint".into(),
+                color: Some(red),
+                metal_rough: None,
+                normal: None,
+                double_sided: true,
+                alpha_mask: false,
+                color_key: Some("paint_c".into()),
+                pbr_key: None,
+            }],
+        };
+        let out = std::env::temp_dir().join(format!("wt-unpack-gltf-test-{}", std::process::id()));
+        write(&vehicle, &out).unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(out.join("box.gltf")).unwrap()).unwrap();
+        assert_eq!(doc["accessors"][0]["count"], 3);
+        assert_eq!(doc["accessors"][0]["max"], json!([1.0, 1.0, 0.0]));
+        assert_eq!(doc["materials"][0]["doubleSided"], true);
+        assert_eq!(doc["images"][0]["uri"], "paint_c.png");
+        // Positions, normals, UVs and indices: 36 + 36 + 24 + 12 bytes, each view 4-byte aligned
+        assert_eq!(fs::read(out.join("box.bin")).unwrap().len(), 108);
+        assert!(out.join("paint_c.png").exists());
+        fs::remove_dir_all(&out).unwrap();
+    }
+}

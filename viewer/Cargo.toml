@@ -1,0 +1,11 @@
+[package]
+name = "wt-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Opens a War Thunder vehicle straight from the game files in a Bevy window"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+bevy = "0.20"
+wt-unpack = { path = ".." }

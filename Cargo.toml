@@ -18,3 +18,10 @@ zstd = "0.13"
 wt_blk = { path = "../wt-contrib/wt_blk", features = ["png"] }
 flate2 = "1.1.10"
 png = "0.18.1"
+
+[workspace]
+members = ["viewer"]
+
+# Bevy is slow without optimisations; keep our own code debuggable
+[profile.dev.package."*"]
+opt-level = 3

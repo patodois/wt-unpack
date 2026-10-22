@@ -5,8 +5,12 @@
 //! is not public, so this approximates it: painted texels get the camouflage colour modulated by the
 //! base texture's detail (dirt, scratches); unpainted texels keep the base colour.
 //!
+//! The ambient occlusion map is laid out on the same second UV set (a unique, non-overlapping unwrap),
+//! while the base texture is a tiling detail atlas on the first set; the occlusion darkens it.
+//!
 //! The base texture is rasterised triangle by triangle in its own UV space, so each texel can look up
-//! the camouflage through the second UV set. Texels no triangle covers get the camouflage's average.
+//! the camouflage and occlusion through the second UV set. Texels no triangle covers get the
+//! camouflage's average and no occlusion.
 
 /// One triangle: per vertex `[u0, v0, u1, v1]`, already in texture units (0..1 per repeat)
 pub type UvTriangle = [[f32; 4]; 3];
@@ -49,7 +53,15 @@ impl Image<'_> {
     }
 }
 
-pub fn bake(base: &mut [u8], width: usize, height: usize, camo: &Image, triangles: &[UvTriangle], opaque: bool) {
+pub fn bake(
+    base: &mut [u8],
+    width: usize,
+    height: usize,
+    camo: Option<&Image>,
+    occlusion: Option<&Image>,
+    triangles: &[UvTriangle],
+    opaque: bool,
+) {
     let original = base.to_vec();
     let luma = |p: &[u8]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
 
@@ -61,13 +73,18 @@ pub fn bake(base: &mut [u8], width: usize, height: usize, camo: &Image, triangle
     }
     let painted_luma = if n > 0.0 { (sum / n) as f32 } else { 128.0 };
 
-    let paint = |o: usize, colour: [f32; 3], out: &mut [u8]| {
+    // `colour`: camouflage colour at this texel (None: keep the base colour); `ao`: occlusion factor
+    let paint = |o: usize, colour: Option<[f32; 3]>, ao: f32, out: &mut [u8]| {
         let p = &original[o..o + 4];
         let mask = f32::from(p[3]) / 255.0;
         let detail = luma(p) / painted_luma.max(1.0);
         for k in 0..3 {
-            let painted = (colour[k] * detail).min(255.0);
-            out[o + k] = (f32::from(p[k]) * (1.0 - mask) + painted * mask).round() as u8;
+            let base_k = f32::from(p[k]);
+            let mixed = match colour {
+                Some(c) => base_k * (1.0 - mask) + (c[k] * detail).min(255.0) * mask,
+                None => base_k,
+            };
+            out[o + k] = (mixed * ao).round().clamp(0.0, 255.0) as u8;
         }
         if opaque {
             out[o + 3] = 255;
@@ -75,9 +92,9 @@ pub fn bake(base: &mut [u8], width: usize, height: usize, camo: &Image, triangle
     };
 
     // Fallback for texels outside every triangle
-    let mean = camo.mean();
+    let mean = camo.map(Image::mean);
     for o in (0..original.len()).step_by(4) {
-        paint(o, mean, base);
+        paint(o, mean, 1.0, base);
     }
 
     for tri in triangles {
@@ -108,7 +125,8 @@ pub fn bake(base: &mut [u8], width: usize, height: usize, camo: &Image, triangle
                 let v = w0 * tri[0][3] + w1 * tri[1][3] + w2 * tri[2][3];
                 let tx = x.rem_euclid(width as i64) as usize;
                 let ty = y.rem_euclid(height as i64) as usize;
-                paint((ty * width + tx) * 4, camo.sample(u, v), base);
+                let ao = occlusion.map_or(1.0, |img| img.sample(u, v)[0] / 255.0);
+                paint((ty * width + tx) * 4, camo.map(|c| c.sample(u, v)), ao, base);
             }
         }
     }

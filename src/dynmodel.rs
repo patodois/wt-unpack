@@ -53,6 +53,13 @@ pub struct VData {
     pub channels: Vec<Channel>,
 }
 
+impl VData {
+    /// Whether vertices carry the second texture coordinate set
+    pub fn has_uv1(&self) -> bool {
+        self.channels.iter().any(|c| c.usage == U_TC && c.index == 1)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Elem {
     pub material: usize,

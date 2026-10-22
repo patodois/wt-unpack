@@ -21,6 +21,10 @@ pub struct Material {
     pub name: String,
     /// File name of the base color PNG, relative to the output directory
     pub color_png: Option<String>,
+    /// glTF metallic-roughness texture (G roughness, B metalness)
+    pub metal_rough_png: Option<String>,
+    /// Tangent-space normal map
+    pub normal_png: Option<String>,
     pub double_sided: bool,
     pub alpha_mask: bool,
 }
@@ -150,7 +154,17 @@ pub fn write(
             images.push(json!({"uri": png}));
             pbr["baseColorTexture"] = json!({"index": images.len() - 1});
         }
+        if let Some(png) = &m.metal_rough_png {
+            images.push(json!({"uri": png}));
+            pbr["metallicRoughnessTexture"] = json!({"index": images.len() - 1});
+            pbr["metallicFactor"] = json!(1.0);
+            pbr["roughnessFactor"] = json!(1.0);
+        }
         let mut mat = json!({"name": m.name, "pbrMetallicRoughness": pbr, "doubleSided": m.double_sided});
+        if let Some(png) = &m.normal_png {
+            images.push(json!({"uri": png}));
+            mat["normalTexture"] = json!({"index": images.len() - 1});
+        }
         if m.alpha_mask {
             mat["alphaMode"] = json!("MASK");
         }

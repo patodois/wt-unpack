@@ -227,6 +227,28 @@ fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
         for s in &lod.skins {
             println!("  skin on node {}: {:?}", s.node, s.elems);
         }
+        if l == 0 && std::env::var_os("WT_PARTS").is_some() {
+            for r in &lod.rigids {
+                let mats: Vec<String> = r
+                    .elems
+                    .iter()
+                    .map(|e| {
+                        let vd = &dm.vdata[e.vdata];
+                        let (mut lo, mut hi) = ([f32::MAX; 4], [f32::MIN; 4]);
+                        for &i in &vd.indices[e.first_index..e.first_index + e.triangles * 3] {
+                            let v = dm.vertex(e.vdata, i as usize + e.base_vertex);
+                            for (k, x) in [v.uv[0], v.uv[1], v.uv1[0], v.uv1[1]].into_iter().enumerate() {
+                                lo[k] = lo[k].min(x / 4096.0);
+                                hi[k] = hi[k].max(x / 4096.0);
+                            }
+                        }
+                        let r2 = |a: [f32; 4]| a.map(|x| (x * 100.0).round() / 100.0);
+                        format!("m{}x{} uv1? {} uv {:?}..{:?}", e.material, e.triangles, vd.has_uv1(), r2(lo), r2(hi))
+                    })
+                    .collect();
+                println!("  part {}: {}", r.node, mats.join(" | "));
+            }
+        }
     }
     Ok(())
 }
@@ -346,6 +368,8 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
         class: String,
         color: Option<String>,
         camo: Option<String>,
+        occlusion: Option<String>,
+        packed_normal: Option<String>,
         double_sided: bool,
         skinned: bool,
         index: usize,
@@ -367,6 +391,8 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
                 name: format!("{block}{i}_{class}"),
                 color: tex("t0"),
                 camo,
+                occlusion: tex("t3").filter(|t| t.ends_with("_ao")),
+                packed_normal: tex("t2").filter(|t| t.ends_with("_n")),
                 double_sided: matches!(get("two_sided"), Some(blk::Value::Bool(true))),
                 skinned: block == "matS",
                 index: i,
@@ -375,11 +401,15 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
         }
     }
 
-    // Pass 2: UV triangles of every camouflaged material, grouped by (base texture, camouflage)
-    let mut camo_tris: HashMap<(String, String), Vec<camo::UvTriangle>> = HashMap::new();
+    // Pass 2: UV triangles of every material that needs baking, grouped by its texture combination
+    let bake_key = |i: &MatInfo| match (&i.color, i.camo.is_some() || i.occlusion.is_some()) {
+        (Some(c), true) => Some(format!("{c}__{}__{}", i.camo.as_deref().unwrap_or("nocamo"), i.occlusion.as_deref().unwrap_or("noao"))),
+        _ => None,
+    };
+    let mut bake_tris: HashMap<String, Vec<camo::UvTriangle>> = HashMap::new();
     for info in &infos {
-        let (Some(color), Some(camo_name)) = (&info.color, &info.camo) else { continue };
-        let tris = camo_tris.entry((color.clone(), camo_name.clone())).or_default();
+        let Some(key) = bake_key(info) else { continue };
+        let tris = bake_tris.entry(key).or_default();
         let (elems, vdata): (Vec<&dynmodel::Elem>, _) = if info.skinned {
             (lod.skins.iter().flat_map(|s| &s.elems).collect(), &model.skin_vdata)
         } else {
@@ -387,6 +417,10 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
         };
         for e in elems.into_iter().filter(|e| e.material == info.index) {
             let vd = &vdata[e.vdata];
+            // Camouflage and occlusion are looked up through the second UV set
+            if !vd.has_uv1() {
+                continue;
+            }
             for t in vd.indices[e.first_index..e.first_index + e.triangles * 3].chunks_exact(3) {
                 tris.push([0, 1, 2].map(|k| {
                     let v = model.vertex_in(vd, t[k] as usize + e.base_vertex);
@@ -406,10 +440,11 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
             }),
             None => None,
         };
+        let key = bake_key(info);
         let color_png = match &info.color {
             Some(c) => {
-                let file_name = match &info.camo {
-                    Some(k) => format!("{c}__{k}.png"),
+                let file_name = match &key {
+                    Some(k) => format!("{k}.png"),
                     None => format!("{c}.png"),
                 };
                 if out.join(&file_name).exists() {
@@ -417,11 +452,16 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
                 } else {
                     match decode(&info.color) {
                         Some(mut img) => {
-                            if let (Some(k), Some(camo_img)) = (&info.camo, decode(&info.camo)) {
-                                let tris = &camo_tris[&(c.clone(), k.clone())];
-                                let camo_view = camo::Image { width: camo_img.0 as usize, height: camo_img.1 as usize, rgba: &camo_img.2 };
-                                camo::bake(&mut img.2, img.0 as usize, img.1 as usize, &camo_view, tris, !info.class.contains("atest"));
-                                eprintln!("baked {k} into {c} from {} triangles", tris.len());
+                            if let Some(k) = &key {
+                                let (camo_img, ao_img) = (decode(&info.camo), decode(&info.occlusion));
+                                fn view(i: &(u32, u32, Vec<u8>)) -> camo::Image<'_> {
+                                    camo::Image { width: i.0 as usize, height: i.1 as usize, rgba: &i.2 }
+                                }
+                                let tris = &bake_tris[k];
+                                // Alpha-tested materials keep their alpha; masked ones use it as the paint mask
+                                let opaque = !info.class.contains("atest");
+                                camo::bake(&mut img.2, img.0 as usize, img.1 as usize, camo_img.as_ref().map(view).as_ref(), ao_img.as_ref().map(view).as_ref(), tris, opaque);
+                                eprintln!("baked {k} from {} triangles", tris.len());
                             }
                             write_png(&file_name, &img)?;
                             Some(file_name)
@@ -432,9 +472,34 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
             }
             None => None,
         };
+        // Dagor packs the normal in A/G, smoothness in R and metalness in B (see unpack_ag_normal)
+        let (mut metal_rough_png, mut normal_png) = (None, None);
+        if let Some(n) = &info.packed_normal {
+            let (mr_name, nrm_name) = (format!("{n}_metal_rough.png"), format!("{n}_normal.png"));
+            if out.join(&mr_name).exists() {
+                (metal_rough_png, normal_png) = (Some(mr_name), Some(nrm_name));
+            } else if let Some((w, h, rgba)) = decode(&info.packed_normal) {
+                let mut mr = Vec::with_capacity(rgba.len());
+                let mut nrm = Vec::with_capacity(rgba.len());
+                for p in rgba.chunks_exact(4) {
+                    mr.extend_from_slice(&[0, 255 - p[0], p[2], 255]);
+                    let x = f32::from(p[3]) / 127.5 - 1.0;
+                    // DirectX-style green: flip for glTF's OpenGL convention
+                    let y = -(f32::from(p[1]) / 127.5 - 1.0);
+                    let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+                    nrm.extend_from_slice(&[x, y, z].map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8));
+                    nrm.push(255);
+                }
+                write_png(&mr_name, &(w, h, mr))?;
+                write_png(&nrm_name, &(w, h, nrm))?;
+                (metal_rough_png, normal_png) = (Some(mr_name), Some(nrm_name));
+            }
+        }
         materials.push(gltf::Material {
             name: info.name.clone(),
             color_png,
+            metal_rough_png,
+            normal_png,
             double_sided: info.double_sided,
             alpha_mask: info.class.contains("atest"),
         });

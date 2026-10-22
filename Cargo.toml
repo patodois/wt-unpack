@@ -25,3 +25,8 @@ members = ["viewer"]
 # Bevy is slow without optimisations; keep our own code debuggable
 [profile.dev.package."*"]
 opt-level = 3
+# Dependency debug info is large (Bevy) and rarely needed
+debug = false
+
+[profile.dev]
+debug = "line-tables-only"

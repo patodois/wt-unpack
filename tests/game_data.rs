@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::{blk, gltf, vehicle, vromfs::Vromfs};
 
 fn game() -> Option<PathBuf> {
@@ -83,4 +84,44 @@ fn sherman_assembles_and_exports() {
         assert!(out.join(image["uri"].as_str().unwrap()).exists());
     }
     fs::remove_dir_all(&out).unwrap();
+}
+
+#[test]
+fn tank_engine_bank_lists_and_decodes() {
+    let Some(game) = game() else { return };
+    // The event bank holds no samples; its .assets.bank pair does
+    let events = sound::map(&game.join("sound/tanks_engines.bank")).unwrap();
+    assert!(sound::fsb5_ranges(&events).unwrap().is_empty());
+
+    let map = sound::map(&game.join("sound/tanks_engines.assets.bank")).unwrap();
+    let ranges = sound::fsb5_ranges(&map).unwrap();
+    let fsbs: Vec<Fsb5> = ranges.iter().map(|r| Fsb5::parse(&map[r.clone()]).unwrap()).collect();
+    let codecs: Vec<Codec> = fsbs.iter().map(|f| f.codec).collect();
+    assert_eq!(codecs, [Codec::Vorbis, Codec::Fadpcm]);
+    for fsb in &fsbs {
+        assert!(fsb.samples.len() > 100);
+        for s in &fsb.samples {
+            assert!(s.name.is_some() && s.rate >= 8000 && (1..=2).contains(&s.channels) && s.frames > 0);
+        }
+    }
+    let vorbis = &fsbs[0];
+    assert!(vorbis.samples.iter().all(|s| s.vorbis_setup.is_some_and(|crc| sound::vorbis::setup_packet(crc).is_some())));
+    let idle = vorbis.samples.iter().find(|s| s.name.as_deref() == Some("engine_00")).unwrap();
+
+    // Decoding yields the header's length, with sound in it
+    for (fsb, s) in [(vorbis, idle), (&fsbs[1], &fsbs[1].samples[0])] {
+        let pcm = fsb.decode(s).unwrap();
+        assert_eq!(pcm.samples.len(), s.frames as usize * usize::from(s.channels));
+        let rms = (pcm.samples.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / pcm.samples.len() as f64).sqrt();
+        assert!(rms > 100.0, "{:?} is silent", s.name);
+    }
+
+    // The Ogg repack opens with the identification page and closes with the end-of-stream page
+    let mut ogg = Vec::new();
+    sound::vorbis::write_ogg(idle, vorbis.data(idle), &mut ogg).unwrap();
+    assert_eq!(&ogg[..4], b"OggS");
+    assert_eq!(ogg[5], 2);
+    let last = ogg.windows(4).rposition(|w| w == b"OggS").unwrap();
+    assert_eq!(ogg[last + 5] & 4, 4);
+    assert_eq!(u64::from_le_bytes(ogg[last + 6..last + 14].try_into().unwrap()), u64::from(idle.frames));
 }

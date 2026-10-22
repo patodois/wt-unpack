@@ -1,8 +1,10 @@
-//! Readers for War Thunder's Dagor Engine game data, and a vehicle assembler built on them.
+//! Readers for War Thunder's Dagor Engine game data and FMOD sound banks, and a vehicle assembler
+//! built on them.
 
 pub mod blk;
 pub mod bytes;
 pub mod camo;
 pub mod gltf;
+pub mod sound;
 pub mod vehicle;
 pub mod vromfs;

@@ -16,6 +16,8 @@ zstd = "0.13"
 # switch to crates.io once they are released
 wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "c7fd584a73384f8de70c76b6a5635f47f42986dc", features = ["png"] }
 png = "0.18.1"
+lewton = { version = "0.10.2", default-features = false }
+memmap2 = "0.9"
 
 [workspace]
 members = ["viewer"]

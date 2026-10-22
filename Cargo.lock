@@ -6778,7 +6778,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "lewton",
  "md-5",
+ "memmap2",
  "png",
  "serde_json",
  "wt_blk",

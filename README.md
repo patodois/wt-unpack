@@ -10,7 +10,8 @@ Rust tools for reading War Thunder's game data (Dagor Engine) from your own inst
   Dagor's packed normal maps split into PBR metal/roughness and normal textures.
 - **Export:** vehicles to glTF 2.0, which opens in Blender, three.js, Godot and most 3D tools.
 - **Viewer:** `wt-viewer`, a [Bevy](https://bevyengine.org) app that opens a vehicle straight from the
-  game files, with no export step.
+  game files, with no export step. Tanks are posable (turret, gun, wheels, tracks) within the limits in
+  their unit file, and a drive mode puts them on flat ground with a simple driving model.
 
 This repository contains no game code or game data, and the tools never modify the game. Everything is
 read from a copy of the game you already have installed.
@@ -33,7 +34,7 @@ wt-unpack list $GAME/char.vromfs.bin
 wt-unpack extract $GAME/aces.vromfs.bin -o out/aces --blk json --filter tankmodels
 wt-unpack cat $GAME/char.vromfs.bin:config/wpcost.blk
 
-# What a .grp pack holds, and the LODs and vertex layouts of one model
+# What a .grp pack holds, and the LODs, vertex layouts and skeleton of one model
 wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp
 wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp --model m4a1_76w_sherman
 
@@ -43,9 +44,27 @@ wt-unpack model $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_s
 # Parse every model in a folder and summarise failures (a regression check)
 wt-unpack check $GAME/content/base/res/tanks
 
-# Open a vehicle in 3D: drag to orbit, scroll to zoom
+# Open a vehicle in 3D: drag to orbit, scroll to zoom, Q/E turn the turret, R/F elevate the gun
 wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V_ausf_g_panther --game $GAME
+
+# Drive it on flat ground with WASD; the camera follows and the speed shows in a corner
+wt-viewer $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman --drive
+
+# Save a picture and close: turret 60 degrees left, gun 10 degrees up; or after a scripted drive
+wt-viewer --turret 60 --gun 10 --screenshot sherman.png
+wt-viewer --drive --auto W:30,WA:3 --turret 90 --screenshot drive.png
 ```
+
+The viewer finds the tank's unit file (`gamedata/units/tankmodels/<unit>.blk` in `aces.vromfs.bin`) by
+its model name, or takes `--unit <name>`. From it come the turret and gun nodes with their traverse and
+elevation limits and speeds, and the mass, engine power, gearing, sprocket and wheel radii and braking
+force. Glass materials are drawn see-through.
+
+The driving model is a simple kinematic one, not the game's (which is not public): engine power and
+the unit's acceleration limit set the acceleration, the gearing at maximum RPM sets the top speeds (38.6
+km/h forward and 5.0 km/h reverse for the M4A1 (76) W), and the hull turns by running one track slower,
+pivoting with one track in first gear at a standstill. The wheels roll with their track, and the track
+texture runs along the static track mesh.
 
 ## How it works
 

@@ -1,20 +1,32 @@
 //! Opens a War Thunder vehicle straight from the game files in a Bevy window.
 //!
-//! Usage: `wt-viewer [pack.grp model_name] [--game <game folder>] [--screenshot <file.png>]`
-//! Drag with the mouse to orbit, scroll to zoom. With `--screenshot` the window saves one frame and
-//! closes, which is handy for checking a model without looking at the screen.
+//! Usage: `wt-viewer [pack.grp model_name] [--game <game folder>] [--unit <unit>] [--screenshot <file.png>]
+//! [--turret <deg>] [--gun <deg>] [--orbit <yaw,pitch,distance>] [--target <x,y,z>] [--drive] [--auto <script>]`
+//!
+//! Drag with the mouse to orbit, scroll to zoom. Q/E traverse the turret and R/F elevate the gun, within
+//! the limits of the tank's unit BLK (found by its model name, or named with `--unit`). `--drive` puts
+//! the tank on flat ground to drive with WASD (see `drive.rs`); `--auto W:20,WA:3` drives by script.
+//! `--turret`/`--gun` set the starting aim in degrees (positive: left and up), `--orbit` the camera angles
+//! in degrees and distance in metres, and `--target` the point it looks at (model space, metres). With
+//! `--screenshot` the window saves one frame and closes (after the script, if there is one), which is
+//! handy for checking a model without looking at the screen.
+
+mod drive;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::RenderTarget;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
+use bevy::math::Affine2;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use wt_unpack::tank::{self, Tank};
 use wt_unpack::vehicle::{self, Vehicle};
 
 const DEFAULT_GAME: &str = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game";
@@ -23,17 +35,91 @@ const DEFAULT_GAME: &str = "/Applications/WarThunderLauncher.app/Contents/WarThu
 #[derive(Resource)]
 struct Loaded(Mutex<Option<Vehicle>>);
 
+/// What the unit BLK says about the vehicle, if a unit uses it
+#[derive(Resource)]
+struct Spec(Option<Tank>);
+
 /// Where to save a single frame before exiting
 #[derive(Resource)]
 struct ScreenshotTo(PathBuf);
 
-/// Orbit camera state: angles in radians, distance in metres
+/// Screenshots are rendered off screen: a window that other windows cover stops being drawn on macOS,
+/// and a capture of it after a few seconds comes out black
+#[derive(Resource)]
+struct ShotImage(Handle<Image>);
+
+const SHOT_SIZE: (u32, u32) = (2560, 1440);
+
+/// Orbit camera state: angles in radians, distance in metres. When following, the target and the yaw
+/// move with the vehicle.
 #[derive(Resource)]
 struct Orbit {
     target: Vec3,
     yaw: f32,
     pitch: f32,
     distance: f32,
+    follow: bool,
+}
+
+/// Camera placement asked for on the command line, applied once the vehicle's size is known
+#[derive(Resource, Default)]
+struct CameraRequest {
+    orbit: Option<[f32; 3]>,
+    target: Option<Vec3>,
+}
+
+/// Turret traverse and gun elevation, degrees: positive is to the left and up
+#[derive(Resource, Default)]
+struct Aim {
+    yaw: f32,
+    pitch: f32,
+}
+
+/// The entity that places the whole vehicle in the world
+#[derive(Component)]
+struct VehicleRoot;
+
+#[derive(Component)]
+struct TurretHead;
+
+#[derive(Component)]
+struct GunMount;
+
+/// A wheel that rolls with its side's track
+#[derive(Component)]
+struct Wheel {
+    left: bool,
+    radius: f32,
+    angle: f32,
+}
+
+/// A track whose texture runs with its speed. Each track has its own copy of the material.
+#[derive(Component)]
+struct Track {
+    left: bool,
+    material: Handle<StandardMaterial>,
+    v_per_metre: f32,
+    offset: f32,
+}
+
+/// How far each track has moved this frame, m (set by the drive mode)
+#[derive(Resource, Default)]
+struct TrackTravel {
+    left: f32,
+    right: f32,
+}
+
+/// The vehicle's lowest point in model space, and the distance between the track centres
+#[derive(Resource)]
+struct Bounds {
+    lo: Vec3,
+    gauge: f32,
+}
+
+/// `N` comma-separated numbers
+fn floats<const N: usize>(s: &str) -> Result<[f32; N]> {
+    let v: Vec<f32> = s.split(',').map(|x| x.trim().parse::<f32>()).collect::<Result<_, _>>().map_err(|e| anyhow!("{s}: {e}"))?;
+    v.try_into().map_err(|_| anyhow!("expected {N} comma-separated numbers: {s}"))
 }
 
 fn main() -> Result<()> {
@@ -41,11 +127,16 @@ fn main() -> Result<()> {
     let option = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let game = option("--game").map_or_else(|| PathBuf::from(DEFAULT_GAME), PathBuf::from);
     let screenshot = option("--screenshot").map(PathBuf::from);
+    // Flags that take no value
+    const SWITCHES: [&str; 1] = ["--drive"];
+    let driving = args.iter().any(|a| a == "--drive");
     // Positional arguments are everything that is neither a flag nor a flag's value
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i].starts_with("--") {
+        if SWITCHES.contains(&args[i].as_str()) {
+            i += 1;
+        } else if args[i].starts_with("--") {
             i += 2;
         } else {
             positional.push(&args[i]);
@@ -56,24 +147,58 @@ fn main() -> Result<()> {
         [pack, name, ..] => (PathBuf::from(pack.as_str()), name.to_string()),
         _ => (game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp"), "m4a1_76w_sherman".to_string()),
     };
+    let script = option("--auto").map(|s| tank::parse_script(&s)).transpose()?;
+    let camera = CameraRequest {
+        orbit: option("--orbit").map(|s| floats::<3>(&s)).transpose()?,
+        target: option("--target").map(|s| floats::<3>(&s).map(Vec3::from)).transpose()?,
+    };
 
     eprintln!("loading {name} from {}", pack.display());
     let vehicle = vehicle::load(&game, &pack, &name, 0).map_err(|e| e.context(format!("loading {name}")))?;
+    let spec = tank::load(&game, &name, option("--unit").as_deref()).unwrap_or_else(|e| {
+        eprintln!("warning: no unit BLK: {e:#}");
+        None
+    });
+    match &spec {
+        Some(t) => eprintln!("unit {}: turret {:?}, drive {:?}", t.unit, t.turret, t.drive),
+        None => eprintln!("no unit uses {name}; turret limits and driving are not available"),
+    }
+
+    // Starting aim, within the limits
+    let turret = spec.as_ref().and_then(|t| t.turret.as_ref());
+    let degrees = |flag: &str| option(flag).map_or(Ok(0.0), |s| floats::<1>(&s).map(|[x]| x));
+    let mut aim = Aim { yaw: degrees("--turret")?, pitch: 0.0 };
+    let pitch = degrees("--gun")?;
+    if let Some(t) = turret {
+        aim.yaw = t.clamp_yaw(aim.yaw);
+        aim.pitch = t.clamp_pitch(aim.yaw, pitch);
+    } else {
+        aim.pitch = pitch;
+    }
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window { title: format!("wt-viewer — {name}"), ..default() }),
         ..default()
     }));
+    if driving {
+        let Some(d) = spec.as_ref().and_then(|t| t.drive.clone()) else { bail!("--drive needs the unit's VehiclePhys block") };
+        app.insert_resource(drive::Driving::new(d, script.unwrap_or_default()));
+        app.add_plugins(drive::DrivePlugin);
+    }
     if let Some(path) = screenshot {
         app.insert_resource(ScreenshotTo(path)).add_systems(Update, screenshot_and_exit);
     }
     app
         .insert_resource(Loaded(Mutex::new(Some(vehicle))))
+        .insert_resource(Spec(spec))
+        .insert_resource(aim)
+        .insert_resource(camera)
+        .init_resource::<TrackTravel>()
         .insert_resource(ClearColor(Color::srgb(0.11, 0.12, 0.14)))
         .insert_resource(GlobalAmbientLight { color: Color::WHITE, brightness: 600.0, affects_lightmapped_meshes: true })
         .add_systems(Startup, spawn_vehicle)
-        .add_systems(Update, orbit_camera)
+        .add_systems(Update, (aim_turret, roll_running_gear, orbit_camera).chain())
         .run();
     Ok(())
 }
@@ -97,14 +222,46 @@ fn to_bevy_image(img: &vehicle::Image, srgb: bool) -> Image {
     image
 }
 
+/// For a node named like `wheel_l_03` or `track_r` (with `prefix` "wheel_" or "track_"): true for the
+/// left side, false for the right
+fn side(name: &str, prefix: &str) -> Option<bool> {
+    match name.strip_prefix(prefix)?.split('_').next()? {
+        "l" => Some(true),
+        "r" => Some(false),
+        _ => None,
+    }
+}
+
+/// Wheel radius from the unit's suspension block, by kind of wheel, else from the wheel's mesh
+fn wheel_radius(name: &str, drive: Option<&tank::Drive>, mesh_radius: f32) -> f32 {
+    let blk = drive.and_then(|d| {
+        if name.contains("_top") {
+            d.top_wheel_radius
+        } else if name.contains("_drive") {
+            Some(d.drive_gear_radius)
+        } else if name.contains("_back") || name.contains("_front") {
+            d.end_wheel_radius
+        } else {
+            d.road_wheel_radius
+        }
+    });
+    blk.unwrap_or(mesh_radius).max(0.05)
+}
+
 fn spawn_vehicle(
     mut commands: Commands,
     loaded: Res<Loaded>,
+    spec: Res<Spec>,
+    request: Res<CameraRequest>,
+    driving: Option<Res<drive::Driving>>,
+    screenshot: Option<Res<ScreenshotTo>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let vehicle = loaded.0.lock().unwrap().take().expect("vehicle is spawned once");
+    let turret = spec.0.as_ref().and_then(|t| t.turret.as_ref());
+    let drive = spec.0.as_ref().and_then(|t| t.drive.as_ref());
 
     let mats: Vec<Handle<StandardMaterial>> = vehicle
         .materials
@@ -125,18 +282,45 @@ fn spawn_vehicle(
                 mat.metallic = 1.0;
                 mat.perceptual_roughness = 1.0;
             }
+            // Glass (vision blocks, lights): see-through and smooth, keeping its tint and normal map
+            if m.name.contains("glass") {
+                mat.alpha_mode = AlphaMode::Blend;
+                mat.base_color = Color::srgba(1.0, 1.0, 1.0, 0.3);
+                mat.metallic_roughness_texture = None;
+                mat.metallic = 0.0;
+                mat.perceptual_roughness = 0.05;
+                mat.reflectance = 0.6;
+            }
             materials.add(mat)
         })
         .collect();
+    for m in &vehicle.materials {
+        info!("material {}{}", m.name, if m.name.contains("glass") { " (glass)" } else { "" });
+    }
 
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for p in vehicle.meshes.iter().flat_map(|m| &m.positions) {
+        lo = lo.min(Vec3::from(*p));
+        hi = hi.max(Vec3::from(*p));
+    }
+
+    // The vehicle stands on y = 0. Every node is an entity placed at its pivot relative to its parent,
+    // without rotation, so turning a node turns its subtree about the pivot in the hull's axes.
+    let root = commands.spawn((Name::new(vehicle.name.clone()), VehicleRoot, Transform::from_xyz(0.0, -lo.y, 0.0), Visibility::default())).id();
+    let pivot = |i: usize| Vec3::from(vehicle.nodes[i].pivot);
+    let mut nodes = Vec::with_capacity(vehicle.nodes.len());
+    for (i, n) in vehicle.nodes.iter().enumerate() {
+        let (parent, origin) = n.parent.map_or((root, Vec3::ZERO), |p| (nodes[p], pivot(p)));
+        nodes.push(commands.spawn((Name::new(n.name.clone()), Transform::from_translation(pivot(i) - origin), Visibility::default(), ChildOf(parent))).id());
+    }
+
+    // Wheels are measured from their meshes when the BLK gives no radius
+    let mut wheel_height = vec![(f32::MAX, f32::MIN); vehicle.nodes.len()];
+    let (mut left_z, mut right_z) = (Vec::new(), Vec::new());
     for m in &vehicle.meshes {
-        for p in &m.positions {
-            lo = lo.min(Vec3::from(*p));
-            hi = hi.max(Vec3::from(*p));
-        }
+        let at = pivot(m.node);
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, m.positions.clone())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, m.positions.iter().map(|p| (Vec3::from(*p) - at).to_array()).collect::<Vec<_>>())
             .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, m.normals.clone())
             .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, m.uvs.clone())
             .with_inserted_indices(Indices::U32(m.indices.clone()));
@@ -144,23 +328,128 @@ fn spawn_vehicle(
         if let Err(e) = mesh.generate_tangents() {
             warn!("no tangents for material {}: {e}", m.material);
         }
-        commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mats[m.material].clone())));
+        let node_name = vehicle.nodes[m.node].name.as_str();
+        let mut material = mats[m.material].clone();
+        let mut entity = commands.spawn((Mesh3d(meshes.add(mesh)), ChildOf(nodes[m.node])));
+        if let (Some(left), Some(v_per_metre)) = (side(node_name, "track_"), vehicle::track_v_per_metre(m)) {
+            // Its own material, so the two tracks can run at different speeds
+            let own = materials.get(&material).cloned().expect("material was just added");
+            material = materials.add(own);
+            entity.insert(Track { left, material: material.clone(), v_per_metre, offset: 0.0 });
+            info!("{node_name}: texture runs {v_per_metre:.3} V per metre");
+        }
+        entity.insert(MeshMaterial3d(material));
+        if side(node_name, "wheel_").is_some() {
+            let h = &mut wheel_height[m.node];
+            for p in &m.positions {
+                h.0 = h.0.min(p[1]);
+                h.1 = h.1.max(p[1]);
+            }
+        }
     }
+    for (i, n) in vehicle.nodes.iter().enumerate() {
+        let name = n.name.as_str();
+        if turret.map_or(name == "bone_turret", |t| t.head == name) {
+            commands.entity(nodes[i]).insert(TurretHead);
+        }
+        if turret.map_or(name == "bone_gun", |t| t.gun == name) {
+            commands.entity(nodes[i]).insert(GunMount);
+        }
+        let (bottom, top) = wheel_height[i];
+        if let (Some(left), true) = (side(name, "wheel_"), bottom <= top) {
+            let radius = wheel_radius(name, drive, (top - bottom) / 2.0);
+            commands.entity(nodes[i]).insert(Wheel { left, radius, angle: 0.0 });
+            if left { &mut left_z } else { &mut right_z }.push(n.pivot[2]);
+        }
+    }
+    let glass: Vec<&str> = vehicle.meshes.iter().filter(|m| vehicle.materials[m.material].name.contains("glass")).map(|m| vehicle.nodes[m.node].name.as_str()).collect();
+    info!("glass on nodes {glass:?}");
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+    let gauge = if left_z.is_empty() || right_z.is_empty() { 2.5 } else { mean(&right_z) - mean(&left_z) };
+    info!("{} wheels, track gauge {gauge:.3} m", left_z.len() + right_z.len());
+    commands.insert_resource(Bounds { lo, gauge });
 
     let size = (hi - lo).max_element();
-    commands.insert_resource(Orbit { target: (lo + hi) / 2.0, yaw: 0.8, pitch: 0.35, distance: size * 1.3 });
-    commands.spawn((Camera3d::default(), Transform::default()));
+    let center = (lo + hi) / 2.0 - Vec3::Y * lo.y;
+    let [yaw, pitch, distance] = request.orbit.map_or([0.8, 0.35, size * 1.3], |[y, p, d]| [y.to_radians(), p.to_radians(), d]);
+    let target = request.target.map_or(center, |t| t - Vec3::Y * lo.y);
+    // Driving: the camera follows from behind unless told otherwise
+    let (yaw, follow) = match driving {
+        Some(_) if request.orbit.is_none() => (-std::f32::consts::FRAC_PI_2 + 0.5, true),
+        Some(_) => (yaw, true),
+        None => (yaw, false),
+    };
+    commands.insert_resource(Orbit { target, yaw, pitch, distance, follow });
+    // The HUD (drive mode) goes wherever this camera renders
+    let mut camera = commands.spawn((Camera3d::default(), IsDefaultUiCamera, Transform::default()));
+    if screenshot.is_some() {
+        let target = images.add(Image::new_target_texture(SHOT_SIZE.0, SHOT_SIZE.1, TextureFormat::Rgba8UnormSrgb, None));
+        camera.insert(RenderTarget::Image(target.clone().into()));
+        commands.insert_resource(ShotImage(target));
+    }
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
         Transform::from_xyz(4.0, 8.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    // Ground plane under the tracks
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(size * 4.0, size * 4.0))),
-        MeshMaterial3d(materials.add(StandardMaterial { base_color: Color::srgb(0.23, 0.24, 0.22), perceptual_roughness: 1.0, ..default() })),
-        Transform::from_xyz((lo.x + hi.x) / 2.0, lo.y, (lo.z + hi.z) / 2.0),
-    ));
-    info!("{}: {} meshes, {} materials", vehicle.name, vehicle.meshes.len(), vehicle.materials.len());
+    if driving.is_none() {
+        // Ground plane under the tracks
+        commands.spawn((
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(size * 4.0, size * 4.0))),
+            MeshMaterial3d(materials.add(StandardMaterial { base_color: Color::srgb(0.23, 0.24, 0.22), perceptual_roughness: 1.0, ..default() })),
+            Transform::from_xyz((lo.x + hi.x) / 2.0, 0.0, (lo.z + hi.z) / 2.0),
+        ));
+    }
+    info!("{}: {} meshes, {} materials, {} nodes", vehicle.name, vehicle.meshes.len(), vehicle.materials.len(), vehicle.nodes.len());
+}
+
+/// Q/E traverse the turret and R/F elevate the gun, at the BLK's speeds and within its limits
+fn aim_turret(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    spec: Res<Spec>,
+    mut aim: ResMut<Aim>,
+    mut heads: Query<&mut Transform, (With<TurretHead>, Without<GunMount>)>,
+    mut guns: Query<&mut Transform, (With<GunMount>, Without<TurretHead>)>,
+) {
+    let turret = spec.0.as_ref().and_then(|t| t.turret.as_ref());
+    let (speed_yaw, speed_pitch) = turret.map_or((20.0, 5.0), |t| (t.speed_yaw, t.speed_pitch));
+    let axis = |plus: KeyCode, minus: KeyCode| f32::from(u8::from(keys.pressed(plus))) - f32::from(u8::from(keys.pressed(minus)));
+    let dt = time.delta_secs();
+    aim.yaw += axis(KeyCode::KeyQ, KeyCode::KeyE) * speed_yaw * dt;
+    aim.pitch += axis(KeyCode::KeyR, KeyCode::KeyF) * speed_pitch * dt;
+    if let Some(t) = turret {
+        aim.yaw = t.clamp_yaw(aim.yaw);
+        aim.pitch = t.clamp_pitch(aim.yaw, aim.pitch);
+    }
+    // Y is up and Z points right, so turning about +Y goes left and about +Z lifts the muzzle (+X)
+    for mut t in &mut heads {
+        t.rotation = Quat::from_rotation_y(aim.yaw.to_radians());
+    }
+    for mut t in &mut guns {
+        t.rotation = Quat::from_rotation_z(aim.pitch.to_radians());
+    }
+}
+
+/// Rolls the wheels and runs the track textures by how far each track moved
+fn roll_running_gear(
+    travel: Res<TrackTravel>,
+    mut wheels: Query<(&mut Wheel, &mut Transform)>,
+    mut tracks: Query<&mut Track>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let side = |left: bool| if left { travel.left } else { travel.right };
+    for (mut w, mut t) in &mut wheels {
+        // Rolling forward (+X) turns a wheel clockwise seen from the right (+Z), i.e. negatively about Z
+        w.angle = (w.angle - side(w.left) / w.radius).rem_euclid(std::f32::consts::TAU);
+        t.rotation = Quat::from_rotation_z(w.angle);
+    }
+    for mut track in &mut tracks {
+        // The bottom run stays put on the ground, so relative to the hull it runs backwards
+        track.offset = (track.offset + track.v_per_metre * side(track.left)).rem_euclid(1.0);
+        if let Some(mut m) = materials.get_mut(&track.material) {
+            m.uv_transform = Affine2::from_translation(Vec2::new(0.0, track.offset));
+        }
+    }
 }
 
 fn orbit_camera(
@@ -168,6 +457,7 @@ fn orbit_camera(
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    root: Query<&Transform, (With<VehicleRoot>, Without<Camera3d>)>,
     mut camera: Query<&mut Transform, With<Camera3d>>,
 ) {
     if buttons.pressed(MouseButton::Left) {
@@ -175,24 +465,40 @@ fn orbit_camera(
         orbit.pitch = (orbit.pitch + motion.delta.y * 0.005).clamp(-1.4, 1.4);
     }
     orbit.distance = (orbit.distance * (1.0 - scroll.delta.y * 0.1)).clamp(1.0, 200.0);
-    let offset = Vec3::new(orbit.yaw.sin() * orbit.pitch.cos(), orbit.pitch.sin(), orbit.yaw.cos() * orbit.pitch.cos()) * orbit.distance;
+    // A following camera keeps its angle to the vehicle's heading and looks at the vehicle
+    let (target, yaw) = match root.single() {
+        Ok(r) if orbit.follow => {
+            let heading = r.rotation.to_euler(EulerRot::YXZ).0;
+            (r.translation + Vec3::Y * 1.5, orbit.yaw + heading)
+        }
+        _ => (orbit.target, orbit.yaw),
+    };
+    let offset = Vec3::new(yaw.sin() * orbit.pitch.cos(), orbit.pitch.sin(), yaw.cos() * orbit.pitch.cos()) * orbit.distance;
     for mut t in &mut camera {
-        *t = Transform::from_translation(orbit.target + offset).looking_at(orbit.target, Vec3::Y);
+        *t = Transform::from_translation(target + offset).looking_at(target, Vec3::Y);
     }
 }
 
-/// Waits for textures to upload, saves one frame, then exits
+/// Waits for textures to upload (and for the drive script to finish), saves one frame, then exits
 fn screenshot_and_exit(
     mut commands: Commands,
     target: Res<ScreenshotTo>,
+    image: Option<Res<ShotImage>>,
+    driving: Option<Res<drive::Driving>>,
     mut frame: Local<u32>,
+    mut shot_at: Local<Option<u32>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     *frame += 1;
-    if *frame == 60 {
-        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(target.0.clone()));
+    let ready = *frame >= 60 && driving.as_ref().is_none_or(|d| d.script_done());
+    if let (true, None, Some(image)) = (ready, *shot_at, image) {
+        *shot_at = Some(*frame);
+        commands.spawn(Screenshot::image(image.0.clone())).observe(save_to_disk(target.0.clone()));
+        if let Some(d) = &driving {
+            eprintln!("{}", d.report());
+        }
     }
-    if *frame == 120 {
+    if shot_at.is_some_and(|f| *frame == f + 60) {
         exit.write(AppExit::Success);
     }
 }

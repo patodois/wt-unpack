@@ -195,7 +195,7 @@ impl Collision {
             recs.push(Rec { name_ofs, indices, behavior, material, planes_at, kind, bbox });
         }
 
-        let mut tms = Vec::with_capacity(counts[1]);
+        let mut tms = Vec::with_capacity(r.capacity_for(counts[1], 48));
         for _ in 0..counts[1] {
             tms.push([[r.f32()?, r.f32()?, r.f32()?], [r.f32()?, r.f32()?, r.f32()?], [r.f32()?, r.f32()?, r.f32()?], [r.f32()?, r.f32()?, r.f32()?]]);
         }
@@ -223,11 +223,11 @@ impl Collision {
             ensure!(blas.indices.len() == rec.indices, "node {i}: {} indices, the record says {}", blas.indices.len(), rec.indices);
             chunks.push(Some(Chunk { bmin, inv_scale, verts: blas.verts, indices: blas.indices }));
         }
-        let mut pool = Vec::with_capacity(counts[6]);
+        let mut pool = Vec::with_capacity(r.capacity_for(counts[6], 2));
         for _ in 0..counts[6] {
             pool.push(r.u16()?);
         }
-        let mut capsules = Vec::with_capacity(counts[7]);
+        let mut capsules = Vec::with_capacity(r.capacity_for(counts[7], 28));
         for _ in 0..counts[7] {
             let a = [r.f32()?, r.f32()?, r.f32()?];
             let radius = r.f32()?;
@@ -298,6 +298,30 @@ mod tests {
         assert!(Collision::parse("x", &[0xFF; 64]).is_err());
         // The right label, an unsupported version
         assert!(Collision::parse("x", &[2, 0, 0xE5, 0xAC, 0, 0, 0, 0]).unwrap_err().to_string().contains("version 2"));
+    }
+
+    /// A body with no nodes whose array counts are as given
+    fn body_with_counts(counts: [u32; ARRAYS]) -> Vec<u8> {
+        let mut body = vec![0u8; 32 + 24 + 8];
+        for c in counts {
+            body.extend_from_slice(&c.to_le_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn array_counts_the_body_cannot_hold_reserve_nothing() {
+        // Transforms (48 bytes each), the u16 pool and the capsules (28 bytes each), one at a time at a count
+        // that would take gigabytes
+        for (array, count) in [(1, 0x1000_0000u32), (6, 0x4000_0000), (7, 0x1000_0000)] {
+            let mut counts = [0u32; ARRAYS];
+            counts[array] = count;
+            let (res, largest) = crate::alloc_probe::largest_allocation(|| Collision::parse_body("x", &body_with_counts(counts)));
+            assert!(res.is_err(), "array {array}");
+            assert!(largest < 1 << 20, "array {array} of {count}: asked for {largest} bytes");
+        }
+        // No arrays at all is an empty, valid resource
+        assert!(Collision::parse_body("x", &body_with_counts([0; ARRAYS])).unwrap().nodes.is_empty());
     }
 
     #[test]

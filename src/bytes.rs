@@ -71,6 +71,13 @@ impl<'a> Reader<'a> {
         self.buf.len() - self.pos
     }
 
+    /// How many items to reserve room for when the file says there are `count` of them, each at least
+    /// `item_size` bytes in the rest of the data: no more than the rest could hold, so a corrupt count
+    /// cannot ask for gigabytes before the first item is read. (The reads still stop at the end of the data.)
+    pub fn capacity_for(&self, count: usize, item_size: usize) -> usize {
+        count.min(self.remaining() / item_size.max(1))
+    }
+
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
@@ -95,5 +102,24 @@ impl<'a> Reader<'a> {
         let s = String::from_utf8_lossy(&rest[..len]).into_owned();
         self.pos += len + 1;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_never_exceeds_what_the_rest_of_the_data_holds() {
+        let data = [0u8; 100];
+        let mut r = Reader::new(&data);
+        assert_eq!(r.capacity_for(10, 8), 10);
+        assert_eq!(r.capacity_for(0xFFFF_FFFF, 8), 12);
+        assert_eq!(r.capacity_for(usize::MAX, 1), 100);
+        assert_eq!(r.capacity_for(5, 0), 5);
+        r.skip(90).unwrap();
+        assert_eq!(r.capacity_for(10, 8), 1);
+        r.skip(10).unwrap();
+        assert_eq!(r.capacity_for(10, 8), 0);
     }
 }

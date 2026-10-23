@@ -17,6 +17,8 @@
 //! with a fixed key. The unpacked body is a table of file names followed by a
 //! table of (offset, size) pairs pointing at the file data.
 
+use std::io::Read as _;
+
 use anyhow::{bail, ensure, Context, Result};
 use md5::{Digest, Md5};
 
@@ -72,7 +74,13 @@ impl Vromfs {
         } else if zstd_packed {
             let mut packed = body.to_vec();
             deobfuscate(&mut packed);
-            zstd::bulk::decompress(&packed, full_size).context("zstd decompression of vromfs body failed")?
+            // The header's size is a claim: let the buffer grow with what the stream really holds, and stop a
+            // stream that holds more than it said
+            let mut out = Vec::with_capacity(full_size.min(packed.len().saturating_mul(64)));
+            zstd::stream::read::Decoder::new(&packed[..])
+                .and_then(|d| d.take(full_size as u64 + 1).read_to_end(&mut out))
+                .context("zstd decompression of vromfs body failed")?;
+            out
         } else {
             bail!("zlib-packed vromfs bodies are not supported yet");
         };
@@ -142,6 +150,11 @@ fn read_file_table(body: &[u8]) -> Result<Vec<VromFile>> {
 
     let mut names = Reader::at(body, names_ofs)?;
     let mut entries = Reader::at(body, data_ofs)?;
+    // A name is 8 bytes of the name table and a file's entry 16 of the data table
+    ensure!(
+        names_count <= names.remaining() / 8 && names_count <= entries.remaining() / 16,
+        "the file tables claim {names_count} files but hold fewer"
+    );
     let mut files = Vec::with_capacity(names_count);
     for _ in 0..names_count {
         let name_ofs = names.u64()? as usize;
@@ -159,6 +172,56 @@ fn read_file_table(body: &[u8]) -> Result<Vec<VromFile>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VRFs file around `body`: stored as it is, or zstd-packed and obfuscated, with the header
+    /// claiming `full_size` unpacked bytes
+    fn vromfs(body: &[u8], full_size: u32, packed: bool) -> Vec<u8> {
+        let mut out = b"VRFs".to_vec();
+        out.extend_from_slice(b"pc\0\0");
+        out.extend_from_slice(&full_size.to_le_bytes());
+        if packed {
+            let mut z = zstd::bulk::compress(body, 3).unwrap();
+            deobfuscate(&mut z); // the XOR is its own inverse
+            out.extend_from_slice(&(z.len() as u32 | 0x4000_0000).to_le_bytes());
+            out.extend_from_slice(&z);
+        } else {
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    /// The two tables at the start of a body: names and data, each claiming `count` entries at offset 32
+    fn tables(count: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        for _ in 0..2 {
+            body.extend_from_slice(&32u32.to_le_bytes());
+            body.extend_from_slice(&count.to_le_bytes());
+            body.extend_from_slice(&[0; 8]);
+        }
+        body
+    }
+
+    #[test]
+    fn a_file_table_count_the_body_cannot_hold_reserves_nothing() {
+        let (res, largest) = crate::alloc_probe::largest_allocation(|| Vromfs::parse(&vromfs(&tables(0x1000_0000), 32, false)));
+        let err = res.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("claim"), "{err}");
+        assert!(largest < 1 << 20, "asked for {largest} bytes");
+        // The same file with an empty table is a valid, empty archive
+        assert!(Vromfs::parse(&vromfs(&tables(0), 32, false)).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn a_claimed_unpacked_size_does_not_size_the_buffer() {
+        // 32 bytes of zstd-packed table, in a header that says 4 GB
+        let (res, largest) = crate::alloc_probe::largest_allocation(|| Vromfs::parse(&vromfs(&tables(0), 0xF000_0000, true)));
+        let err = res.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("unpacked size"), "{err}");
+        assert!(largest < 1 << 24, "asked for {largest} bytes");
+        // The truthful header still unpacks
+        assert!(Vromfs::parse(&vromfs(&tables(0), 32, true)).unwrap().files.is_empty());
+    }
 
     #[test]
     fn deobfuscation_restores_zstd_magic() {

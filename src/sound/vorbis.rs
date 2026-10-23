@@ -129,7 +129,9 @@ pub fn packets(data: &[u8]) -> impl Iterator<Item = Result<&[u8]>> {
 pub fn decode(s: &Sample, data: &[u8]) -> Result<Vec<i16>> {
     let h = headers(s)?;
     let mut pwr = PreviousWindowRight::new();
-    let mut out = Vec::with_capacity(s.frames as usize * usize::from(s.channels));
+    // The frame count is the header's claim: reserve what the data could plausibly decode to (Vorbis packs
+    // well past 10:1, so 64 samples a byte leaves room) and let the buffer grow if a stream is denser
+    let mut out = Vec::with_capacity((s.frames as usize * usize::from(s.channels)).min(data.len().saturating_mul(64)));
     for (i, packet) in packets(data).enumerate() {
         let block: InterleavedSamples<i16> = read_audio_packet_generic(&h.ident, &h.setup, packet?, &mut pwr)
             .map_err(|e| anyhow!("Vorbis packet {i}: {e:?}"))?;
@@ -350,6 +352,15 @@ mod tests {
         let s = Sample { name: None, rate: 48000, channels: 2, frames: 0, loop_points: None, vorbis_setup: Some(0xA722_97FF), data: 0..0 };
         let h = headers(&s).unwrap();
         assert_eq!((h.ident.blocksize_0, h.ident.blocksize_1, h.ident.audio_sample_rate), (8, 11, 48000));
+    }
+
+    #[test]
+    fn a_claimed_length_does_not_size_the_pcm_buffer() {
+        // A stereo sample of 4 billion frames and no data: the header's frame count is only a claim
+        let s = Sample { name: None, rate: 48000, channels: 2, frames: u32::MAX, loop_points: None, vorbis_setup: Some(0xA722_97FF), data: 0..0 };
+        let (pcm, largest) = crate::alloc_probe::largest_allocation(|| decode(&s, &[]));
+        assert!(pcm.unwrap().is_empty());
+        assert!(largest < 1 << 24, "asked for {largest} bytes");
     }
 
     #[test]

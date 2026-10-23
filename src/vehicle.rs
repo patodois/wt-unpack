@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use memmap2::Mmap;
 
 use wt_blk::dxp_and_grp::{
@@ -188,6 +188,8 @@ pub fn texture_index(game: &Path) -> Result<TextureIndex> {
             continue;
         }
         let dump_size = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+        // The size is the pack's claim: it must fit in the file before a buffer is made for it
+        ensure!(dump_size as u64 <= f.metadata()?.len().saturating_sub(16), "{}: the pack claims a header of {dump_size} bytes, longer than the file", path.display());
         let mut dump = vec![0u8; dump_size];
         f.read_exact(&mut dump)?;
         let mut r = bytes::Reader::new(&dump);
@@ -694,6 +696,22 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
 mod tests {
     use super::*;
     use wt_blk::dxp_and_grp::dynmodel::{channel, Bone, Channel, SkinMaterial};
+
+    #[test]
+    fn a_texture_pack_claiming_a_header_the_file_lacks_reserves_nothing() {
+        let dir = std::env::temp_dir().join(format!("wt-unpack-dxp-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // "DxP2", 8 bytes, then a header size of 4 billion in a 16-byte file
+        let mut pack = b"DxP2".to_vec();
+        pack.extend_from_slice(&[0; 8]);
+        pack.extend_from_slice(&0xF000_0000u32.to_le_bytes());
+        fs::write(dir.join("big.dxp.bin"), &pack).unwrap();
+        let (res, largest) = crate::alloc_probe::largest_allocation(|| texture_index(&dir));
+        let err = res.err().map(|e| e.to_string()).unwrap_or_default();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(err.contains("claims a header"), "{err}");
+        assert!(largest < 1 << 24, "asked for {largest} bytes");
+    }
 
     /// A skin vertex buffer of 8-byte vertices holding bone slots and weights as the E3DCOLORs of texture
     /// coordinates 4 and 5. Each vertex is `(slots, weights)` in the order x, y, z, w; E3DCOLOR is stored

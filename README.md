@@ -12,6 +12,9 @@ Rust tools for reading War Thunder's game data (Dagor Engine) from your own inst
   heightmap, or the landmesh's collision mesh), the ground's land classes and weights, and the placed
   objects (rendinst) with their transforms, rotations and real models. With the bridge feature a level
   loads as a whole scene (see "Levels as scenes").
+- **Rigs and collision:** the data a game rewrite needs to drive a tank (turret limits, drive train, wheels,
+  track belts, named attachment points) as plain structs, and the collision shapes of placed objects. See
+  "Using wt-unpack from another game".
 - **Sounds:** FMOD Studio sound banks (`sound/*.assets.bank`). Samples come out as Ogg Vorbis, copied
   without re-encoding, or as WAV, including FMOD's own FADPCM codec.
 - **Export:** vehicles and terrain to glTF 2.0, which opens in Blender, three.js, Godot and most 3D tools;
@@ -135,7 +138,160 @@ wheel nodes, see above), and glass blends.
 ```sh
 cargo build --release --features bridge
 wt-unpack check-bridge              # load and validate every tank, aircraft and ship
+wt-unpack rig tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman   # print a tank's rig
 ```
+
+## Using wt-unpack from another game (rewrite-bridge)
+
+A game rewrite that wants a War Thunder tank to drive, with its turret, wheels and tracks working from the
+game's data, needs no knowledge of Dagor's formats. `WarThunder` gives it three things, all from the player's
+installed copy:
+
+- **The model and its sockets.** `load_animated(id)` returns the model plus a `Socket` for every node worth
+  attaching to or turning: the turret, gun, barrel and muzzle, the wheels, the track belts, the crew cameras,
+  the hatches and the effect emitters.
+- **The rig**, `WarThunder::vehicle_rig(id)`: plain structs with the turret limits and speeds, the drive train,
+  the track gauge, the wheel radii and the track texture rate, and a small driving model. Only the skeleton and
+  meshes are read, so it is quick. `wt_unpack::rig` documents every field with its source key and unit.
+- **Collision of level objects**, `WarThunder::load_level_collision(level_id)`, since `Scene` has no field for it.
+
+```rust
+use rewrite_bridge::Provider;
+use wt_unpack::bridge::WarThunder;
+use wt_unpack::rig::{wheel_rotation, TurretAim};
+use wt_unpack::tank::Controls;
+
+let wt = WarThunder::new("/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game");
+let id = "tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman";
+let tank = wt.load_animated(id)?;               // Model + sockets; `load(id)` is the same model
+let rig = wt.vehicle_rig(id)?;                  // limits, speeds, gearing, wheels, belts
+let (turret, gun) = (tank.socket("turret").unwrap().node, tank.socket("gun").unwrap().node);
+let mut aim = TurretAim::default();
+let mut driving = rig.driving_model().unwrap(); // Sherman: tops out at 38.6 km/h from the gearing
+
+// Every frame
+aim.step(rig.turret.as_ref().unwrap(), yaw_input, pitch_input, dt); // at 24 and 4 deg/s, within -180..180 / -10..25
+nodes[turret].rotation = aim.head_rotation();
+nodes[gun].rotation = aim.gun_rotation();
+driving.step(Controls { throttle, steer }, dt);
+heading += driving.yaw_rate_rad_s() * dt;               // positive turns left (about +Y)
+position += forward(heading) * driving.speed_ms() * dt; // the hull's pose is yours
+for (wheel, angle) in rig.gear.as_ref().unwrap().wheels.iter().zip(driving.wheel_angles()) {
+    nodes[wheel.node].rotation = wheel_rotation(*angle); // about +X; forward is positive
+}
+// driving.belt_offsets() are V offsets for the track meshes' UVs (rig.gear.belts[i].mesh)
+```
+
+`cargo run --release --features bridge --example drive_tank -- $GAME` runs this loop headless and prints the
+state. The axes are the bridge's (front +Z, left +X, up +Y); `wt_unpack::rig` says which way each rotation
+goes.
+
+### Sockets
+
+A socket is a node of the model's skeleton (its pivot, in the model's axes; identity offset). Names are the
+game's node names, except that the turret group is named by role, as the unit BLK
+(`gamedata/units/tankmodels/<unit>.blk` in `aces.vromfs.bin`) names its nodes:
+
+| Socket | Node (Sherman) | Named by |
+|---|---|---|
+| `turret`, `gun`, `barrel` | `bone_turret`, `bone_gun`, `bone_gun_barrel` | `commonWeapons.Weapon.turret{head, gun, barrel}` |
+| `muzzle` | `emtr_gun_flame` | `Weapon.flash` |
+| `emitter` | `bone_gun_barrel` | `Weapon.emitter` (where the shell leaves) |
+| `weapon_<i>_turret`, `_gun`, `_barrel`, `_muzzle`, `_emitter` | the coaxial (`i` = 1) and anti-aircraft (2) guns | the other `Weapon` blocks |
+| `wheel_l_01`, `wheel_r_top_02`, `wheel_l_drive`, `wheel_r_back`, ... | the 22 wheels | the skeleton, verbatim |
+| `track_l`, `track_r` | the track belts | the skeleton, verbatim |
+| `camera_driver`, `camera_gunner`, `camera_commander` | `bone_camera_*`, the crew's eye points | the skeleton |
+| `hatch_01`, ... | the hatches | the skeleton, verbatim |
+| `emtr_*` | exhaust, lanterns, fires, track dust | the skeleton, verbatim |
+
+The Sherman has 77 sockets. A node the unit names that the skeleton lacks gets none and is listed in
+`VehicleRig::missing_nodes`. Sockets are for ground vehicles; aircraft and ships return none. Sockets carry a
+position only: the game's own node axes are not carried (many are mirrored, and which way an emitter fires is
+engine code).
+
+### The rig
+
+Everything below is read from the unit BLK unless noted; the units are those of the BLK. A field the unit does
+not give is `None`, or the mount is left out; nothing is guessed.
+
+- `turret`, `weapons` (`tank::Turret`): node names (`turret.head`, `gun`, `barrel`, `Weapon.emitter`, `flash`),
+  traverse `limits.yaw` and elevation `limits.pitch` in degrees (Sherman: -180..180, -10..25), the elevation
+  limits over parts of the traverse (`limitsTable`), and the speeds `speedYaw` and `speedPitch` in degrees per
+  second.
+- `drive` (`tank::Drive`): `VehiclePhys.Mass.TakeOff` (kg), `engine.horsePowers`, `engine.maxRPM`,
+  `mechanics.gearRatios`, `mainGearRatio` and `sideGearRatio`, `driveGearRadius` (m), the brake force, the
+  track width and length, the suspension's wheel radii, and the top-level `maxAccel` (m/s²), `maxDecel`,
+  `maxAngSpeed` (deg/s) and `maxAngAccel`. `speeds` (`DriveSpeeds`) has the top speeds the gearing allows:
+  38.6 km/h forward and 5.0 km/h in reverse for the Sherman.
+- `gear` (`GearRig`): the track gauge in metres (2.163 for the Sherman), and for each wheel its node, side, kind
+  (road, return roller, sprocket, idler), radius in metres (from the unit's suspension values, or measured from
+  the wheel's mesh where the unit has none, which `radius_source` says) and pivot; for each belt its node, mesh
+  and `v_per_metre`, the texture scroll rate (1.614 for the Sherman).
+- `driving_model()`: the simple kinematic model of `tank::DriveState` plus the wheels and belts it turns
+  (see "Wheels and tracks" above for what is left out).
+
+Not available, and why: the crew's positions (the unit's `tank_crew` names damage parts such as `gunner_dm`,
+which are geometry of the damage model, not points of the render skeleton), the cockpit's `headPos` (its frame is
+not documented), the suspension simulation (`PhysSys`) and the engine's real vehicle physics (not public).
+
+### Level collision
+
+Every placed object has a collision resource in the game's `.grp` packs, `<object>_collision` (class
+`ACE50000`, version 3, which `wt_unpack::collision` decodes: 19,799 resources, 57,415 nodes, 11.5 million
+triangles, all of them). `Scene` has no collision field at the bridge revision this crate uses, so the shapes come
+from `WarThunder::load_level_collision("levels/avg_berlin.bin")`, in the objects' own space and the bridge's axes:
+`collision.object(&model.name)` is the collision of a scene model, to be placed by the same `Instance`
+transform. Each `ObjectCollision` has a `model` with the triangle meshes, convex hulls and boxes (one mesh per
+collision node, its material named after the node's physical material: `concrete`, `wood`...) and the capsules
+(tree trunks) a triangle model cannot hold. Berlin: 446 of its 476 objects have collision, with 229,159 triangles and 11
+capsules, loaded in about a second. The 30 without are debris pieces the destruction effects scatter (across
+all 160 levels, 2,520 of 31,010 placed objects lack a resource).
+
+The ground has no entry: the scene's `terrain` model is the landmesh's collision mesh (and the heightmap's grid
+where it is finer). Not carried: point nodes (no geometry), the game's 8 sphere nodes, and the BVH's edge flags.
+
+### Memory
+
+Loading Berlin's scene (`load_scene("levels/avg_berlin.bin")`, 512,641 placements) peaked near 1.1 GB of live
+allocations (the scene itself is 830 MB), and a program that dropped the scene still showed about 1.2 GB resident.
+The loader keeps nothing alive for that: with the scene dropped, no allocation of the level load is left (the
+allocator's statistics say 0 MB live). The memory is **retained by the system allocator**: freed pages are handed
+back lazily, and on macOS they stay counted in the process's resident size and footprint until the system needs
+them. What the provider does about it:
+
+- it owns every cache it uses (the texture and pack indexes, the model descriptions of the vehicles, the unit
+  index; about 26 MB after a level) and nothing is global; dropping the `WarThunder` value, or calling
+  `clear_caches()`, frees them, and the pack indexes are shared between vehicle and level loads;
+- `clear_caches()` and the end of every level load ask the allocator to release its free pages
+  (`wt_unpack::memory::release_freed_memory`: `malloc_zone_pressure_relief` on macOS, `malloc_trim` on glibc).
+  This lowers the resident size on a quiet system, but macOS can keep reporting the pages until it reclaims them,
+  so the footprint of a process that loaded a level stays near its peak. `drop(scene); wt.clear_caches();` is
+  what a consumer should do when it is done with a level;
+- the peak is lower. The loader no longer keeps a second copy of every object texture (a texture is decoded once
+  and the later materials copy it from the first that holds it), parses only the needed entries of `riDesc.bin`
+  instead of holding its whole tree (about 200 MB), shares the paths of the texture index, and trims the meshes'
+  spare capacity. The scene is byte for byte the same (checked with a hash of every mesh, image and
+  transform).
+
+Berlin, measured with `/usr/bin/time -l` on a Mac that was also busy with other work, so the OS-reported
+numbers move between runs:
+
+| Berlin | Before | After |
+|---|---|---|
+| Peak live allocations | 1,110 MB | 870 MB |
+| Scene data at the end | 830 MB | 826 MB |
+| Peak memory footprint | 1,590 to 1,610 MB | 1,150 to 1,370 MB |
+| Maximum resident set size | 1,440 to 1,760 MB | 800 to 1,370 MB |
+| Live after dropping the scene | 0 MB | 26 MB (the indexes), 0 MB after `clear_caches()` |
+
+```sh
+/usr/bin/time -l cargo run --release --features bridge --example scene_memory -- $GAME levels/avg_berlin.bin
+```
+
+`examples/scene_memory.rs` prints the live, resident and footprint sizes at each step (and a hash of the whole
+scene with `WT_DIGEST=1`, to see that a change leaves it alone); `tests/memory.rs` checks the live numbers (macOS).
+The peak is still the scene plus the allocator's fragmentation: the object textures are 256 px copies, one per
+material, because a bridge `Material` owns its image.
 
 ## Levels as scenes
 
@@ -173,8 +329,9 @@ Not in the scene, and why:
 The conversion is bounded by budgets that are not game data and live in `SceneOptions`: the colour map
 memory, the baked ground pictures (2 m per pixel where the heightmap is finer than the landmesh, 16 m
 elsewhere, spacings growing together past 384 MB), the terrain vertex count, and the object textures
-(256 px on the longest side). Berlin (512,641 placements of 452 models) loads in about 7 s and peaks near
-1.7 GB; `cargo run --release --features bridge --example render_scene -- $GAME levels/avg_berlin.bin
+(256 px on the longest side). Berlin (512,641 placements of 452 models) loads in about 7 s with about 850 MB
+of scene data and a peak near 1.3 GB (see "Memory" above); the collision of the objects is separate
+(`load_level_collision`, see "Level collision"). `cargo run --release --features bridge --example render_scene -- $GAME levels/avg_berlin.bin
 out.png --eye 2150,90,1380 --at 2400,40,1560` draws a scene from a camera with a small software
 rasteriser (albedo with a headlight on a flat background, since the game's sun and sky are not in the
 data).
@@ -277,8 +434,11 @@ The field names and units come from open-source community clients, chiefly the
 
 ```sh
 cargo test                                     # unit tests; no game files needed
-cargo test --features live                     # also the live telemetry client, against a mock server
+cargo test --features live,bridge              # also the live telemetry client (against a mock server) and the bridge
 WT_GAME_DIR=$GAME cargo test --release         # also runs the tests that read your installed game
+WT_GAME_DIR=$GAME cargo test --release --features live,bridge   # all of it: the Sherman's rig and sockets, every
+                                               # collision resource, Berlin's scene and collision, and the
+                                               # memory check (tests/memory.rs)
 ```
 
 Checked against War Thunder 2.59.0.80 on macOS:
@@ -289,7 +449,10 @@ Checked against War Thunder 2.59.0.80 on macOS:
 | Textures | 148,335, all decoded except 375 stored as deltas to a paired base texture |
 | Models | tanks 3,656/3,656, aircraft 1,695/1,695, ships 1,925/1,925, with every skeleton |
 | Levels | 160/160 parse fully: terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
-| Level scenes | 160/160 load and validate through the bridge in 0.6 to 19 s, peak RSS 0.65 to 1.96 GB (avg_falklands); every placed object's pool resolves to a model, and 225 models that are only decals have nothing to draw |
+| Level scenes | 160/160 load and validate through the bridge in 0.8 to 33 s (two runs at once), peak RSS 0.60 to 1.79 GB (avg_breslau), where it was 0.65 to 1.96 GB; every placed object's pool resolves to a model, and 225 models that are only decals have nothing to draw |
+| Level collision | 160/160 levels: 28,490 placed objects have collision resources and 0 fail to decode; 2,520 have none (debris) |
+| Collision resources | 19,799/19,799 decode (57,415 nodes, 11.5 million triangles), every vertex inside its node's box |
+| Vehicle rigs | see the `check-bridge` line below |
 | Sound samples | 156,223 in 123 banks decoded: 148,743 Vorbis (91.7 hours) and 7,480 FADPCM |
 
 ## Disclaimer

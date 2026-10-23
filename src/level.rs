@@ -28,7 +28,7 @@
 //! | `TEX.` | end of the texture list                                                   |
 //! | `lmap` | landmesh (`lndm` v4): render cells, detail map, land ray tracer           |
 //! | `HM2`  | block-compressed 16-bit heightmap (see [`Heightmap`])                     |
-//! | `LMp2` | physics map (ground material per cell)                                    |
+//! | `LMp2` | physics map (ground material per cell; header read, see [`PhysMapInfo`])    |
 //! | `hspl` `spgz` `stbl` | splines, road grid (zstd), road intersections               |
 //! | `WBBX` | world bounding box, six floats                                            |
 //! | `SCN`  | static render scene                                                       |
@@ -145,8 +145,53 @@ impl<'a> Level<'a> {
         self.find("lmap").map(|b| LandMesh::parse(b.data).context("lmap")).transpose()
     }
 
+    /// What the physics material map (`LMp2`) says about itself; its bitmap and decals are not decoded
+    pub fn phys_map_info(&self) -> Result<Option<PhysMapInfo>> {
+        self.find("LMp2").map(|b| PhysMapInfo::parse(b.data).context("LMp2")).transpose()
+    }
+
     pub fn heightmap(&self) -> Result<Option<Heightmap>> {
         self.find("HM2").map(|b| Heightmap::parse(b.data).context("HM2")).transpose()
+    }
+}
+
+/// The header of the physics material map (`LMp2`, `load_phys_map` in Dagor's `physMapLoad.cpp`): which
+/// physical materials the level's ground can have and how its map is laid out. The map itself is a tree
+/// bitmap of material indices plus decal meshes in a compressed block, which is not decoded.
+///
+/// ```text
+/// i32 version (0 has a second map header after the names)
+/// i32 name count, names (Dagor strings): the physical materials, e.g. `soil`, `road`
+/// i32 width, i32 height   texels of the map
+/// f32 world x, z          where the map starts
+/// f32 scale               metres per texel
+/// nested block            the bitmap and the decals
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysMapInfo {
+    pub version: u32,
+    pub materials: Vec<String>,
+    pub size: [u32; 2],
+    pub world_origin: [f32; 2],
+    pub metres_per_texel: f32,
+}
+
+impl PhysMapInfo {
+    fn parse(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let version = r.u32()?;
+        ensure!(version <= 4, "unknown physics map version {version}");
+        let count = r.u32()? as usize;
+        ensure!(count <= data.len() / 4, "physics map claims {count} materials");
+        let materials = (0..count).map(|_| dstring(&mut r)).collect::<Result<Vec<_>>>()?;
+        if version == 0 {
+            // The level-1 map's size, the heightmap offset and the grid scale, which nothing uses
+            r.skip(5 * 4)?;
+        }
+        let size = [r.u32()?, r.u32()?];
+        let world_origin = [r.f32()?, r.f32()?];
+        let metres_per_texel = r.f32()?;
+        Ok(PhysMapInfo { version, materials, size, world_origin, metres_per_texel })
     }
 }
 
@@ -1168,6 +1213,26 @@ mod tests {
     }
 
     #[test]
+    fn physics_map_header_lists_materials_and_layout() {
+        let mut lmp = 1u32.to_le_bytes().to_vec();
+        lmp.extend_from_slice(&2u32.to_le_bytes());
+        lmp.extend(dstr("default"));
+        lmp.extend(dstr("road"));
+        for v in [2048u32, 2048] {
+            lmp.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [-100.0f32, 50.0, 2.0] {
+            lmp.extend_from_slice(&v.to_le_bytes());
+        }
+        let raw = level(&[block(b"LMp2", &lmp)]);
+        let info = Level::parse(&raw).unwrap().phys_map_info().unwrap().unwrap();
+        assert_eq!(info, PhysMapInfo { version: 1, materials: vec!["default".into(), "road".into()], size: [2048, 2048], world_origin: [-100.0, 50.0], metres_per_texel: 2.0 });
+        // A level without one has none, and a short one is an error
+        assert!(Level::parse(&level(&[])).unwrap().phys_map_info().unwrap().is_none());
+        assert!(Level::parse(&level(&[block(b"LMp2", &lmp[..12])])).unwrap().phys_map_info().is_err());
+    }
+
+    #[test]
     fn truncated_level_is_an_error() {
         let mut raw = level(&[block(b"WBBX", &[0; 24])]);
         raw.truncate(raw.len() - 8);
@@ -1357,6 +1422,133 @@ mod tests {
         // Rotated 90 degrees about Y, halfway along the cell in Z
         assert_eq!(found[1].tm[0], [0.0, 0.0, -1.0]);
         assert!(near(found[1].tm[3], [100.0, 10.0, 216.0]), "{:?}", found[1].tm[3]);
+    }
+
+    /// A one-cell RIGz layer with one pool (`tree`, with the given bits and palette count) and the given
+    /// instance bytes (each followed by the per-instance dword the dump promises), counted as `n`
+    fn rigz_layer(bits: u32, palette_count: i32, inst: &[u8], n: u32) -> Vec<u8> {
+        let mut dump = vec![0u8; 760];
+        let put = |d: &mut Vec<u8>, at: usize, bytes: &[u8]| d[at..at + bytes.len()].copy_from_slice(bytes);
+        put(&mut dump, 8, &160u32.to_le_bytes());
+        put(&mut dump, 12, &1u32.to_le_bytes());
+        put(&mut dump, 24, &1i32.to_le_bytes());
+        put(&mut dump, 28, &1i32.to_le_bytes());
+        put(&mut dump, 32, &8i16.to_le_bytes());
+        put(&mut dump, 34, &[1, 1]);
+        put(&mut dump, 112, &4f32.to_le_bytes());
+        put(&mut dump, 128, &712u32.to_le_bytes());
+        put(&mut dump, 132, &1u32.to_le_bytes());
+        put(&mut dump, 160 + 24, &0i16.to_le_bytes());
+        put(&mut dump, 160 + 26, &100i16.to_le_bytes());
+        put(&mut dump, 160 + 32, &744u64.to_le_bytes());
+        for s in 1..=64 {
+            put(&mut dump, 160 + 32 + 8 * s, &752u64.to_le_bytes());
+        }
+        put(&mut dump, 712 + 8, &752u64.to_le_bytes());
+        put(&mut dump, 712 + 24, &bits.to_le_bytes());
+        put(&mut dump, 712 + 28, &palette_count.to_le_bytes());
+        put(&mut dump, 744, &0u32.to_le_bytes());
+        put(&mut dump, 748, &n.to_le_bytes());
+        put(&mut dump, 752, b"tree\0");
+        let mut pregen = nested(1, &zstd::bulk::compress(inst, 3).unwrap());
+        pregen.resize(pregen.len() + 200, 0);
+        let stream = [(dump.len() as u32).to_le_bytes().to_vec(), dump].concat();
+        [nested(1, &zstd::bulk::compress(&stream, 3).unwrap()), nested(0, &pregen)].concat()
+    }
+
+    #[test]
+    fn palette_pools_turn_by_their_id_and_others_keep_the_identity() {
+        // Position-only instances: x, y, z, then scale (1.0 is 256) with the palette id in its low bits
+        let inst: Vec<u8> = [[0i16, 0, 0, 256], [0, 0, 0, 256 | 1], [0, 0, 0, 512 | 3]].iter().flat_map(|q| q.iter().flat_map(|v| v.to_le_bytes()).chain([0u8; 4])).collect();
+        // Position-only with a palette of four: id 1 is a quarter turn, id 3 three quarters, scale 2
+        let rigz = rigz_layer(1 | 2, 4, &inst, 3);
+        let layers = RendInstLayer::parse_all(&rigz).unwrap();
+        let (pool, found) = (&layers[0].pools[0], layers[0].instances().unwrap());
+        assert!(pool.pos_only && pool.palette_rotation);
+        assert_eq!(pool.palette_count, 4);
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(near(found[0].tm[0], [1.0, 0.0, 0.0]) && near(found[0].tm[2], [0.0, 0.0, 1.0]));
+        // x axis (cos, 0, sin), z axis (-sin, 0, cos)
+        assert!(near(found[1].tm[0], [0.0, 0.0, 1.0]) && near(found[1].tm[2], [-1.0, 0.0, 0.0]), "{:?}", found[1].tm);
+        assert!(near(found[2].tm[0], [0.0, 0.0, -2.0]) && near(found[2].tm[1], [0.0, 2.0, 0.0]) && near(found[2].tm[2], [2.0, 0.0, 0.0]), "{:?}", found[2].tm);
+        // Without the palette flag the low bits are part of the scale and nothing turns
+        let rigz = rigz_layer(1, 0, &inst, 3);
+        let layers = RendInstLayer::parse_all(&rigz).unwrap();
+        let found = layers[0].instances().unwrap();
+        assert!(near(found[1].tm[0], [257.0 / 256.0, 0.0, 0.0]) && near(found[1].tm[2], [0.0, 0.0, 257.0 / 256.0]));
+    }
+
+    /// An `lmap` block with an empty mesh, no tile or ray tracer, and `weights` after the land class list
+    /// (`weights(record_base)` builds them given the offset records are relative to)
+    fn lmap_with_detail(classes: &[(&str, &[u8])], weights: impl Fn(usize, usize) -> Vec<u8>) -> Vec<u8> {
+        let mut head = b"lndm".to_vec();
+        head.extend_from_slice(&4u32.to_le_bytes());
+        head.extend_from_slice(&32f32.to_le_bytes());
+        head.extend_from_slice(&4096f32.to_le_bytes());
+        for v in [1i32, 1, 0, 0] {
+            head.extend_from_slice(&v.to_le_bytes());
+        }
+        head.extend_from_slice(&0u32.to_le_bytes()); // use_tile
+        let base = head.len();
+        let mut list = (classes.len() as u32).to_le_bytes().to_vec();
+        for (name, inline) in classes {
+            list.extend(nested(0, &[dstr(name), inline.to_vec()].concat()));
+        }
+        let mut detail = nested(0, &list);
+        let detail_start = base + 16;
+        detail.extend(weights(base, detail_start + detail.len()));
+        // Offsets from `base`: mesh (empty) and detail right after the table, tile after the detail data
+        for ofs in [16, 16, 16 + detail.len() as i32, 0] {
+            head.extend_from_slice(&ofs.to_le_bytes());
+        }
+        head.extend(detail);
+        head.extend(dstr("")); // no vertical texture
+        head
+    }
+
+    #[test]
+    fn detail_map_lists_land_classes_and_cell_weights() {
+        // Legacy: a 1 x 1 map of 128-texel weight textures, its one cell blending classes 0 and 1
+        let data = lmap_with_detail(&[("grass", &[]), ("road", &[7, 7])], |base, at| {
+            let mut w = Vec::new();
+            for v in [1i32, 1, 128, 128] {
+                w.extend_from_slice(&v.to_le_bytes());
+            }
+            // The one offset, then the record it names (relative to the offsets' base)
+            let record = at + w.len() + 4 - base;
+            w.extend_from_slice(&(record as i32).to_le_bytes());
+            w.extend_from_slice(&[0, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+            w.extend_from_slice(&[0; 8]); // no weight textures
+            w
+        });
+        let map = LandMesh::parse(&data).unwrap().detail_map().unwrap();
+        assert_eq!((map.width, map.height, map.tex_size, map.elem_size), (1, 1, 128, 128));
+        assert_eq!(map.land_classes.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["grass", "road"]);
+        assert_eq!((map.land_classes[0].inline_data, map.land_classes[1].inline_data), (&[][..], &[7u8, 7][..]));
+        assert_eq!((map.cell_blend_count(0), map.cell_classes(0)), (Some(2), Some(vec![0, 1])));
+        assert_eq!(map.cell_classes(1), None);
+
+        // Packed: no per-cell textures; a record of pages and ids, and the atlas
+        let data = lmap_with_detail(&[("a", &[]), ("b", &[]), ("c", &[])], |_, _| {
+            let mut w = Vec::new();
+            for v in [1i32, 1, 0, 128] {
+                w.extend_from_slice(&v.to_le_bytes());
+            }
+            w.extend_from_slice(&[0; 4 + 7 + 8]); // the offset table and the empty legacy record
+            w.extend_from_slice(&1i32.to_le_bytes()); // pages per row
+            w.extend_from_slice(&1i32.to_le_bytes()); // pages
+            // Pages 0 and 0, three classes (count - 1 = 2 in the top bits), ids 2, 0, 1
+            w.extend_from_slice(&(2u32 << 28).to_le_bytes());
+            w.extend_from_slice(&u32::from_le_bytes([2, 0, 1, 0]).to_le_bytes());
+            w.extend_from_slice(&0u32.to_le_bytes());
+            w.extend_from_slice(&3i32.to_le_bytes());
+            w.extend_from_slice(&[9, 9, 9]);
+            w
+        });
+        let map = LandMesh::parse(&data).unwrap().detail_map().unwrap();
+        assert_eq!(map.tex_size, 0);
+        assert!(matches!(&map.weights, DetailWeights::Packed { pages_per_row: 1, page_count: 1, atlas, .. } if *atlas == [9, 9, 9]));
+        assert_eq!((map.cell_blend_count(0), map.cell_classes(0)), (Some(3), Some(vec![2, 0, 1])));
     }
 
     #[test]

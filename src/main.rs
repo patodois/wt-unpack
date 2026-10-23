@@ -485,6 +485,12 @@ fn level_cmd(
             lm.cells[0], lm.cells[1], lm.land_cell_size, e[0], e[1], e[2], e[3], lm.grid_cell_size, lm.tracer_kind()
         );
     }
+    if let Some(info) = level.phys_map_info()? {
+        println!(
+            "physics map: {}x{} texels of {} m from ({}, {}), {} materials ({})",
+            info.size[0], info.size[1], info.metres_per_texel, info.world_origin[0], info.world_origin[1], info.materials.len(), info.materials.join(", ")
+        );
+    }
     if let Some(lm) = &lmesh {
         let map = lm.detail_map()?;
         let names: Vec<&str> = map.land_classes.iter().map(|c| c.name.as_str()).collect();

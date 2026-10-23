@@ -54,13 +54,23 @@ pub struct Turret {
     pub speed_pitch: f32,
 }
 
+/// `f32::clamp` without its panic: a reversed range gives its upper bound and a NaN bound is no bound
+fn clamp(x: f32, [lo, hi]: [f32; 2]) -> f32 {
+    x.max(lo).min(hi)
+}
+
+/// Whether limits make a range a turret can move in (`min <= max`, both numbers)
+fn is_range([lo, hi]: [f32; 2]) -> bool {
+    lo.is_finite() && hi.is_finite() && lo <= hi
+}
+
 impl Turret {
     /// Clamps a traverse angle to the limits; a turret with a full circle wraps around instead
     pub fn clamp_yaw(&self, yaw: f32) -> f32 {
         if self.yaw[1] - self.yaw[0] >= 360.0 {
             (yaw + 180.0).rem_euclid(360.0) - 180.0
         } else {
-            yaw.clamp(self.yaw[0], self.yaw[1])
+            clamp(yaw, self.yaw)
         }
     }
 
@@ -73,8 +83,7 @@ impl Turret {
     }
 
     pub fn clamp_pitch(&self, yaw: f32, pitch: f32) -> f32 {
-        let [lo, hi] = self.pitch_limits(yaw);
-        pitch.clamp(lo, hi)
+        clamp(pitch, self.pitch_limits(yaw))
     }
 }
 
@@ -217,16 +226,29 @@ fn weapons(root: &Block) -> Vec<Turret> {
                         Value::Point4(p) => Some(*p),
                         _ => None,
                     })
+                    // A row whose range is reversed or not a number never matches a traverse angle
+                    .filter(|p| {
+                        let ok = is_range([p[0], p[1]]) && is_range([p[2], p[3]]);
+                        if !ok {
+                            eprintln!("warning: limitsTable row {p:?} is not a range, left out");
+                        }
+                        ok
+                    })
                     .collect()
             });
+            let (yaw, pitch) = (point2(limits, "yaw")?, point2(limits, "pitch")?);
+            if !is_range(yaw) || !is_range(pitch) {
+                eprintln!("warning: weapon limits yaw {yaw:?} pitch {pitch:?} are not ranges, mount left out");
+                return None;
+            }
             Some(Turret {
                 head: text(t, "head")?.to_string(),
                 gun: text(t, "gun")?.to_string(),
                 barrel: text(t, "barrel").map(str::to_string),
                 emitter: text(w, "emitter").map(str::to_string),
                 flash: text(w, "flash").map(str::to_string),
-                yaw: point2(limits, "yaw")?,
-                pitch: point2(limits, "pitch")?,
+                yaw,
+                pitch,
                 pitch_by_yaw,
                 speed_yaw: real(w, "speedYaw")?,
                 speed_pitch: real(w, "speedPitch")?,
@@ -589,6 +611,47 @@ mod tests {
         let limited = Turret { yaw: [-15.0, 15.0], pitch_by_yaw: vec![], ..t };
         assert_eq!(limited.clamp_yaw(60.0), 15.0);
         assert_eq!(limited.pitch_limits(0.0), [-10.0, 25.0]);
+    }
+
+    #[test]
+    fn limits_that_are_reversed_or_not_numbers_cannot_panic_the_clamps() {
+        let t = from_blk("us_m4a1_76w_sherman", &sherman()).turret.unwrap();
+        // f32::clamp panics when min > max or either is NaN; built by hand, these are reachable
+        for (yaw, pitch) in [([15.0, -15.0], [25.0, -10.0]), ([f32::NAN, 15.0], [-10.0, f32::NAN]), ([-15.0, 15.0], [f32::INFINITY, f32::NEG_INFINITY])] {
+            let odd = Turret { yaw, pitch, pitch_by_yaw: vec![], ..t.clone() };
+            assert!(!odd.clamp_yaw(60.0).is_nan() && !odd.clamp_pitch(0.0, 5.0).is_nan());
+        }
+        // Ordinary limits still clamp both ways, and an unbounded side lets everything through
+        let limited = Turret { yaw: [-15.0, 15.0], pitch: [-10.0, 25.0], pitch_by_yaw: vec![], ..t };
+        assert_eq!([limited.clamp_yaw(-60.0), limited.clamp_yaw(60.0), limited.clamp_pitch(0.0, 90.0), limited.clamp_pitch(0.0, -90.0)], [-15.0, 15.0, 25.0, -10.0]);
+        assert_eq!(Turret { pitch: [f32::NAN, 25.0], ..limited }.clamp_pitch(0.0, -90.0), -90.0);
+    }
+
+    #[test]
+    fn reversed_or_non_numeric_limits_in_the_data_are_left_out() {
+        // None of the game's 1,308 turreted units has one: a mount with limits that cannot be a range is
+        // dropped like a mount without limits, and a table row that can never match is skipped
+        let edit = |f: &dyn Fn(&mut Block)| {
+            let mut root = sherman();
+            let weapons = root.blocks.iter_mut().find(|b| b.name == "commonWeapons").unwrap();
+            f(&mut weapons.blocks[0]);
+            from_blk("x", &root)
+        };
+        let set = |b: &mut Block, block: &str, key: &str, v: Value| {
+            let blk = b.blocks.iter_mut().find(|c| c.name == block).unwrap();
+            for p in blk.params.iter_mut().filter(|p| p.0 == key) {
+                p.1 = v.clone();
+            }
+        };
+        assert!(edit(&|w| set(w, "limits", "yaw", Value::Point2([30.0, -30.0]))).weapons.is_empty());
+        assert!(edit(&|w| set(w, "limits", "pitch", Value::Point2([f32::NAN, 25.0]))).weapons.is_empty());
+        let t = edit(&|w| {
+            set(w, "limitsTable", "lim2", Value::Point4([160.0, -160.0, -10.0, 25.0]));
+            set(w, "limitsTable", "lim3", Value::Point4([160.0, 180.0, 25.0, -7.0]));
+        })
+        .turret
+        .unwrap();
+        assert_eq!(t.pitch_by_yaw, vec![[-180.0, -160.0, -7.0, 25.0]]);
     }
 
     #[test]

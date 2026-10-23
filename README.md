@@ -171,7 +171,8 @@ The field names and units come from open-source community clients, chiefly the
   [vgmstream](https://github.com/vgmstream/vgmstream) (ISC) and
   [python-fsb5](https://github.com/HearthSim/python-fsb5) (MIT); no code was copied. FSB5 Vorbis drops
   the stream headers, so they are rebuilt from FMOD's fixed set of setup headers, which python-fsb5
-  extracted and vgmstream ships (`src/sound/vorbis_setups.bin.zst`, ISC notice in `src/sound/vorbis.rs`).
+  extracted and vgmstream ships (`src/sound/vorbis_setups.bin.zst`, under vgmstream's ISC licence in
+  `src/sound/LICENSE-vgmstream`).
   Vorbis decoding to WAV uses [lewton](https://github.com/RustAudio/lewton).
 - The camouflage blend is an approximation, because the game's shaders are not public. The base
   texture's alpha marks painted areas, and the camouflage and occlusion maps are sampled through the

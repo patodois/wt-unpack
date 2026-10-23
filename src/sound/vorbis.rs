@@ -18,7 +18,8 @@
 //! Snowhill, NicknineTheEagle, bxaimc, Thealexbarney, CyberBotX, EdnessP, et al. Permission to use,
 //! copy, modify, and distribute this software for any purpose with or without fee is hereby granted,
 //! provided that the above copyright notice and this permission notice appear in all copies.").
-//! The same set is in [fsbex](https://github.com/astral4/fsbex) (MIT OR Apache-2.0).
+//! vgmstream's full licence text is in `src/sound/LICENSE-vgmstream`. The same set is in
+//! [fsbex](https://github.com/astral4/fsbex) (MIT OR Apache-2.0).
 //!
 //! Repacking to Ogg is lossless: the packets are copied into Ogg pages after the rebuilt headers,
 //! with granule positions counted from each packet's block size. Decoding uses

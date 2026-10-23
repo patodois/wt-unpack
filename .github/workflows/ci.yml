@@ -21,6 +21,8 @@ jobs:
       - run: cargo build -p wt-unpack --release
       # Game-data tests skip themselves without WT_GAME_DIR; CI has no game files
       - run: cargo test -p wt-unpack
+      # The optional live telemetry client and rewrite-bridge provider
+      - run: cargo test -p wt-unpack --features live,bridge
 
   viewer:
     name: Viewer (macOS)

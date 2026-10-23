@@ -1,0 +1,7 @@
+[
+  {"type": "ground_model", "color": "#faC81E", "color[]": [250, 200, 30], "blink": 0, "icon": "Player", "icon_bg": "none", "x": 0.6, "y": 0.25, "dx": 0.6, "dy": -0.8},
+  {"type": "ground_model", "color": "#174DFF", "color[]": [23, 77, 255], "blink": 0, "icon": "MediumTank", "icon_bg": "none", "x": 0.55, "y": 0.3, "dx": 0.0, "dy": -1.0},
+  {"type": "capture_zone", "color": "#FAFAFA", "color[]": [250, 250, 250], "blink": 0, "icon": "capture_zone", "icon_bg": "none", "x": 0.5, "y": 0.5},
+  {"type": "respawn_base_tank", "color": "#174DFF", "color[]": [23, 77, 255], "blink": 0, "icon": "respawn_base_tank", "icon_bg": "none", "x": 0.2, "y": 0.9},
+  {"type": "airfield", "color": "#174DFF", "color[]": [23, 77, 255], "blink": 0, "icon": "none", "icon_bg": "none", "sx": 0.1, "sy": 0.95, "ex": 0.3, "ey": 0.95}
+]

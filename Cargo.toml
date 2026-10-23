@@ -24,7 +24,7 @@ memmap2 = "0.9"
 ureq = { version = "3.5", default-features = false, optional = true }
 # The bridge to other game rewrites (see src/bridge.rs, github.com/patodois/rewrite-bridge), and the
 # peak memory report of `check-bridge`
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "263b74c550c49873e9a8b0298ca8434803037fd8", optional = true }
+rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "1b5820180efbd585916ab206e6bcbbcf33096e1e", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }

@@ -15,6 +15,8 @@
 /// One triangle: per vertex `[u0, v0, u1, v1]`, already in texture units (0..1 per repeat)
 pub type UvTriangle = [[f32; 4]; 3];
 
+use anyhow::{ensure, Result};
+
 pub struct Image<'a> {
     pub width: usize,
     pub height: usize,
@@ -53,6 +55,8 @@ impl Image<'_> {
     }
 }
 
+/// Bakes the camouflage into `base` (`width` x `height` RGBA). A triangle with a UV that is not a finite
+/// number is an error, reported before `base` is touched.
 pub fn bake(
     base: &mut [u8],
     width: usize,
@@ -61,7 +65,10 @@ pub fn bake(
     occlusion: Option<&Image>,
     triangles: &[UvTriangle],
     opaque: bool,
-) {
+) -> Result<()> {
+    if let Some(i) = triangles.iter().position(|t| t.iter().flatten().any(|c| !c.is_finite())) {
+        ensure!(false, "triangle {i} has a texture coordinate that is not finite: {:?}", triangles[i]);
+    }
     let original = base.to_vec();
     let luma = |p: &[u8]| (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / 3.0;
 
@@ -103,14 +110,18 @@ pub fn bake(
         if area.abs() < 1e-6 {
             continue;
         }
-        let min_x = pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min).floor() as i64;
-        let max_x = pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max).ceil() as i64;
-        let min_y = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min).floor() as i64;
-        let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max).ceil() as i64;
-        // Skip degenerate mappings (e.g. huge or broken UVs) instead of looping over millions of texels
-        if (max_x - min_x) * (max_y - min_y) > (width * height) as i64 {
+        let min_x = pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min).floor();
+        let max_x = pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max).ceil();
+        let min_y = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min).floor();
+        let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max).ceil();
+        // Skip degenerate mappings (e.g. huge or broken UVs) instead of looping over millions of texels. The
+        // extents are measured in f64, and a flat triangle counts as one row or column thick: its loop still
+        // visits every texel of its length
+        let (dx, dy) = (f64::from(max_x) - f64::from(min_x), f64::from(max_y) - f64::from(min_y));
+        if dx.max(1.0) * dy.max(1.0) > (width * height) as f64 {
             continue;
         }
+        let (min_x, max_x, min_y, max_y) = (min_x as i64, max_x as i64, min_y as i64, max_y as i64);
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -130,6 +141,7 @@ pub fn bake(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,12 +160,41 @@ mod tests {
     }
 
     #[test]
+    fn texture_coordinates_that_are_not_finite_are_an_error_not_a_hang() {
+        let c = |u: f32, v: f32| [u, v, u, v];
+        let before = solid([100, 100, 100, 255]);
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut base = before.clone();
+            let tris = vec![[c(0., 0.), c(bad, 0.), c(1., 1.)]];
+            let err = bake(&mut base, 2, 2, None, None, &tris, true).unwrap_err().to_string();
+            assert!(err.contains("not finite"), "{err}");
+            assert_eq!(base, before, "a refused bake leaves the texture alone");
+        }
+        // A bad second set is as bad as a bad first one
+        let tris = vec![[[0., 0., 0., 0.], [1., 0., f32::INFINITY, 0.], [1., 1., 1., 1.]]];
+        assert!(bake(&mut solid([1, 2, 3, 255]), 2, 2, None, None, &tris, true).is_err());
+    }
+
+    #[test]
+    fn huge_mappings_are_skipped_without_overflowing_or_looping() {
+        let c = |u: f32, v: f32| [u, v, u, v];
+        // Finite but absurd: the extents saturate `as i64`, and their difference overflowed
+        let tris = vec![[c(0., 0.), c(1e30, 0.), c(1., 1.)], [c(-1e30, 0.5), c(1e30, 0.5), c(0., 0.6)]];
+        let mut base = solid([100, 100, 100, 255]);
+        let camo = solid([80, 70, 50, 255]);
+        let camo = Image { width: 2, height: 2, rgba: &camo };
+        bake(&mut base, 2, 2, Some(&camo), None, &tris, true).unwrap();
+        // Nothing was drawn, so every texel got the camouflage average
+        assert!(base.chunks_exact(4).all(|p| p == [80, 70, 50, 255]), "{base:?}");
+    }
+
+    #[test]
     fn painted_texels_take_the_camouflage_colour() {
         // Fully painted base whose detail equals the painted average: result is the camouflage colour
         let mut base = solid([100, 100, 100, 255]);
         let camo = solid([80, 70, 50, 255]);
         let camo = Image { width: 2, height: 2, rgba: &camo };
-        bake(&mut base, 2, 2, Some(&camo), None, &full_square(), true);
+        bake(&mut base, 2, 2, Some(&camo), None, &full_square(), true).unwrap();
         assert!(base.chunks_exact(4).all(|p| p == [80, 70, 50, 255]), "{base:?}");
     }
 
@@ -162,7 +203,7 @@ mod tests {
         let mut base = solid([120, 60, 30, 0]);
         let ao = solid([128, 128, 128, 255]);
         let ao = Image { width: 2, height: 2, rgba: &ao };
-        bake(&mut base, 2, 2, None, Some(&ao), &full_square(), false);
+        bake(&mut base, 2, 2, None, Some(&ao), &full_square(), false).unwrap();
         // Alpha 0 means no paint; 128/255 occlusion roughly halves the colour; alpha is kept
         assert!(base.chunks_exact(4).all(|p| p == [60, 30, 15, 0]), "{base:?}");
     }
@@ -172,7 +213,7 @@ mod tests {
         let mut base = solid([100, 100, 100, 255]);
         let camo: Vec<u8> = [[0, 0, 0, 255], [200, 100, 0, 255], [0, 0, 0, 255], [200, 100, 0, 255]].concat();
         let camo = Image { width: 2, height: 2, rgba: &camo };
-        bake(&mut base, 2, 2, Some(&camo), None, &[], true);
+        bake(&mut base, 2, 2, Some(&camo), None, &[], true).unwrap();
         assert!(base.chunks_exact(4).all(|p| p == [100, 50, 0, 255]), "{base:?}");
     }
 }

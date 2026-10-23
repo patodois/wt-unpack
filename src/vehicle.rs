@@ -684,7 +684,10 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
             // Alpha-tested materials keep their alpha; masked ones use it as the paint mask
             let opaque = !matches!(info.alpha(), Alpha::Mask(_));
             let (camo_view, ao_view) = (camo_img.as_ref().map(Image::view), ao_img.as_ref().map(Image::view));
-            camo::bake(&mut img.rgba, img.width as usize, img.height as usize, camo_view.as_ref(), ao_view.as_ref(), &bake_tris[key], opaque);
+            // A model with a texture coordinate that is not a number keeps its plain colour texture
+            if let Err(e) = camo::bake(&mut img.rgba, img.width as usize, img.height as usize, camo_view.as_ref(), ao_view.as_ref(), &bake_tris[key], opaque) {
+                eprintln!("{name}: material {} is not baked: {e:#}", info.name);
+            }
         }
         let (metal_rough, normal) = match source.decode_or_warn(&info.packed_normal) {
             Some(packed) => {

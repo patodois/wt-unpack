@@ -1,6 +1,8 @@
 //! Readers for War Thunder's Dagor Engine game data and FMOD sound banks, and a vehicle assembler
 //! built on them.
 
+#[cfg(test)]
+mod alloc_probe;
 pub mod blk;
 #[cfg(feature = "bridge")]
 pub mod bridge;
@@ -26,3 +28,7 @@ pub mod terrain;
 pub mod texlib;
 pub mod vehicle;
 pub mod vromfs;
+
+#[cfg(test)]
+#[global_allocator]
+static PROBE: alloc_probe::Probe = alloc_probe::Probe;

@@ -392,6 +392,15 @@ impl<'a> LandMesh<'a> {
         let grid_cell_size = r.f32()?;
         let land_cell_size = r.f32()?;
         let cells = [r.i32()?, r.i32()?];
+        // Every mesh cell has data in the block, so a grid the block cannot hold is a corrupt header (the
+        // terrain builder makes a tile per cell)
+        ensure!(
+            cells.iter().all(|&c| c >= 1) && i64::from(cells[0]) * i64::from(cells[1]) <= data.len() as i64,
+            "landmesh of {}x{} cells in a block of {} bytes",
+            cells[0],
+            cells[1],
+            data.len()
+        );
         let origin = [r.i32()?, r.i32()?];
         let use_tile = r.u32()? != 0;
         let base = r.pos();
@@ -407,7 +416,7 @@ impl<'a> LandMesh<'a> {
             None
         };
         let ltdump = if tracer_ofs != 0 {
-            ensure!(base + tracer_ofs as usize == r.pos() + 4, "ray tracer is not where its offset points");
+            ensure!(usize::try_from(tracer_ofs).ok().and_then(|o| base.checked_add(o)) == Some(r.pos() + 4), "ray tracer is not where its offset points");
             Some(sub_block(&mut r)?)
         } else {
             None
@@ -1027,7 +1036,11 @@ impl<'a> RendInstLayer<'a> {
         let cell_size = r.i16()?;
         let flags = r.u8()?;
         let per_inst_dwords = r.u8()? as usize;
-        ensure!(cells_w >= 0 && cells_h >= 0 && cell_count == (cells_w * cells_h) as usize, "{cell_count} cells for {cells_w}x{cells_h}");
+        ensure!(
+            cells_w >= 0 && cells_h >= 0 && Some(cell_count) == usize::try_from(i64::from(cells_w) * i64::from(cells_h)).ok(),
+            "{cell_count} cells for {cells_w}x{cells_h}"
+        );
+        ensure!(cell_count.checked_mul(RIGEN_CELL).and_then(|n| n.checked_add(cells_ofs)).is_some_and(|end| end <= dump.len()), "{cell_count} cells overrun the dump");
         ensure!(cell_size > 0, "bad cell size {cell_size}");
         let mut r = Reader::at(dump, 48)?;
         let (lc_ofs, lc_count) = ptab(&mut r)?;
@@ -1448,12 +1461,18 @@ mod tests {
     /// A one-cell RIGz layer with one pool (`tree`, with the given bits and palette count) and the given
     /// instance bytes (each followed by the per-instance dword the dump promises), counted as `n`
     fn rigz_layer(bits: u32, palette_count: i32, inst: &[u8], n: u32) -> Vec<u8> {
+        rigz_layer_grid(bits, palette_count, inst, n, (1, 1, 1))
+    }
+
+    /// Like [`rigz_layer`], with the grid the header claims: width, height and the cell table's count (the
+    /// table itself holds one cell)
+    fn rigz_layer_grid(bits: u32, palette_count: i32, inst: &[u8], n: u32, (cells_w, cells_h, cell_count): (i32, i32, u32)) -> Vec<u8> {
         let mut dump = vec![0u8; 760];
         let put = |d: &mut Vec<u8>, at: usize, bytes: &[u8]| d[at..at + bytes.len()].copy_from_slice(bytes);
         put(&mut dump, 8, &160u32.to_le_bytes());
-        put(&mut dump, 12, &1u32.to_le_bytes());
-        put(&mut dump, 24, &1i32.to_le_bytes());
-        put(&mut dump, 28, &1i32.to_le_bytes());
+        put(&mut dump, 12, &cell_count.to_le_bytes());
+        put(&mut dump, 24, &cells_w.to_le_bytes());
+        put(&mut dump, 28, &cells_h.to_le_bytes());
         put(&mut dump, 32, &8i16.to_le_bytes());
         put(&mut dump, 34, &[1, 1]);
         put(&mut dump, 112, &4f32.to_le_bytes());
@@ -1475,6 +1494,27 @@ mod tests {
         pregen.resize(pregen.len() + 200, 0);
         let stream = [(dump.len() as u32).to_le_bytes().to_vec(), dump].concat();
         [nested(1, &zstd::bulk::compress(&stream, 3).unwrap()), nested(0, &pregen)].concat()
+    }
+
+    #[test]
+    fn rendinst_grids_the_dump_cannot_hold_are_errors() {
+        let inst = [0u8; 12];
+        let err = |grid| RendInstLayer::parse_all(&rigz_layer_grid(0, 0, &inst, 0, grid)).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        // 65536 x 65536 overflowed the i32 product (a panic in debug builds)
+        assert!(err((65536, 65536, 0)).contains("cells"), "{}", err((65536, 65536, 0)));
+        // 2^30 cells that the table's count agrees with: nothing may be sized by it before it is checked
+        let (e, largest) = crate::alloc_probe::largest_allocation(|| err((1 << 15, 1 << 15, 1 << 30)));
+        assert!(e.contains("overrun"), "{e}");
+        assert!(largest < 1 << 24, "asked for {largest} bytes");
+    }
+
+    #[test]
+    fn a_negative_ray_tracer_offset_is_an_error() {
+        let mut data = lmap_with_detail(&[("grass", &[])], |_, _| Vec::new());
+        let base = 36; // after the magic, version, two cell sizes, cells, origin and use_tile
+        data[base + 12..base + 16].copy_from_slice(&(-1i32).to_le_bytes());
+        let err = LandMesh::parse(&data).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("ray tracer"), "{err}");
     }
 
     #[test]
@@ -1570,6 +1610,24 @@ mod tests {
         assert_eq!(map.tex_size, 0);
         assert!(matches!(&map.weights, DetailWeights::Packed { pages_per_row: 1, page_count: 1, atlas, .. } if *atlas == [9, 9, 9]));
         assert_eq!((map.cell_blend_count(0), map.cell_classes(0)), (Some(3), Some(vec![2, 0, 1])));
+    }
+
+    #[test]
+    fn landmesh_cells_must_fit_the_data() {
+        let data = lmap_with_detail(&[("grass", &[])], |_, _| Vec::new());
+        let with_cells = |x: i32, z: i32| {
+            let mut d = data.clone();
+            d[16..20].copy_from_slice(&x.to_le_bytes());
+            d[20..24].copy_from_slice(&z.to_le_bytes());
+            LandMesh::parse(&d).err().map(|e| e.to_string())
+        };
+        assert_eq!(with_cells(1, 1), None);
+        assert_eq!(with_cells(2, 3), None);
+        // A grid of 2^30 cells, a negative one and an empty one, in a block of a few hundred bytes
+        for (x, z) in [(32768, 32768), (i32::MAX, i32::MAX), (-1, 4), (4, 0)] {
+            let err = with_cells(x, z).unwrap_or_default();
+            assert!(err.contains("cells"), "{x}x{z}: {err:?}");
+        }
     }
 
     #[test]

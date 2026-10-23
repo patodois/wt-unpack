@@ -357,6 +357,22 @@ fn transform(m: &[f32; 16], p: [f32; 3], w: f32) -> [f32; 3] {
     [0, 1, 2].map(|r| m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r] * w)
 }
 
+/// A normal through a node's matrix: by the inverse transpose of its 3 x 3 part, which keeps a normal
+/// perpendicular to its surface when the node scales unevenly (the matrix itself would tilt it). The result
+/// is not unit length. A matrix that cannot be inverted falls back to the matrix itself.
+fn transform_normal(m: &[f32; 16], n: [f32; 3]) -> [f32; 3] {
+    let (a, b, c) = ([m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]);
+    let cross = |u: [f32; 3], v: [f32; 3]| [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    // The columns of the inverse transpose are the cross products of the other two columns, over the determinant
+    let (bc, ca, ab) = (cross(b, c), cross(c, a), cross(a, b));
+    let det = a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2];
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return transform(m, n, 0.0);
+    }
+    let sign = det.signum();
+    [0, 1, 2].map(|k| (n[0] * bc[k] + n[1] * ca[k] + n[2] * ab[k]) * sign)
+}
+
 /// Makes a mesh's triangles wind counter-clockwise around its vertex normals, as the bridge requires.
 ///
 /// The stored triangles of most parts come out right once the z mirror reverses them, whatever the sign of
@@ -399,7 +415,10 @@ fn right_handed(p: [f32; 3]) -> [f32; 3] {
 }
 
 /// Builds one mesh per node and material. `skin_material_base` is where matS materials start.
-fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_base: usize) -> Vec<Mesh> {
+///
+/// `skin_material_base` is how many rigid materials (`matR`) the description lists and `material_count` how
+/// many materials in all: a part naming a material the list lacks is an error, not an index past its end.
+fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_base: usize, material_count: usize) -> Result<Vec<Mesh>> {
     const IDENTITY: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
     let index: HashMap<&str, usize> = tree.nodes.iter().enumerate().map(|(i, n)| (n.name.as_str(), i)).collect();
     let mut meshes: HashMap<(usize, usize), Mesh> = HashMap::new();
@@ -424,6 +443,12 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
         };
         let tm = if placed { wtm } else { &IDENTITY };
         for e in elems {
+            let (kind, own_count) = if placed { ("rigid", skin_material_base) } else { ("skinned", material_count - skin_material_base.min(material_count)) };
+            ensure!(
+                e.material < own_count,
+                "a {kind} part on {node:?} uses material {} but the description lists {own_count} {kind} materials",
+                e.material
+            );
             let mesh = meshes.entry((node_index, material_base + e.material)).or_default();
             mesh.material = material_base + e.material;
             mesh.node = node_index;
@@ -439,7 +464,7 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
                         // Elements are validated by DynModel::parse, so indices are in range
                         let v = model.vertex(vd, src as usize).unwrap_or_default();
                         mesh.positions.push(right_handed(transform(tm, v.pos, 1.0)));
-                        mesh.normals.push(right_handed(normalize(transform(tm, v.normal, 0.0))));
+                        mesh.normals.push(right_handed(normalize(transform_normal(tm, v.normal))));
                         mesh.uvs.push(v.uv);
                         if let Some(skin) = skin {
                             let (joints, weights) = vertex_bones(model, skin, e, vd, src as usize, &index, node_index, &mut mesh.bones);
@@ -461,7 +486,7 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
         face_normals_out(m);
     }
     out.sort_by_key(|m| (m.material, m.node));
-    out
+    Ok(out)
 }
 
 /// The bones and weights of one skinned vertex, as indices into the mesh's own `bones` list (which
@@ -605,7 +630,7 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
     let infos = material_infos(&library.descs, name)?;
     let skin_material_base = infos.iter().position(|m| m.skinned).unwrap_or(infos.len());
 
-    let meshes = build_meshes(&model, lod, &tree, skin_material_base);
+    let meshes = build_meshes(&model, lod, &tree, skin_material_base, infos.len()).with_context(|| format!("{name}"))?;
     // Materials the description lists but no mesh of this LOD uses are neither decoded nor baked
     let used: std::collections::HashSet<usize> = meshes.iter().map(|m| m.material).collect();
     let is_used = |i: usize| used.contains(&i);
@@ -846,6 +871,70 @@ mod tests {
         assert_eq!(material_alpha("dynamic_tank_atest", None), Alpha::Mask(0.5));
         assert_eq!(material_alpha("dynamic_tank_atest", Some(0)), Alpha::Opaque);
         assert_eq!(material_alpha("dynamic_tank_atest", Some(100)), Alpha::Mask(100.0 / 255.0));
+    }
+
+
+    /// A one-triangle model whose single part sits on the skeleton node "hull" (wtm `m`) with the
+    /// vertex normal given as E3DCOLOR bytes; `skin_elem` adds a skinned part of material `skin_material`
+    fn one_part(m: [f32; 16], normal: [u8; 3], rigid_material: usize, skin_material: Option<usize>) -> (DynModel, GeomNodeTree) {
+        use wt_blk::dxp_and_grp::dynmodel::{Lod, Rigid};
+        use wt_blk::dxp_and_grp::geom_node_tree::GeomNode;
+        let mut bytes = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            bytes.extend(p.iter().flat_map(|v| v.to_le_bytes()));
+            bytes.extend([normal[2], normal[1], normal[0], 255]); // E3DCOLOR is stored B, G, R, A
+        }
+        let channels = vec![
+            Channel { ty: channel::FLOAT3, usage: channel::POSITION, index: 0, offset: 0 },
+            Channel { ty: channel::E3DCOLOR, usage: channel::NORMAL, index: 0, offset: 12 },
+        ];
+        let vd = VData { stride: 16, vertices: bytes, indices: vec![0, 1, 2], channels };
+        let elem = |material| Elem { material, vdata: 0, first_index: 0, triangles: 1, base_vertex: 0 };
+        let skins = skin_material
+            .map(|material| {
+                let bone = Bone { node: "hull".into(), inverse_bind: [0.0; 16] };
+                vec![Skin { node: "hull".into(), elems: vec![elem(material)], bones: vec![bone], materials: vec![] }]
+            })
+            .unwrap_or_default();
+        let lod = Lod { range: 100.0, rigids: vec![Rigid { node: "hull".into(), elems: vec![elem(rigid_material)] }], skins };
+        let model = DynModel { vdata: vec![vd.clone()], skin_vdata: vec![vd], pos_offset: [0.0; 3], pos_scale: [1.0; 3], lods: vec![lod] };
+        let node = |name: &str, wtm| GeomNode { name: name.into(), parent: None, tm: wtm, wtm };
+        (model, GeomNodeTree { nodes: vec![node("@root", IDENTITY_16), node("hull", m)] })
+    }
+
+    const IDENTITY_16: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+
+    #[test]
+    fn normals_follow_the_inverse_transpose_of_a_node_that_scales_unevenly() {
+        // A surface facing (1, 1, 0) under a node that stretches x by 2 faces (0.5, 1, 0) afterwards, not (2, 1, 0)
+        let stretch_x = [2., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+        let (model, tree) = one_part(stretch_x, [218, 218, 128], 0, None);
+        let meshes = build_meshes(&model, &model.lods[0], &tree, 1, 1).unwrap();
+        let n = meshes[0].normals[0];
+        let want = normalize([0.5 * 0.7098, 0.7098, 0.0]);
+        assert!((n[0] - want[0]).abs() < 0.01 && (n[1] - want[1]).abs() < 0.01, "{n:?} wanted {want:?}");
+        // A rotation (and a mirror) keeps normals as they were; a flattened node falls back to the matrix itself
+        let (model, tree) = one_part(IDENTITY_16, [218, 218, 128], 0, None);
+        let n = build_meshes(&model, &model.lods[0], &tree, 1, 1).unwrap()[0].normals[0];
+        assert!((n[0] - n[1]).abs() < 1e-5, "{n:?}");
+        let flat = [1., 0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+        let (model, tree) = one_part(flat, [218, 218, 128], 0, None);
+        assert!(build_meshes(&model, &model.lods[0], &tree, 1, 1).unwrap()[0].normals[0].iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn parts_whose_materials_the_description_lacks_are_an_error() {
+        // The description lists one rigid material (matR) and no skinned ones (no matS): a skinned part
+        // used to be given material index 1 + its own, past the end of the list
+        let (model, tree) = one_part(IDENTITY_16, [128, 128, 255], 0, Some(0));
+        let err = build_meshes(&model, &model.lods[0], &tree, 1, 1).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("skinned"), "{err}");
+        // With a matS block the same model builds, its skin's material after the rigid ones
+        let meshes = build_meshes(&model, &model.lods[0], &tree, 1, 2).unwrap();
+        assert_eq!(meshes.iter().map(|m| (m.material, m.skinned)).collect::<Vec<_>>(), [(0, false), (1, true)]);
+        // A rigid part naming a material past the matR list would land on a skinned material (or off the end)
+        let (model, tree) = one_part(IDENTITY_16, [128, 128, 255], 1, None);
+        assert!(build_meshes(&model, &model.lods[0], &tree, 1, 2).is_err());
     }
 
     #[test]

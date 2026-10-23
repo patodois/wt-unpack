@@ -92,7 +92,7 @@ from a Mac with an SSD and 16 GB, on War Thunder 2.59.0.80.
 # Archives and BLKs
 wt-unpack list $GAME/char.vromfs.bin
 wt-unpack extract $GAME/aces.vromfs.bin -o out/aces --blk json --filter tankmodels
-wt-unpack cat $GAME/char.vromfs.bin:config/wpcost.blk
+wt-unpack cat $GAME/char.vromfs.bin:config/wpcost.blk | head   # it is 1.16 million lines: pipe it
 
 # What a .grp pack holds, and the LODs, vertex layouts and skeleton of one model
 wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp
@@ -122,7 +122,7 @@ wt-unpack check-levels $GAME/levels
 wt-unpack sound list $GAME/sound/tanks_engines.assets.bank
 wt-unpack sound extract $GAME/sound/tanks_weapons.assets.bank --filter dshk_close -o out/dshk
 wt-unpack sound check $GAME/sound            # headers of every bank: under a second
-wt-unpack sound check $GAME/sound --decode   # HEAVY: decodes all 156,223 samples: about 10 minutes, 0.5 GB
+wt-unpack sound check $GAME/sound --decode   # HEAVY: decodes all 156,223 samples: 10 to 12 minutes, about 0.7 GB
 
 # Open a vehicle in 3D: drag to orbit, scroll to zoom, Q/E turn the turret, R/F elevate the gun
 wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V_ausf_g_panther --game $GAME
@@ -289,14 +289,22 @@ Checked against War Thunder 2.59.0.80 on macOS:
 - [docs/LIVE.md](docs/LIVE.md): the live telemetry client
 - [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md): where the formats come from
 - [rewrite-bridge](https://github.com/patodois/rewrite-bridge): the shared types and the conformance checker
+- [bridge-testbed](https://github.com/patodois/bridge-testbed): a Bevy app that loads the assets of every provider
+  side by side, to compare scale, orientation, animation and materials across games (it needs your own installs)
+- The other providers of rewrite-bridge, for other games: [wf-unpack](https://github.com/patodois/wf-unpack) (Warframe),
+  [hytale-unpack](https://github.com/patodois/hytale-unpack) (Hytale) and
+  [nocturne-unpack](https://github.com/patodois/nocturne-unpack) (Shin Megami Tensei III Nocturne HD Remaster)
 
 ## Glossary
 
 - **Game rewrite**: a new engine that loads an old game's original assets. A **mash-up** loads assets of
   several games into one.
 - **rewrite-bridge**, **Provider**: the shared crate, and the trait a game implements to hand out its
-  assets as the crate's `Model`, `AnimatedModel` and `Scene` types. **Socket**: a named node of a model to
-  attach things to (a turret, a muzzle).
+  assets as the crate's `Model`, `AnimatedModel` and `Scene` types. wt-unpack is the War Thunder provider; the
+  others are listed under "More documentation". **Socket**: a named node of a model to attach things to (a
+  turret, a muzzle).
+- **bridge-testbed**: the app that loads the models of several providers into one scene to check that scales,
+  axes and animations agree; it is how a provider is looked at before a game rewrite relies on it.
 - **vromfs** (`.vromfs.bin`): Dagor's archive format. **BLK**: Dagor's configuration file format, text or binary.
 - **grp**: a pack of models and their skeletons. **DynModel**: a movable model (a vehicle), as opposed to a
   **rendinst** ("render instance"), a static object placed in a level (a tree, a house).

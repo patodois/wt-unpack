@@ -599,7 +599,7 @@ impl PlayerVehicle {
 /// Why an endpoint could not be read.
 #[derive(Debug)]
 pub enum FetchError {
-    /// No connection (refused): the game is not running
+    /// No connection (refused, or the connect timeout ran out): the game is not running
     Unreachable(String),
     /// A timeout or a connection dropped midway: the game is busy, not necessarily gone
     Transient(String),
@@ -632,21 +632,38 @@ impl std::fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
-/// Refused connections mean no game; anything else (timeouts, connections dropped midway) is a hiccup.
+/// Sorts ureq's errors by phase. No connection (refused, unroutable, or the connect timeout ran out)
+/// means no game; a timeout or a drop after connecting is a hiccup.
+///
+/// The connect timeout matters on Windows: a connection to a closed port on 127.0.0.1 is not refused
+/// at once there, because the OS retries the SYN for about 2 s before reporting `WSAECONNREFUSED`. The
+/// connect timeout ends that wait first, and ureq reports it as `Timeout::Connect` as long as it
+/// expires before the global timeout (see [`Client::with_timeouts`]). macOS and Linux refuse at once.
 #[cfg(feature = "live")]
 fn classify(e: ureq::Error) -> FetchError {
     use std::io::ErrorKind;
-    let refused = match &e {
+    let no_connection = match &e {
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => true,
-        ureq::Error::Io(io) => matches!(io.kind(), ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable),
+        ureq::Error::Timeout(phase) => matches!(phase, ureq::Timeout::Connect | ureq::Timeout::Resolve),
+        // ureq turns refusals of every address of the host into this, and passes other connect errors on
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable
+        ),
         _ => false,
     };
-    if refused {
+    if no_connection {
         FetchError::Unreachable(e.to_string())
     } else {
         FetchError::Transient(e.to_string())
     }
 }
+
+/// The longest wait for the connection itself. Loopback connections to a listening port complete in
+/// microseconds, so this only ever runs out when nothing listens. That is the normal case on Windows,
+/// which retries the SYN to a closed port for about 2 s instead of refusing it at once.
+#[cfg(feature = "live")]
+pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A blocking client for the telemetry API.
 #[cfg(feature = "live")]
@@ -658,9 +675,21 @@ pub struct Client {
 #[cfg(feature = "live")]
 impl Client {
     /// `base` is e.g. [`DEFAULT_URL`]; `timeout` bounds each request, so a hung game cannot stall the
-    /// poller.
+    /// poller. Connecting gets [`CONNECT_TIMEOUT`], or half of `timeout` if that is shorter.
     pub fn new(base: &str, timeout: Duration) -> Self {
-        let config = ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).build();
+        Self::with_timeouts(base, CONNECT_TIMEOUT.min(timeout / 2), timeout)
+    }
+
+    /// Separate budgets for connecting and for the whole request. A connect timeout counts as "game
+    /// not running", a later one as a hiccup. `connect` must be shorter than `total`, or ureq reports
+    /// a slow connect as the global timeout and it reads as a hiccup; it is capped below `total`.
+    pub fn with_timeouts(base: &str, connect: Duration, total: Duration) -> Self {
+        let connect = connect.min(total.mul_f64(0.9));
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(connect))
+            .timeout_global(Some(total))
+            .http_status_as_error(false)
+            .build();
         Self { base: base.trim_end_matches('/').to_string(), agent: ureq::Agent::new_with_config(config) }
     }
 
@@ -763,7 +792,8 @@ impl Client {
 ///
 /// In a match it bridges hiccups for up to `grace`: when `/indicators` times out or `/map_obj.json`
 /// comes back empty, the last good answer stands in (listed in [`Snapshot::held`]) and the status stays
-/// [`Status::InMatch`]. A refused connection or an answer of `{"valid": false}` ends the match at once.
+/// [`Status::InMatch`]. A connection that cannot be made (refused, or not made within
+/// [`CONNECT_TIMEOUT`]) or an answer of `{"valid": false}` ends the match at once.
 #[cfg(feature = "live")]
 pub struct Poller {
     pub client: Client,
@@ -1013,6 +1043,42 @@ pub mod mock {
                 }
                 other => tank_match(other),
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "live"))]
+mod tests {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn errors_sort_by_phase() {
+        let unreachable = |e: ureq::Error| matches!(classify(e), FetchError::Unreachable(_));
+        // Before a connection exists: the game is not running
+        assert!(unreachable(ureq::Error::Timeout(ureq::Timeout::Connect)), "Windows: closed port, SYN retries cut short");
+        assert!(unreachable(ureq::Error::Timeout(ureq::Timeout::Resolve)));
+        assert!(unreachable(ureq::Error::Io(IoError::from(ErrorKind::ConnectionRefused))), "macOS and Linux");
+        assert!(unreachable(ureq::Error::Io(IoError::from(ErrorKind::NetworkUnreachable))));
+        assert!(unreachable(ureq::Error::ConnectionFailed));
+        assert!(unreachable(ureq::Error::HostNotFound));
+        // After connecting: a hiccup
+        for phase in [ureq::Timeout::Global, ureq::Timeout::PerCall, ureq::Timeout::SendRequest, ureq::Timeout::RecvResponse, ureq::Timeout::RecvBody] {
+            assert!(matches!(classify(ureq::Error::Timeout(phase)), FetchError::Transient(_)), "{phase:?}");
+        }
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted, ErrorKind::UnexpectedEof, ErrorKind::TimedOut] {
+            assert!(matches!(classify(ureq::Error::Io(IoError::from(kind))), FetchError::Transient(_)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn connect_budget_stays_inside_the_total() {
+        // ureq names the earliest deadline; the connect one has to come first to be reported as such
+        for (connect, total) in [(250, 500), (250, 200), (500, 500)] {
+            let c = Client::with_timeouts("http://127.0.0.1:1", Duration::from_millis(connect), Duration::from_millis(total));
+            let cfg = c.agent.config();
+            let (connect, total) = (cfg.timeouts().connect.unwrap(), cfg.timeouts().global.unwrap());
+            assert!(connect < total, "{connect:?} vs {total:?}");
         }
     }
 }

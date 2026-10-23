@@ -153,8 +153,9 @@ the player's own minimap entry, and `map_info` on the first poll of each match.
 
 About 2% of polls hiccup: `/map_obj.json` answers with an empty body, or a request times out. In a match
 the poller bridges these for up to 2 seconds with the last good answer (the log lists them under `held`);
-an empty body is logged as a note, not an error. A refused connection or `{"valid": false}` ends the
-match at once.
+an empty body is logged as a note, not an error. A connection that cannot be made ends the match at
+once, as does `{"valid": false}`. On Windows a closed port is not refused straight away (the OS retries
+for about 2 seconds), so connecting has its own 250 ms timeout, separate from the request's 500 ms.
 
 A test drive with a T-26 confirmed the units (speed in km/h, positions in metres: the speed derived from
 the positions matches the speedometer within about 1 km/h), the heading, and the gear numbering. Not

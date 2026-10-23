@@ -279,8 +279,9 @@ mod client {
         assert_eq!(snap.status, Status::GameNotRunning);
         assert!(snap.player().is_none());
         assert_eq!(snap.errors.len(), 1, "stops after the first unreachable endpoint: {:?}", snap.errors);
-        assert!(snap.errors[0].starts_with("indicators: unreachable"));
-        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(snap.errors[0].starts_with("indicators: unreachable"), "{:?}", snap.errors);
+        // macOS and Linux refuse at once; Windows retries the SYN until the 250 ms connect timeout
+        assert!(t.elapsed() < Duration::from_millis(1500), "took {:?}", t.elapsed());
         assert!(matches!(c.state(), Err(FetchError::Unreachable(_))));
     }
 

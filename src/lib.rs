@@ -6,6 +6,7 @@ pub mod blk;
 pub mod bridge;
 pub mod bytes;
 pub mod camo;
+pub mod gear;
 pub mod gltf;
 pub mod level;
 pub mod live;

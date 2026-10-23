@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use wt_unpack::level::Level;
 use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::terrain::HeightGrid;
+use wt_unpack::gear::{RadiusSource, RunningGear, Side, WheelKind};
 use wt_unpack::{blk, gltf, tank, vehicle, vromfs::Vromfs};
 
 fn game() -> Option<PathBuf> {
@@ -118,6 +119,116 @@ fn sherman_unit_names_its_turret_nodes_and_drive_train() {
     assert!(tank::load(&game, "no_such_model", None).unwrap().is_none());
 }
 
+/// The Sherman's tracks are skinned with the game's bone table: every vertex follows the `root` node or
+/// the suspension wheel node it wraps around, and moving one of those moves the track there
+#[test]
+fn sherman_track_skins_follow_the_wheel_bones() {
+    let Some(game) = game() else { return };
+    let pack = game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp");
+    let v = vehicle::load(&game, &pack, "m4a1_76w_sherman", 0).unwrap();
+    let node = |name: &str| v.nodes.iter().position(|n| n.name == name).unwrap_or_else(|| panic!("no node {name}"));
+
+    let skinned: Vec<&vehicle::Mesh> = v.meshes.iter().filter(|m| m.skinned).collect();
+    assert_eq!(skinned.len(), 3, "antenna and the two tracks");
+    for m in &skinned {
+        assert_eq!(m.joints.len(), m.positions.len());
+        assert_eq!(m.weights.len(), m.positions.len());
+        for (j, w) in m.joints.iter().zip(&m.weights) {
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-4, "{w:?}");
+            assert!(j.iter().zip(w).all(|(&j, &w)| w == 0.0 || usize::from(j) < m.bones.len()));
+        }
+    }
+    for (track, side) in [("track_l", "l"), ("track_r", "r")] {
+        let m = skinned.iter().find(|m| m.node == node(track)).unwrap();
+        // The root and the six suspension wheels of the side
+        let mut names: Vec<&str> = m.bones.iter().map(|&b| v.nodes[b].name.as_str()).collect();
+        names.sort_unstable();
+        let wheels: Vec<String> = (1..=6).map(|i| format!("bone_wheel_{side}_0{i}")).collect();
+        let mut expected: Vec<&str> = wheels.iter().map(String::as_str).chain(["root"]).collect();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+        // One influence per vertex, with a real share on each wheel
+        assert!(m.weights.iter().all(|w| w[0] > 0.99 && w[1] == 0.0));
+
+        // Lifting a wheel bone 10 cm lifts exactly the vertices bound to it
+        let lifted = m.bones.iter().position(|&b| v.nodes[b].name == format!("bone_wheel_{side}_03")).unwrap();
+        let mut moves = vec![vehicle::IDENTITY; m.bones.len()];
+        moves[lifted][10] = 0.1;
+        let moved = m.skinned_positions(&moves);
+        let bound = m.joints.iter().filter(|j| usize::from(j[0]) == lifted).count();
+        assert!(bound > 50, "{bound}");
+        for (i, (a, b)) in m.positions.iter().zip(&moved).enumerate() {
+            let dy = b[1] - a[1];
+            let expect = if usize::from(m.joints[i][0]) == lifted { 0.1 } else { 0.0 };
+            assert!((dy - expect).abs() < 1e-5 && a[0] == b[0] && a[2] == b[2], "vertex {i}: {dy}");
+        }
+        // The vertices bound to a wheel bone are the ring of the track under that wheel's axle
+        let wheel_x = v.nodes[m.bones[lifted]].pivot[0];
+        let xs = m.joints.iter().zip(&m.positions).filter(|(j, _)| usize::from(j[0]) == lifted).map(|(_, p)| p[0]);
+        let (lo, hi) = xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        assert!((lo - wheel_x).abs() < 0.01 && (hi - wheel_x).abs() < 0.01, "{lo}..{hi} under {wheel_x}");
+    }
+    // The antenna blends its two bones
+    let antenna = skinned.iter().find(|m| m.node == node("antenna")).unwrap();
+    let names: Vec<&str> = antenna.bones.iter().map(|&b| v.nodes[b].name.as_str()).collect();
+    assert_eq!(names, ["bone_antenna_01", "bone_phx_antenna_01"]);
+    assert!(antenna.weights.iter().any(|w| w[1] > 0.0));
+}
+
+/// Wheels and belts of the Sherman, with radii from its unit BLK and the track texture rate from its mesh
+#[test]
+fn sherman_running_gear_comes_from_the_game_data() {
+    let Some(game) = game() else { return };
+    let pack = game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp");
+    let v = vehicle::load(&game, &pack, "m4a1_76w_sherman", 0).unwrap();
+    let t = tank::load(&game, "m4a1_76w_sherman", None).unwrap().unwrap();
+    let drive = t.drive.unwrap();
+    let gear = RunningGear::new(&v, Some(&drive));
+    let mesh_only = RunningGear::new(&v, None);
+
+    // Six road wheels, three return rollers, a sprocket and an idler per side
+    assert_eq!(gear.wheels.len(), 22);
+    let count = |kind| gear.wheels.iter().filter(|w| w.kind == kind).count();
+    assert_eq!((count(WheelKind::Road), count(WheelKind::Top), count(WheelKind::Drive), count(WheelKind::End)), (12, 6, 2, 2));
+    assert!(gear.wheels.iter().all(|w| w.radius_source == RadiusSource::Unit));
+    for (w, m) in gear.wheels.iter().zip(&mesh_only.wheels) {
+        assert_eq!(w.node, m.node);
+        assert_eq!(m.radius_source, RadiusSource::Mesh);
+        // The BLK radii are the wheels' tread radii: the road wheels and idlers match their meshes to
+        // 2 mm; the sprocket's is the pitch radius, inside the tips of its teeth; the rollers' mesh
+        // is a little smaller than their rubber
+        let name = &v.nodes[w.node].name;
+        match w.kind {
+            WheelKind::Road => assert!((w.radius - m.radius).abs() < 0.005, "{name}: {} vs {}", w.radius, m.radius),
+            WheelKind::End => assert!((w.radius - m.radius).abs() < 0.01, "{name}"),
+            WheelKind::Drive => assert!(w.radius < m.radius, "{name}"),
+            WheelKind::Top => assert!((w.radius - m.radius).abs() < 0.03, "{name}"),
+        }
+    }
+    let sprocket = gear.wheels.iter().find(|w| w.kind == WheelKind::Drive).unwrap();
+    assert_eq!(sprocket.radius, drive.drive_gear_radius);
+    assert!(gear.wheels.iter().filter(|w| w.kind == WheelKind::Road).all(|w| Some(w.radius) == drive.road_wheel_radius));
+    assert!((gear.gauge.unwrap() - 2.163).abs() < 0.001, "{:?}", gear.gauge);
+
+    // Both belts run the texture at the rate of the track mesh, which is a quarter of a V unit per link
+    // of the pitch the unit BLK gives
+    assert_eq!(gear.belts.len(), 2);
+    assert_eq!(gear.belts.iter().map(|b| b.side).collect::<Vec<_>>(), [Side::Left, Side::Right]);
+    let pitch = 0.154;
+    for b in &gear.belts {
+        assert!((b.v_per_metre * pitch - 0.25).abs() < 0.005, "{}", b.v_per_metre);
+    }
+    assert!((drive.track_length.unwrap() / 79.0 - pitch).abs() < 1e-4);
+    assert_eq!(drive.track_animation_multiplier, Some(0.68));
+
+    // Driving 10 m turns a road wheel 40 rad (clockwise), which is 6.37 turns, and runs the texture 16.1 V
+    let mut state = gear.rest();
+    gear.advance(&mut state, 10.0, 10.0);
+    let road = gear.wheels.iter().position(|w| w.kind == WheelKind::Road).unwrap();
+    assert!((state.wheel_angles[road] - (std::f32::consts::TAU * 7.0 - 40.0)).abs() < 1e-3, "{}", state.wheel_angles[road]);
+    assert!((state.belt_offsets[0] - (gear.belts[0].v_per_metre * 10.0).fract()).abs() < 1e-3);
+}
+
 #[test]
 fn berlin_level_has_terrain_and_placed_objects() {
     let Some(game) = game() else { return };
@@ -215,6 +326,14 @@ fn sherman_loads_through_the_bridge() {
     assert!(world[node("wheel_l_01")][0] > 1.0 && world[node("wheel_r_01")][0] < -1.0);
     // The tracks are skinned, the glass blends
     assert_eq!(m.skins.len(), 3, "track_l, track_r and the antenna");
+    // The tracks follow the root and six suspension wheels each, with one influence per vertex
+    let mut joints: Vec<usize> = m.skins.iter().map(|s| s.joints.len()).collect();
+    joints.sort_unstable();
+    assert_eq!(joints, [2, 7, 7]);
+    for mesh in m.meshes.iter().filter(|x| x.skin.is_some()) {
+        assert_eq!(mesh.joints.len(), mesh.positions.len());
+        assert!(mesh.weights.iter().all(|w| (w.iter().sum::<f32>() - 1.0).abs() < 1e-4));
+    }
     assert!(m.materials.iter().any(|x| x.name.contains("glass") && x.alpha == rewrite_bridge::AlphaMode::Blend));
 }
 

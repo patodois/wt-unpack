@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 
 use wt_blk::dxp_and_grp::{
-    dynmodel::{DynModel, Elem, Lod},
+    dynmodel::{DynModel, Elem, Lod, Skin, VData},
     geom_node_tree::GeomNodeTree,
     grp_pack::{class_id, GrpPack},
 };
@@ -56,10 +56,48 @@ pub struct Mesh {
     pub node: usize,
     /// A skinned mesh (tracks, cables), in its bind pose
     pub skinned: bool,
+    /// Skinned meshes: the skeleton nodes (indices into `Vehicle::nodes`) that move the vertices, from
+    /// the model's bone table. `joints` refer to this list.
+    pub bones: Vec<usize>,
+    /// Skinned meshes, per vertex: the `bones` that move it (unused entries are 0 with weight 0) ...
+    pub joints: Vec<[u16; 4]>,
+    /// ... and their weights, which sum to 1
+    pub weights: Vec<[f32; 4]>,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+}
+
+/// A rigid motion in model space as a column-major 3x4 matrix: three axis columns, then the translation
+pub type Affine = [f32; 12];
+
+pub const IDENTITY: Affine = [1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0.];
+
+impl Mesh {
+    /// Vertex positions of a skinned mesh once its bones have moved, blended by the vertex weights
+    /// (linear blend skinning, as the game does it). `moves[i]` is how bone `self.bones[i]` has moved
+    /// from its bind pose, in model space: the node's transform now, times the inverse of its bind
+    /// transform. All identities give back `positions`; a bone without an entry stays put.
+    pub fn skinned_positions(&self, moves: &[Affine]) -> Vec<[f32; 3]> {
+        let apply = |m: &Affine, p: [f32; 3]| [0, 1, 2].map(|r| m[r] * p[0] + m[3 + r] * p[1] + m[6 + r] * p[2] + m[9 + r]);
+        self.positions
+            .iter()
+            .enumerate()
+            .map(|(v, &p)| {
+                let (joints, weights) = (self.joints.get(v), self.weights.get(v));
+                let (Some(joints), Some(weights)) = (joints, weights) else { return p };
+                let mut out = [0.0; 3];
+                for (&j, &w) in joints.iter().zip(weights) {
+                    if w > 0.0 {
+                        let q = apply(moves.get(usize::from(j)).unwrap_or(&IDENTITY), p);
+                        (0..3).for_each(|k| out[k] += w * q[k]);
+                    }
+                }
+                out
+            })
+            .collect()
+    }
 }
 
 /// A skeleton node. Only its origin is kept: the axes of Dagor's nodes vary (many are mirrored), and
@@ -281,9 +319,10 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
     let parts = lod
         .rigids
         .iter()
-        .map(|r| (r.node.as_str(), &r.elems, &model.vdata, 0, true))
-        .chain(lod.skins.iter().map(|s| (s.node.as_str(), &s.elems, &model.skin_vdata, skin_material_base, false)));
-    for (node, elems, vdata, material_base, placed) in parts {
+        .map(|r| (r.node.as_str(), &r.elems, &model.vdata, 0, None))
+        .chain(lod.skins.iter().map(|s| (s.node.as_str(), &s.elems, &model.skin_vdata, skin_material_base, Some(s))));
+    for (node, elems, vdata, material_base, skin) in parts {
+        let placed = skin.is_none();
         // "@root" is the model origin; parts without a node go there too
         let (node_index, wtm) = match index.get(node) {
             Some(&i) => (i, &tree.nodes[i].wtm),
@@ -313,6 +352,11 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
                         mesh.positions.push(right_handed(transform(tm, v.pos, 1.0)));
                         mesh.normals.push(right_handed(normalize(transform(tm, v.normal, 0.0))));
                         mesh.uvs.push(v.uv);
+                        if let Some(skin) = skin {
+                            let (joints, weights) = vertex_bones(model, skin, e, vd, src as usize, &index, node_index, &mut mesh.bones);
+                            mesh.joints.push(joints);
+                            mesh.weights.push(weights);
+                        }
                         next
                     });
                     mesh.indices.push(dst);
@@ -326,6 +370,55 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
     let mut out: Vec<Mesh> = meshes.into_values().collect();
     out.sort_by_key(|m| (m.material, m.node));
     out
+}
+
+/// The bones and weights of one skinned vertex, as indices into the mesh's own `bones` list (which
+/// grows as new skeleton nodes turn up). Bones are named by the skin's bone table, through the
+/// material's palette. A vertex the data leaves without a weight follows `fallback`, the skin's node.
+#[allow(clippy::too_many_arguments)]
+fn vertex_bones(
+    model: &DynModel,
+    skin: &Skin,
+    elem: &Elem,
+    vd: &VData,
+    vertex: usize,
+    nodes: &HashMap<&str, usize>,
+    fallback: usize,
+    bones: &mut Vec<usize>,
+) -> ([u16; 4], [f32; 4]) {
+    let sw = model.skin_weights(vd, vertex).unwrap_or_default();
+    // (skeleton node, weight) of each influence; two slots can name the same node
+    let mut influences: Vec<(usize, f32)> = Vec::with_capacity(4);
+    for k in 0..4 {
+        if sw.weights[k] <= 0.0 {
+            continue;
+        }
+        // A slot the bone table cannot resolve, or a bone whose node the skeleton lacks, follows the skin's node
+        let node = skin.bone(elem.material, usize::from(sw.joints[k])).and_then(|b| nodes.get(b.node.as_str()).copied()).unwrap_or(fallback);
+        match influences.iter_mut().find(|i| i.0 == node) {
+            Some(i) => i.1 += sw.weights[k],
+            None => influences.push((node, sw.weights[k])),
+        }
+    }
+    let sum: f32 = influences.iter().map(|i| i.1).sum();
+    if sum > 0.0 {
+        influences.iter_mut().for_each(|i| i.1 /= sum);
+    } else {
+        influences = vec![(fallback, 1.0)];
+    }
+    let mut joints = [0u16; 4];
+    let mut weights = [0f32; 4];
+    for (k, (node, weight)) in influences.into_iter().enumerate() {
+        joints[k] = match bones.iter().position(|&b| b == node) {
+            Some(i) => i as u16,
+            None => {
+                bones.push(node);
+                (bones.len() - 1) as u16
+            }
+        };
+        weights[k] = weight;
+    }
+    (joints, weights)
 }
 
 /// How fast a track's texture runs along the track: the change in V per metre on the bottom run, which
@@ -481,6 +574,103 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wt_blk::dxp_and_grp::dynmodel::{channel, Bone, Channel, SkinMaterial};
+
+    /// A skin vertex buffer of 8-byte vertices holding bone slots and weights as the E3DCOLORs of texture
+    /// coordinates 4 and 5. Each vertex is `(slots, weights)` in the order x, y, z, w; E3DCOLOR is stored
+    /// B, G, R, A, so z comes first in memory.
+    fn bone_buffer(vertices: &[([u8; 4], [u8; 4])]) -> VData {
+        let color = |c: [u8; 4]| [c[2], c[1], c[0], c[3]];
+        let mut bytes = Vec::new();
+        for (slots, weights) in vertices {
+            bytes.extend_from_slice(&color(*slots));
+            bytes.extend_from_slice(&color(*weights));
+        }
+        let channel = |index, offset| Channel { ty: channel::E3DCOLOR, usage: channel::TEXCOORD, index, offset };
+        VData { stride: 8, vertices: bytes, indices: Vec::new(), channels: vec![channel(4, 0), channel(5, 4)] }
+    }
+
+    fn skin_model() -> (DynModel, Skin) {
+        let model = DynModel { vdata: vec![], skin_vdata: vec![], pos_offset: [0.0; 3], pos_scale: [1.0; 3], lods: vec![] };
+        let bone = |node: &str| Bone { node: node.into(), inverse_bind: [0.0; 16] };
+        // Material 0 uses the bone table as it is; material 1 has a palette of bones 2 and 0
+        let skin = Skin {
+            node: "track_l".into(),
+            elems: vec![],
+            bones: vec![bone("root"), bone("bone_wheel_l_01"), bone("bone_wheel_l_02"), bone("not_in_the_skeleton")],
+            materials: vec![SkinMaterial { material: 0, palette: vec![] }, SkinMaterial { material: 1, palette: vec![2, 0] }],
+        };
+        (model, skin)
+    }
+
+    #[test]
+    fn vertices_get_the_skeleton_nodes_of_their_bones() {
+        let (model, skin) = skin_model();
+        // Skeleton nodes by name; "not_in_the_skeleton" is deliberately absent
+        let nodes: HashMap<&str, usize> = [("root", 1), ("bone_wheel_l_01", 5), ("bone_wheel_l_02", 6), ("track_l", 9)].into_iter().collect();
+        let elem = |material| Elem { material, vdata: 0, first_index: 0, triangles: 0, base_vertex: 0 };
+        let vd = bone_buffer(&[
+            // 0: slot 1 alone: bone_wheel_l_01
+            ([1, 0, 0, 0], [255, 0, 0, 0]),
+            // 1: root a quarter, bone_wheel_l_02 three quarters
+            ([0, 2, 0, 0], [64, 191, 0, 0]),
+            // 2: two slots naming the root merge into one influence
+            ([0, 0, 0, 0], [128, 127, 0, 0]),
+            // 3: a bone whose node the skeleton lacks follows the skin's own node
+            ([3, 0, 0, 0], [255, 0, 0, 0]),
+            // 4: a slot the bone table lacks does too
+            ([9, 0, 0, 0], [255, 0, 0, 0]),
+            // 5: and so does a vertex without any weight
+            ([0, 0, 0, 0], [0, 0, 0, 0]),
+            // 6: a slot with weight 0 is skipped, whatever it names
+            ([1, 3, 0, 0], [255, 0, 0, 0]),
+        ]);
+        let mut bones = Vec::new();
+        let mut get = |v| vertex_bones(&model, &skin, &elem(0), &vd, v, &nodes, 9, &mut bones);
+
+        assert_eq!(get(0), ([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        // Bones are added to the mesh's list as they turn up: [5], then root and bone_wheel_l_02
+        let (j, w) = get(1);
+        assert_eq!(&j[..2], &[1, 2]);
+        assert!((w[0] - 0.25).abs() < 0.01 && (w[1] - 0.75).abs() < 0.01 && w[2..] == [0.0, 0.0], "{w:?}");
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(get(2), ([1, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(get(3), ([3, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(get(4), ([3, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(get(5), ([3, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(get(6), ([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(bones, [5, 1, 6, 9]);
+
+        // Material 1 goes through its palette: slot 0 is bone 2 (node 6), slot 1 is bone 0 (the root)
+        let vd1 = bone_buffer(&[([0, 1, 0, 0], [128, 127, 0, 0])]);
+        let mut bones1 = Vec::new();
+        let (j, w) = vertex_bones(&model, &skin, &elem(1), &vd1, 0, &nodes, 9, &mut bones1);
+        assert_eq!((bones1, &j[..2]), (vec![6, 1], &[0u16, 1][..]));
+        assert!((w[0] - 128.0 / 255.0).abs() < 1e-6 && (w[1] - 127.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn moving_a_bone_moves_the_vertices_it_weighs_on() {
+        let mut m = Mesh { skinned: true, bones: vec![10, 11], ..Mesh::default() };
+        m.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 1.0, 0.0]];
+        // Vertex 0 follows bone 0, vertex 1 follows bone 1, vertex 2 is half and half
+        m.joints = vec![[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0]];
+        m.weights = vec![[1., 0., 0., 0.], [1., 0., 0., 0.], [0.5, 0.5, 0., 0.]];
+        assert_eq!(m.skinned_positions(&[IDENTITY, IDENTITY]), m.positions);
+        // Bone 1 moves up 0.4 m; bone 0 turns a quarter turn about Z: (x, y) -> (-y, x)
+        let up: Affine = [1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0.4, 0.];
+        let quarter: Affine = [0., 1., 0., -1., 0., 0., 0., 0., 1., 0., 0., 0.];
+        let moved = m.skinned_positions(&[quarter, up]);
+        assert_eq!(moved[0], [0.0, 0.0, 0.0]);
+        assert_eq!(moved[1], [1.0, 0.4, 0.0]);
+        // Halfway between (2, 1) turned to (-1, 2) and (2, 1.4)
+        assert!((moved[2][0] - 0.5).abs() < 1e-6 && (moved[2][1] - 1.7).abs() < 1e-6);
+        // A bone without an entry stays put; a rigid mesh is returned as it is
+        assert_eq!(m.skinned_positions(&[quarter])[1], [1.0, 0.0, 0.0]);
+        let rigid = Mesh { positions: m.positions.clone(), ..Mesh::default() };
+        assert_eq!(rigid.skinned_positions(&[up]), m.positions);
+    }
+
 
     #[test]
     fn track_texture_rate_comes_from_the_bottom_run() {

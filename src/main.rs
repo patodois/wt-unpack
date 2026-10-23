@@ -335,6 +335,13 @@ fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
     for (l, lod) in dm.lods.iter().enumerate() {
         let tris: usize = lod.rigids.iter().flat_map(|r| &r.elems).map(|e| e.triangles).sum();
         println!("lod {l}: range {} m, {} rigids, {} skins, {tris} rigid triangles", lod.range, lod.rigids.len(), lod.skins.len());
+        // Each skinned mesh's bone table: the skeleton nodes that move its vertices, with the number of
+        // palette entries each skinned material uses
+        for skin in &lod.skins {
+            let bones: Vec<&str> = skin.bones.iter().map(|b| b.node.as_str()).collect();
+            let palettes: Vec<String> = skin.materials.iter().map(|m| format!("mat {}: {}", m.material, if m.palette.is_empty() { "all bones".into() } else { format!("{} bones", m.palette.len()) })).collect();
+            println!("  skin {} ({} bones: {}; {})", skin.node, bones.len(), bones.join(", "), palettes.join(", "));
+        }
     }
     // The skeleton: each node with its parent, model-space position and the LOD0 parts it carries
     if let Some(res) = pack.find(&format!("{model}_skeleton"), class_id::GEOM_NODE_TREE) {

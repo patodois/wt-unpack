@@ -15,9 +15,11 @@
 //! turning a node (the turret about Y, the gun about X) turns its subtree in the vehicle's own axes.
 //! Dagor's node axes vary from node to node and many are mirrored, which a glTF node cannot hold.
 //!
-//! Skinned meshes (tracks, cables) become skins bound wholly to their own node. Their per-bone
-//! weights are in the vertex data, but which node each bone is lives in the skinned mesh's bone
-//! table, which the DynModel reader does not expose yet.
+//! Skinned meshes (tracks, cables) become skins with the game's own bones and weights: each vertex
+//! follows up to four skeleton nodes, taken from the model's bone table (a track follows the `root` node
+//! and the suspension wheel nodes `bone_wheel_<l|r>_<NN>`). A skin's inverse bind matrices undo the
+//! joint's place, `translate(-pivot)`, since node frames carry no axes (the game's own matrices
+//! include them).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -184,9 +186,9 @@ pub fn to_model(v: Vehicle) -> Model {
         })
         .collect();
 
-    // One skin per skinned node, bound wholly to that node
-    let mut skins = Vec::new();
-    let mut skin_of: HashMap<usize, usize> = HashMap::new();
+    // One skin per distinct set of bones; a skinned mesh keeps the game's per-vertex bones and weights
+    let mut skins: Vec<Skin> = Vec::new();
+    let mut skin_of: HashMap<Vec<usize>, usize> = HashMap::new();
     let mut meshes = Vec::with_capacity(v.meshes.len());
     for m in &v.meshes {
         let name = format!("{}_{}", nodes[m.node].name, v.materials[m.material].name);
@@ -200,16 +202,22 @@ pub fn to_model(v: Vehicle) -> Model {
             ..Mesh::default()
         };
         if m.skinned {
-            // Skinned vertices stay in model space; the inverse bind matrix undoes the joint's place
-            let skin = *skin_of.entry(m.node).or_insert_with(|| {
-                let [x, y, z] = pivot(m.node);
-                let inverse_bind = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., -x, -y, -z, 1.];
-                skins.push(Skin { joints: vec![m.node], inverse_bind: vec![inverse_bind] });
+            // Skinned vertices stay in model space; each joint's inverse bind matrix undoes its place
+            let skin = *skin_of.entry(m.bones.clone()).or_insert_with(|| {
+                let inverse_bind = m
+                    .bones
+                    .iter()
+                    .map(|&b| {
+                        let [x, y, z] = pivot(b);
+                        [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., -x, -y, -z, 1.]
+                    })
+                    .collect();
+                skins.push(Skin { joints: m.bones.clone(), inverse_bind });
                 skins.len() - 1
             });
             mesh.positions = m.positions.iter().map(|&p| turn(p)).collect();
-            mesh.joints = vec![[0; 4]; m.positions.len()];
-            mesh.weights = vec![[1.0, 0.0, 0.0, 0.0]; m.positions.len()];
+            mesh.joints = m.joints.clone();
+            mesh.weights = m.weights.clone();
             mesh.skin = Some(skin);
         } else {
             // Rigid vertices are relative to their node
@@ -237,6 +245,7 @@ mod tests {
             normals: vec![[1.0, 0.0, 0.0]; 3],
             uvs: vec![[0.0; 2]; 3],
             indices: vec![0, 1, 2],
+            ..vehicle::Mesh::default()
         };
         let material = |name: &str| vehicle::Material {
             name: name.into(),
@@ -249,9 +258,16 @@ mod tests {
             pbr_key: None,
         };
         let node = |name: &str, parent, pivot| vehicle::Node { name: name.into(), parent, pivot };
+        // The strip follows its track node and the turret, the last vertex half and half
+        let strip = vehicle::Mesh {
+            bones: vec![2, 1],
+            joints: vec![[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0]],
+            weights: vec![[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]],
+            ..tri(2, true, 1)
+        };
         Vehicle {
             name: "tank".into(),
-            meshes: vec![tri(1, false, 0), tri(2, true, 1)],
+            meshes: vec![tri(1, false, 0), strip],
             materials: vec![material("matR0_tank"), material("matR1_dynamic_pbr_glass")],
             nodes: vec![node("", None, [0.0; 3]), node("bone_turret", Some(0), [0.5, 2.0, 0.0]), node("track_l", Some(0), [0.0, 0.0, -1.0])],
         }
@@ -269,11 +285,16 @@ mod tests {
         // Rigid vertices are relative to their node: (1, 2, 0) -> (0, 2, 1), minus the pivot (0, 2, 0.5)
         assert_eq!(m.meshes[0].positions[0], [0.0, 0.0, 0.5]);
         assert_eq!(m.meshes[0].normals[0], [0.0, 0.0, 1.0]);
-        // Skinned vertices stay in model space, bound to their node, whose place the inverse bind undoes
+        // Skinned vertices stay in model space and keep the game's bones and weights; each joint's
+        // inverse bind undoes its place
         let skinned = &m.meshes[1];
         assert_eq!((skinned.skin, skinned.positions[0]), (Some(0), [0.0, 2.0, 1.0]));
-        assert_eq!(m.skins[0].joints, vec![2]);
+        assert_eq!(skinned.joints[2], [0, 1, 0, 0]);
+        assert_eq!(skinned.weights[2], [0.5, 0.5, 0.0, 0.0]);
+        assert_eq!(m.skins[0].joints, vec![2, 1]);
         assert_eq!(m.skins[0].inverse_bind[0][12..15], [-1.0, 0.0, 0.0]);
+        // The turret's pivot (0.5, 2, 0) is (0, 2, 0.5) in the bridge's axes
+        assert_eq!(m.skins[0].inverse_bind[1][12..15], [0.0, -2.0, -0.5]);
         assert_eq!(m.nodes[2].translation, [1.0, 0.0, 0.0]);
         // Glass blends
         assert_eq!((m.materials[0].alpha, m.materials[1].alpha), (AlphaMode::Opaque, AlphaMode::Blend));

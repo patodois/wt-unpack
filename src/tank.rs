@@ -87,6 +87,9 @@ pub struct Drive {
     /// Track width and length (links times link length), m
     pub track_width: Option<f32>,
     pub track_length: Option<f32>,
+    /// `VehiclePhys.tracks.animationMultiplier` (negative on some units), read as the game has it. The
+    /// engine code that uses it is not public, so nothing here applies it; see [`crate::gear`].
+    pub track_animation_multiplier: Option<f32>,
     /// Radii of the road wheels, return rollers, and idler and sprocket, m
     pub road_wheel_radius: Option<f32>,
     pub top_wheel_radius: Option<f32>,
@@ -229,6 +232,7 @@ fn drive(root: &Block) -> Option<Drive> {
         max_brake_force: real(mech, "maxBrakeForce"),
         track_width: tracks.and_then(|t| real(t, "width")),
         track_length,
+        track_animation_multiplier: tracks.and_then(|t| real(t, "animationMultiplier")),
         road_wheel_radius: susp.and_then(|s| real(s, "defaultGearRadius")),
         top_wheel_radius: susp.and_then(|s| real(s, "topGearRadius")),
         end_wheel_radius: susp.and_then(|s| real(s, "frontBackGearRadius")),
@@ -428,7 +432,11 @@ mod tests {
             vec![],
             vec![
                 block("Mass", vec![("Empty", Value::Real(32373.0)), ("TakeOff", Value::Real(32673.0))], vec![]),
-                block("tracks", vec![("width", Value::Real(0.4)), ("trackLen", Value::Real(0.154)), ("trackCount", Value::Int(79))], vec![]),
+                block(
+                    "tracks",
+                    vec![("width", Value::Real(0.4)), ("trackLen", Value::Real(0.154)), ("trackCount", Value::Int(79)), ("animationMultiplier", Value::Real(0.68))],
+                    vec![],
+                ),
                 block("engine", vec![("horsePowers", Value::Real(400.0)), ("maxRPM", Value::Real(2400.0))], vec![]),
                 block(
                     "mechanics",
@@ -483,6 +491,7 @@ mod tests {
         assert_eq!(d.mass, 32673.0);
         assert_eq!(d.gear_ratios.len(), 7);
         assert_eq!(d.track_width, Some(0.4));
+        assert_eq!(d.track_animation_multiplier, Some(0.68));
         assert!((d.track_length.unwrap() - 12.166).abs() < 1e-3);
         assert_eq!(d.road_wheel_radius, Some(0.25));
         // 2400 RPM through 0.733 x 3.615 x 2.7 on a 0.305 m sprocket: 38.6 km/h; reverse 5.0 km/h

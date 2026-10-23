@@ -1,7 +1,8 @@
 //! Opens a War Thunder vehicle straight from the game files in a Bevy window.
 //!
 //! Usage: `wt-viewer [pack.grp model_name] [--game <game folder>] [--unit <unit>] [--screenshot <file.png>]
-//! [--turret <deg>] [--gun <deg>] [--orbit <yaw,pitch,distance>] [--target <x,y,z>] [--drive] [--auto <script>]`
+//! [--turret <deg>] [--gun <deg>] [--orbit <yaw,pitch,distance>] [--target <x,y,z>] [--drive] [--auto <script>]
+//! [--lift <node=metres>]`
 //!
 //! Drag with the mouse to orbit, scroll to zoom. Q/E traverse the turret and R/F elevate the gun, within
 //! the limits of the tank's unit BLK (found by its model name, or named with `--unit`). `--drive` puts
@@ -10,6 +11,12 @@
 //! in degrees and distance in metres, and `--target` the point it looks at (model space, metres). With
 //! `--screenshot` the window saves one frame and closes (after the script, if there is one), which is
 //! handy for checking a model without looking at the screen.
+//!
+//! The wheels and tracks move by `wt_unpack::gear`: wheels turn by the distance their track travels and the
+//! track texture runs at the rate of the track mesh, while the track mesh itself is skinned with the
+//! game's own bone table, so it follows its skeleton nodes (`root` and the suspension wheel nodes).
+//! `--lift bone_wheel_l_03=0.15` raises a node by that many metres, to see the skin follow it; the game
+//! moves those nodes with a suspension simulation that the viewer does not have.
 
 mod drive;
 
@@ -22,10 +29,12 @@ use bevy::camera::RenderTarget;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::math::Affine2;
-use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use wt_unpack::gear::{GearState, RunningGear};
 use wt_unpack::tank::{self, Tank};
 use wt_unpack::vehicle::{self, Vehicle};
 
@@ -85,22 +94,28 @@ struct TurretHead;
 #[derive(Component)]
 struct GunMount;
 
-/// A wheel that rolls with its side's track
+/// A wheel that rolls with its side's track: an index into the running gear's wheels
 #[derive(Component)]
-struct Wheel {
-    left: bool,
-    radius: f32,
-    angle: f32,
-}
+struct Wheel(usize);
 
-/// A track whose texture runs with its speed. Each track has its own copy of the material.
+/// A track whose texture runs with its speed: an index into the running gear's belts. Each track has its
+/// own copy of the material.
 #[derive(Component)]
 struct Track {
-    left: bool,
+    belt: usize,
     material: Handle<StandardMaterial>,
-    v_per_metre: f32,
-    offset: f32,
 }
+
+/// The vehicle's wheels and belts, from the game's data, and where they are now
+#[derive(Resource)]
+struct Gear {
+    gear: RunningGear,
+    state: GearState,
+}
+
+/// Nodes to raise, from `--lift`
+#[derive(Resource, Default)]
+struct Lift(Vec<(String, f32)>);
 
 /// How far each track has moved this frame, m (set by the drive mode)
 #[derive(Resource, Default)]
@@ -148,6 +163,19 @@ fn main() -> Result<()> {
         _ => (game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp"), "m4a1_76w_sherman".to_string()),
     };
     let script = option("--auto").map(|s| tank::parse_script(&s)).transpose()?;
+    let lift = Lift(
+        option("--lift")
+            .map(|s| {
+                s.split(',')
+                    .map(|part| {
+                        let (node, metres) = part.split_once('=').ok_or_else(|| anyhow!("--lift expects node=metres: {part}"))?;
+                        Ok((node.trim().to_string(), metres.trim().parse::<f32>()?))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+    );
     let camera = CameraRequest {
         orbit: option("--orbit").map(|s| floats::<3>(&s)).transpose()?,
         target: option("--target").map(|s| floats::<3>(&s).map(Vec3::from)).transpose()?,
@@ -194,6 +222,7 @@ fn main() -> Result<()> {
         .insert_resource(Spec(spec))
         .insert_resource(aim)
         .insert_resource(camera)
+        .insert_resource(lift)
         .init_resource::<TrackTravel>()
         .insert_resource(ClearColor(Color::srgb(0.11, 0.12, 0.14)))
         .insert_resource(GlobalAmbientLight { color: Color::WHITE, brightness: 600.0, affects_lightmapped_meshes: true })
@@ -222,42 +251,18 @@ fn to_bevy_image(img: &vehicle::Image, srgb: bool) -> Image {
     image
 }
 
-/// For a node named like `wheel_l_03` or `track_r` (with `prefix` "wheel_" or "track_"): true for the
-/// left side, false for the right
-fn side(name: &str, prefix: &str) -> Option<bool> {
-    match name.strip_prefix(prefix)?.split('_').next()? {
-        "l" => Some(true),
-        "r" => Some(false),
-        _ => None,
-    }
-}
-
-/// Wheel radius from the unit's suspension block, by kind of wheel, else from the wheel's mesh
-fn wheel_radius(name: &str, drive: Option<&tank::Drive>, mesh_radius: f32) -> f32 {
-    let blk = drive.and_then(|d| {
-        if name.contains("_top") {
-            d.top_wheel_radius
-        } else if name.contains("_drive") {
-            Some(d.drive_gear_radius)
-        } else if name.contains("_back") || name.contains("_front") {
-            d.end_wheel_radius
-        } else {
-            d.road_wheel_radius
-        }
-    });
-    blk.unwrap_or(mesh_radius).max(0.05)
-}
-
 fn spawn_vehicle(
     mut commands: Commands,
     loaded: Res<Loaded>,
     spec: Res<Spec>,
     request: Res<CameraRequest>,
+    lift: Res<Lift>,
     driving: Option<Res<drive::Driving>>,
     screenshot: Option<Res<ScreenshotTo>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut inverse_bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
 ) {
     let vehicle = loaded.0.lock().unwrap().take().expect("vehicle is spawned once");
     let turret = spec.0.as_ref().and_then(|t| t.turret.as_ref());
@@ -311,41 +316,56 @@ fn spawn_vehicle(
     let mut nodes = Vec::with_capacity(vehicle.nodes.len());
     for (i, n) in vehicle.nodes.iter().enumerate() {
         let (parent, origin) = n.parent.map_or((root, Vec3::ZERO), |p| (nodes[p], pivot(p)));
-        nodes.push(commands.spawn((Name::new(n.name.clone()), Transform::from_translation(pivot(i) - origin), Visibility::default(), ChildOf(parent))).id());
+        let raised = lift.0.iter().filter(|(name, _)| *name == n.name).map(|(_, metres)| *metres).sum::<f32>();
+        let at = pivot(i) - origin + Vec3::Y * raised;
+        nodes.push(commands.spawn((Name::new(n.name.clone()), Transform::from_translation(at), Visibility::default(), ChildOf(parent))).id());
     }
 
-    // Wheels are measured from their meshes when the BLK gives no radius
-    let mut wheel_height = vec![(f32::MAX, f32::MIN); vehicle.nodes.len()];
-    let (mut left_z, mut right_z) = (Vec::new(), Vec::new());
-    for m in &vehicle.meshes {
-        let at = pivot(m.node);
+    // Wheels and belts, from the game's data
+    let gear = RunningGear::new(&vehicle, drive);
+    for (i, w) in gear.wheels.iter().enumerate() {
+        commands.entity(nodes[w.node]).insert(Wheel(i));
+    }
+    info!("{} wheels, track gauge {:?} m", gear.wheels.len(), gear.gauge);
+
+    for (mesh_index, m) in vehicle.meshes.iter().enumerate() {
+        let node_name = vehicle.nodes[m.node].name.as_str();
+        let skinned = m.skinned && !m.bones.is_empty() && m.joints.len() == m.positions.len();
+        // Rigid parts are relative to their node; skinned vertices stay in the vehicle's space, bound to
+        // the bones' nodes
+        let at = if skinned { Vec3::ZERO } else { pivot(m.node) };
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
             .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, m.positions.iter().map(|p| (Vec3::from(*p) - at).to_array()).collect::<Vec<_>>())
             .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, m.normals.clone())
             .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, m.uvs.clone())
             .with_inserted_indices(Indices::U32(m.indices.clone()));
+        if skinned {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_INDEX, VertexAttributeValues::Uint16x4(m.joints.clone()));
+            mesh.insert_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT, m.weights.clone());
+        }
         // Normal maps need tangents
         if let Err(e) = mesh.generate_tangents() {
             warn!("no tangents for material {}: {e}", m.material);
         }
-        let node_name = vehicle.nodes[m.node].name.as_str();
         let mut material = mats[m.material].clone();
-        let mut entity = commands.spawn((Mesh3d(meshes.add(mesh)), ChildOf(nodes[m.node])));
-        if let (Some(left), Some(v_per_metre)) = (side(node_name, "track_"), vehicle::track_v_per_metre(m)) {
+        let parent = if skinned { root } else { nodes[m.node] };
+        let mut entity = commands.spawn((Mesh3d(meshes.add(mesh)), ChildOf(parent)));
+        if skinned {
+            // Each bone's inverse bind matrix undoes its node's place (node frames carry no axes)
+            let bindposes = m.bones.iter().map(|&b| Mat4::from_translation(-pivot(b))).collect::<Vec<_>>();
+            entity.insert(SkinnedMesh {
+                inverse_bindposes: inverse_bindposes.add(SkinnedMeshInverseBindposes::from(bindposes)),
+                joints: m.bones.iter().map(|&b| nodes[b]).collect(),
+            });
+        }
+        if let Some(belt) = gear.belts.iter().position(|b| b.mesh == mesh_index) {
             // Its own material, so the two tracks can run at different speeds
             let own = materials.get(&material).cloned().expect("material was just added");
             material = materials.add(own);
-            entity.insert(Track { left, material: material.clone(), v_per_metre, offset: 0.0 });
-            info!("{node_name}: texture runs {v_per_metre:.3} V per metre");
+            entity.insert(Track { belt, material: material.clone() });
+            info!("{node_name}: texture runs {:.3} V per metre", gear.belts[belt].v_per_metre);
         }
         entity.insert(MeshMaterial3d(material));
-        if side(node_name, "wheel_").is_some() {
-            let h = &mut wheel_height[m.node];
-            for p in &m.positions {
-                h.0 = h.0.min(p[1]);
-                h.1 = h.1.max(p[1]);
-            }
-        }
     }
     for (i, n) in vehicle.nodes.iter().enumerate() {
         let name = n.name.as_str();
@@ -355,19 +375,14 @@ fn spawn_vehicle(
         if turret.map_or(name == "bone_gun", |t| t.gun == name) {
             commands.entity(nodes[i]).insert(GunMount);
         }
-        let (bottom, top) = wheel_height[i];
-        if let (Some(left), true) = (side(name, "wheel_"), bottom <= top) {
-            let radius = wheel_radius(name, drive, (top - bottom) / 2.0);
-            commands.entity(nodes[i]).insert(Wheel { left, radius, angle: 0.0 });
-            if left { &mut left_z } else { &mut right_z }.push(n.pivot[2]);
-        }
     }
     let glass: Vec<&str> = vehicle.meshes.iter().filter(|m| vehicle.materials[m.material].name.contains("glass")).map(|m| vehicle.nodes[m.node].name.as_str()).collect();
     info!("glass on nodes {glass:?}");
-    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
-    let gauge = if left_z.is_empty() || right_z.is_empty() { 2.5 } else { mean(&right_z) - mean(&left_z) };
-    info!("{} wheels, track gauge {gauge:.3} m", left_z.len() + right_z.len());
+    // Without wheels to measure, a typical gauge
+    let gauge = gear.gauge.unwrap_or(2.5);
     commands.insert_resource(Bounds { lo, gauge });
+    let state = gear.rest();
+    commands.insert_resource(Gear { gear, state });
 
     let size = (hi - lo).max_element();
     let center = (lo + hi) / 2.0 - Vec3::Y * lo.y;
@@ -430,24 +445,22 @@ fn aim_turret(
     }
 }
 
-/// Rolls the wheels and runs the track textures by how far each track moved
+/// Rolls the wheels and runs the track textures by how far each track moved (see `wt_unpack::gear`)
 fn roll_running_gear(
     travel: Res<TrackTravel>,
-    mut wheels: Query<(&mut Wheel, &mut Transform)>,
-    mut tracks: Query<&mut Track>,
+    mut gear: ResMut<Gear>,
+    mut wheels: Query<(&Wheel, &mut Transform)>,
+    tracks: Query<&Track>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let side = |left: bool| if left { travel.left } else { travel.right };
-    for (mut w, mut t) in &mut wheels {
-        // Rolling forward (+X) turns a wheel clockwise seen from the right (+Z), i.e. negatively about Z
-        w.angle = (w.angle - side(w.left) / w.radius).rem_euclid(std::f32::consts::TAU);
-        t.rotation = Quat::from_rotation_z(w.angle);
+    let Gear { gear, state } = &mut *gear;
+    gear.advance(state, travel.left, travel.right);
+    for (w, mut t) in &mut wheels {
+        t.rotation = Quat::from_rotation_z(state.wheel_angles[w.0]);
     }
-    for mut track in &mut tracks {
-        // The bottom run stays put on the ground, so relative to the hull it runs backwards
-        track.offset = (track.offset + track.v_per_metre * side(track.left)).rem_euclid(1.0);
+    for track in &tracks {
         if let Some(mut m) = materials.get_mut(&track.material) {
-            m.uv_transform = Affine2::from_translation(Vec2::new(0.0, track.offset));
+            m.uv_transform = Affine2::from_translation(Vec2::new(0.0, state.belt_offsets[track.belt]));
         }
     }
 }

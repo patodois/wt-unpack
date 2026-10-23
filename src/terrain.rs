@@ -232,7 +232,7 @@ pub fn to_model(name: &str, mesh: &TriMesh) -> Vehicle {
     let uvs = positions.iter().map(|p| [(p[0] - lo[0]) / span[0], (p[2] - lo[1]) / span[1]]).collect();
     Vehicle {
         name: name.to_owned(),
-        meshes: vec![Mesh { material: 0, node: 0, skinned: false, positions, normals, uvs, indices }],
+        meshes: vec![Mesh { positions, normals, uvs, indices, ..Mesh::default() }],
         materials: vec![Material {
             name: "terrain".into(),
             color: None,

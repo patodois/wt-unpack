@@ -20,7 +20,8 @@ png = "0.18.1"
 oozextract = "0.5.5"
 memmap2 = "0.9"
 # The bridge to other game rewrites (see src/bridge.rs), and the peak memory report of `check-bridge`
-rewrite-bridge = { path = "../rewrite-bridge", optional = true }
+# Common model types shared with other game rewrites (github.com/patodois/rewrite-bridge)
+rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", rev = "263b74c550c49873e9a8b0298ca8434803037fd8", optional = true }
 libc = { version = "0.2", optional = true }
 
 [features]

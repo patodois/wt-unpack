@@ -6,6 +6,7 @@ pub mod bytes;
 pub mod camo;
 pub mod gltf;
 pub mod level;
+pub mod live;
 pub mod sound;
 pub mod tank;
 pub mod terrain;

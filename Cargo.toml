@@ -20,6 +20,12 @@ png = "0.18.1"
 oozextract = "0.5.5"
 lewton = { version = "0.10.2", default-features = false }
 memmap2 = "0.9"
+# Blocking HTTP client for the live telemetry poller (plain HTTP to localhost only, so no TLS)
+ureq = { version = "3.5", default-features = false, optional = true }
+
+[features]
+# `wt-unpack live`: poll the game's read-only telemetry API on localhost:8111
+live = ["dep:ureq"]
 
 [workspace]
 members = ["viewer"]

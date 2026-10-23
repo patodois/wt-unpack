@@ -101,20 +101,39 @@ enum Command {
     CheckBridge {
         #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
         game: PathBuf,
-        /// Only vehicles whose id contains this text
+        /// Only vehicles whose id contains this text (e.g. `--filter usa_` or `--filter tanks/germ_`)
         #[arg(long, default_value = "")]
         filter: String,
-        /// Only print the ids
+        /// Only print the ids, then stop
         #[arg(long)]
         list: bool,
+        /// Stop after this many vehicles (a full run is every tank, aircraft and ship: over 3,000)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Also decode and bake every vehicle's textures, camouflage included (the default checks geometry, skeleton
+        /// and materials only). Over 3,000 vehicles that takes more than an hour, and a large ship needs 2 to 3 GB
+        #[arg(long)]
+        textures: bool,
+        /// Skip this many vehicles first (to resume a run, or to look at a later part of the list)
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Print a progress line every this many vehicles
+        #[arg(long, default_value_t = 50)]
+        progress: usize,
     },
     /// Check vehicles against rewrite-bridge's conventions (scale, orientation, winding, materials, ...) with its
-    /// conformance checker; the options after `--` are the checker's own (`--help` lists them)
+    /// conformance checker, e.g. `check-conformance --filter germ_he_115 -v`; `--help` lists the checker's options
     #[cfg(feature = "bridge")]
+    #[command(disable_help_flag = true)]
     CheckConformance {
+        /// The War Thunder game folder (put it before the checker's options)
         #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
         game: PathBuf,
-        /// Options of the checker: --id, --filter, --kind, --limit, --compare-load, --allow, -v, --strict
+        /// Skip texture baking (fast; a large ship needs 2 to 3 GB with textures). Works anywhere among the options
+        #[arg(long)]
+        no_textures: bool,
+        /// Options of the checker, passed through, with or without a `--` before them: `--id`, `--filter`,
+        /// `--kind`, `--limit`, `--compare-load`, `--allow`, `-v`, `--strict`, `--help`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -214,10 +233,11 @@ fn main() -> Result<()> {
         Command::Check { dir } => check_cmd(&dir),
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
         #[cfg(feature = "bridge")]
-        Command::CheckBridge { game, filter, list } => check_bridge(&game, &filter, list),
+        Command::CheckBridge { game, filter, list, limit, textures, skip, progress } => check_bridge(&game, &filter, list, limit, textures, skip, progress),
         #[cfg(feature = "bridge")]
-        Command::CheckConformance { game, args } => {
-            let wt = wt_unpack::bridge::WarThunder::new(game);
+        Command::CheckConformance { game, no_textures, mut args } => {
+            let no_textures = take_flag(&mut args, "--no-textures") || no_textures;
+            let wt = wt_unpack::bridge::WarThunder::new(game).with_textures(!no_textures);
             std::process::exit(rewrite_bridge::conformance::cli::run(&wt, args))
         }
         #[cfg(feature = "bridge")]
@@ -778,30 +798,90 @@ fn peak_rss() -> u64 {
     if cfg!(target_os = "macos") { max } else { max * 1024 }
 }
 
+/// Resident memory of this process now, in bytes (0 where it cannot be read)
+#[cfg(all(feature = "bridge", target_os = "macos"))]
+fn current_rss() -> u64 {
+    // Safety: proc_pid_rusage only writes the struct it is given
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let ptr = &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t;
+    let ok = unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, ptr) } == 0;
+    if ok { info.ri_resident_size } else { 0 }
+}
+
+#[cfg(all(feature = "bridge", target_os = "linux"))]
+fn current_rss() -> u64 {
+    // The second field of statm is the resident set in pages
+    let pages = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|t| t.split_whitespace().nth(1).and_then(|f| f.parse::<u64>().ok()))
+        .unwrap_or(0);
+    // Safety: sysconf takes no pointers
+    pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64
+}
+
+/// Not measured elsewhere
+#[cfg(all(feature = "bridge", not(any(target_os = "macos", target_os = "linux"))))]
+fn current_rss() -> u64 {
+    0
+}
+
 /// Not measured outside Unix
 #[cfg(all(feature = "bridge", not(unix)))]
 fn peak_rss() -> u64 {
     0
 }
 
+/// Removes every `flag` from `args` and says whether there was one
 #[cfg(feature = "bridge")]
-fn check_bridge(game: &Path, filter: &str, list_only: bool) -> Result<()> {
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != flag);
+    args.len() < before
+}
+
+/// `90` as `1:30`, `4000` as `1:06:40`
+#[cfg(feature = "bridge")]
+fn clock(seconds: f32) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// `check-bridge` drops the provider's caches (the pack indexes, rebuilt by the next load) this often
+#[cfg(feature = "bridge")]
+const CLEAR_CACHES_EVERY: usize = 250;
+
+#[cfg(feature = "bridge")]
+fn check_bridge(game: &Path, filter: &str, list_only: bool, limit: Option<usize>, textures: bool, skip: usize, progress: usize) -> Result<()> {
     use std::collections::BTreeMap;
     use std::time::Instant;
     use rewrite_bridge::Provider;
     use wt_unpack::bridge::WarThunder;
 
     let start = Instant::now();
-    let wt = WarThunder::new(game);
+    let wt = WarThunder::new(game).with_textures(textures);
     let mut assets = wt.list(filter).map_err(|e| anyhow::anyhow!("{e}"))?;
     assets.retain(|a| a.kind == rewrite_bridge::AssetKind::Vehicle);
-    eprintln!("{} vehicles listed in {:.1} s", assets.len(), start.elapsed().as_secs_f32());
+    let listed = assets.len();
+    assets.drain(..skip.min(assets.len()));
+    assets.truncate(limit.unwrap_or(usize::MAX));
     if list_only {
         for a in &assets {
             println!("{}", a.id);
         }
         return Ok(());
     }
+    let limited = if assets.len() < listed { format!(" of {listed} listed") } else { String::new() };
+    println!(
+        "checking {}{limited} vehicles ({}; listed in {:.1} s); one progress line per {progress}, Ctrl-C stops",
+        assets.len(),
+        if textures { "with textures" } else { "geometry and materials, no textures: add --textures to bake them" },
+        start.elapsed().as_secs_f32()
+    );
+    let checking = Instant::now();
     // Per folder: (ok, failed); and how often each error came up, with one example
     let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut errors: BTreeMap<String, (usize, String)> = BTreeMap::new();
@@ -828,8 +908,24 @@ fn check_bridge(game: &Path, filter: &str, list_only: bool) -> Result<()> {
                 slot.0 += 1;
             }
         }
-        if (i + 1) % 250 == 0 {
-            eprintln!("{}/{} ({:.0} s, peak {} MB)", i + 1, assets.len(), start.elapsed().as_secs_f32(), peak_rss() >> 20);
+        // A vehicle's meshes and textures are freed when it goes out of scope, but the allocator keeps the
+        // pages: without this the resident size follows the largest vehicles seen so far, not the current one
+        wt_unpack::memory::release_freed_memory();
+        if (i + 1) % CLEAR_CACHES_EVERY == 0 {
+            wt.clear_caches();
+        }
+        if progress > 0 && (i + 1) % progress == 0 && i + 1 < assets.len() {
+            let elapsed = checking.elapsed().as_secs_f32();
+            let eta = elapsed / (i + 1) as f32 * (assets.len() - i - 1) as f32;
+            println!(
+                "{:>5}/{}  elapsed {}  {} MB resident (peak {} MB)  about {} left",
+                i + 1,
+                assets.len(),
+                clock(elapsed),
+                current_rss() >> 20,
+                peak_rss() >> 20,
+                clock(eta)
+            );
         }
     }
     let (ok, failed) = counts.values().fold((0, 0), |(o, f), c| (o + c.0, f + c.1));
@@ -1109,4 +1205,25 @@ fn live_cmd(url: &str, hz: f64, log: Option<&Path>, mock: bool, count: Option<us
         writeln!(out)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "bridge"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_shows_minutes_and_hours() {
+        assert_eq!(clock(0.0), "0:00");
+        assert_eq!(clock(90.4), "1:30");
+        assert_eq!(clock(4000.0), "1:06:40");
+        assert_eq!(clock(-5.0), "0:00");
+    }
+
+    #[test]
+    fn a_flag_is_taken_out_wherever_it_stands() {
+        let mut args: Vec<String> = ["--filter", "x", "--no-textures", "-v"].map(String::from).to_vec();
+        assert!(take_flag(&mut args, "--no-textures"));
+        assert_eq!(args, ["--filter", "x", "-v"]);
+        assert!(!take_flag(&mut args, "--no-textures"));
+    }
 }

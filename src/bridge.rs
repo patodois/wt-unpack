@@ -70,12 +70,22 @@ pub struct WarThunder {
     game: PathBuf,
     caches: Mutex<Caches>,
     scene_options: SceneOptions,
+    textures: bool,
 }
 
 impl WarThunder {
     /// `game` is the installed game's folder, the one holding `content` and `aces.vromfs.bin`
     pub fn new(game: impl Into<PathBuf>) -> Self {
-        Self { game: game.into(), caches: Mutex::new(Caches::default()), scene_options: SceneOptions::default() }
+        Self { game: game.into(), caches: Mutex::new(Caches::default()), scene_options: SceneOptions::default(), textures: true }
+    }
+
+    /// Whether vehicles are loaded with their textures (the default). With `false` the materials keep their
+    /// names, alpha mode and sidedness but hold no images: loading is many times faster and a ship needs
+    /// megabytes instead of gigabytes (the textures are baked at full size, camouflage included). For checks
+    /// and tools that only need the geometry and skeleton.
+    pub fn with_textures(mut self, textures: bool) -> Self {
+        self.textures = textures;
+        self
     }
 
     /// Sets the budget parameters of [`Provider::load_scene`]
@@ -254,7 +264,8 @@ impl WarThunder {
 
     fn load_vehicle(&self, id: &str) -> Result<AnimatedModel> {
         let (rel, name, pack) = self.vehicle_parts(id)?;
-        let v = self.library()?.load(&pack, name, 0)?;
+        let library = self.library()?;
+        let v = if self.textures { library.load(&pack, name, 0)? } else { library.load_geometry(&pack, name, 0)? };
         // Sockets are for ground vehicles, whose unit files and node names the rig knows
         let rig = if rel.starts_with("tanks/") { Some(VehicleRig::new(&v, self.tank_of(rel, name)?.as_ref())) } else { None };
         let mut animated = AnimatedModel::new(to_model(v));

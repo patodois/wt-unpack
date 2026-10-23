@@ -25,6 +25,15 @@ const PARAM_SIZE: usize = 8;
 /// Deepest nesting accepted (real land classes go three or four deep)
 const MAX_DEPTH: usize = 32;
 
+/// What the blocks and parameters read so far may add up to. A dump stores every block and parameter once
+/// and each takes room in it, so a tree can hold no more of either than the dump has room for; a pointer
+/// that leads back to a block already read would otherwise multiply (two children per block, eighteen
+/// levels, 1.7 KB of dump make 262,143 blocks).
+struct Budget {
+    blocks: usize,
+    params: usize,
+}
+
 /// Parses a dump that starts with its root block
 pub fn parse(dump: &[u8]) -> Result<Block> {
     let names = {
@@ -41,11 +50,13 @@ pub fn parse(dump: &[u8]) -> Result<Block> {
             .collect::<Result<Vec<_>>>()?;
         (map, names)
     };
-    read_block(dump, 0, &names.1, names.0, 0)
+    let mut budget = Budget { blocks: dump.len() / BLOCK_SIZE, params: dump.len() / PARAM_SIZE };
+    read_block(dump, 0, &names.1, names.0, 0, &mut budget)
 }
 
-fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize) -> Result<Block> {
+fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize, budget: &mut Budget) -> Result<Block> {
     ensure!(depth < MAX_DEPTH, "data blocks nest too deeply");
+    budget.blocks = budget.blocks.checked_sub(1).context("the dump's blocks point at more blocks than it stores")?;
     let mut r = Reader::at(dump, at)?;
     let (params_ofs, params_count) = ptab(&mut r)?;
     let (blocks_ofs, blocks_count) = ptab(&mut r)?;
@@ -53,6 +64,7 @@ fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize
     let name_id = r.i32()?;
     let name = usize::try_from(name_id).ok().and_then(|i| names.get(i)).cloned().unwrap_or_default();
     ensure!(params_count <= dump.len() / PARAM_SIZE && blocks_count <= dump.len() / BLOCK_SIZE, "block claims too many entries");
+    budget.params = budget.params.checked_sub(params_count).context("the dump's blocks list more parameters than it stores")?;
 
     let name_of = |id: u16| names.get(usize::from(id)).cloned().with_context(|| format!("name id {id} out of range"));
     let mut params = Vec::with_capacity(params_count);
@@ -95,7 +107,7 @@ fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize
         params.push((name_of(id)?, value));
     }
     let blocks = (0..blocks_count)
-        .map(|i| read_block(dump, blocks_ofs + i * BLOCK_SIZE, names, map, depth + 1))
+        .map(|i| read_block(dump, blocks_ofs + i * BLOCK_SIZE, names, map, depth + 1, budget))
         .collect::<Result<Vec<_>>>()?;
     Ok(Block { name, params, blocks })
 }
@@ -165,6 +177,46 @@ mod tests {
         assert_eq!(b.params, vec![("n".to_string(), Value::Int(7)), ("s".to_string(), Value::Str("hi".into()))]);
         assert_eq!(b.blocks.len(), 1);
         assert_eq!(b.blocks[0].name, "child");
+    }
+
+    /// `levels` pairs of blocks where both blocks of a level list the same two blocks of the next one as
+    /// children: 1,744 bytes at 18 levels, and a reader that follows every pointer builds 2^18 blocks
+    fn shared_children(levels: usize) -> Vec<u8> {
+        let map = levels * 96;
+        let mut d = Vec::new();
+        for l in 0..levels {
+            for _ in 0..2 {
+                let (ofs, count) = if l + 1 < levels { (((l + 1) * 96) as u32, 2u32) } else { (0, 0) };
+                put(&mut d, 0);
+                put(&mut d, 0);
+                d.extend_from_slice(&[0; 8]);
+                put(&mut d, ofs);
+                put(&mut d, count);
+                d.extend_from_slice(&[0; 8]);
+                d.extend_from_slice(&(map as u64).to_le_bytes());
+                d.extend_from_slice(&(-1i32).to_le_bytes());
+                put(&mut d, 0);
+            }
+        }
+        // the name map: an empty table
+        put(&mut d, 0);
+        put(&mut d, 0);
+        d.extend_from_slice(&[0; 8]);
+        d
+    }
+
+    #[test]
+    fn children_shared_between_blocks_cannot_blow_up_the_tree() {
+        fn count(b: &Block) -> usize {
+            1 + b.blocks.iter().map(count).sum::<usize>()
+        }
+        // Two levels read: three blocks out of the four the dump stores
+        let d = shared_children(2);
+        assert_eq!(count(&parse(&d).unwrap()), 3);
+        let d = shared_children(18);
+        assert!(d.len() < 2000);
+        let err = parse(&d).unwrap_err().to_string();
+        assert!(err.contains("more blocks"), "{err}");
     }
 
     #[test]

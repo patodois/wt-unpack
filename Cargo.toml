@@ -14,7 +14,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 zstd = "0.13"
 # Texture and model readers from Warthunder-Open-Source-Foundation/wt_blk#28 and #29 (fork branch);
 # switch to crates.io once they are released
-wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "c7fd584a73384f8de70c76b6a5635f47f42986dc", features = ["png"] }
+wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "2de16e1deb6771532cbc426aa6950c4b99ba850b", features = ["png"] }
 png = "0.18.1"
 # Oodle streams inside level files (the same decoder wt_blk uses)
 oozextract = "0.5.5"

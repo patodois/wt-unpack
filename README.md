@@ -289,6 +289,7 @@ Checked against War Thunder 2.59.0.80 on macOS:
 | Textures | 148,335, all decoded except 375 stored as deltas to a paired base texture |
 | Models | tanks 3,656/3,656, aircraft 1,695/1,695, ships 1,925/1,925, with every skeleton |
 | Levels | 160/160 parse fully: terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
+| Level scenes | 160/160 load and validate through the bridge in 0.6 to 19 s, peak RSS 0.65 to 1.96 GB (avg_falklands); every placed object's pool resolves to a model, and 225 models that are only decals have nothing to draw |
 | Sound samples | 156,223 in 123 banks decoded: 148,743 Vorbis (91.7 hours) and 7,480 FADPCM |
 
 ## Disclaimer

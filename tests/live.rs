@@ -3,7 +3,7 @@
 //! `cargo test --features live --test live`.
 
 use serde_json::{json, Value};
-use wt_unpack::live::{self, mock, Army, Indicators, MapBounds, MapInfo, MapObject, Snapshot, State, Status};
+use wt_unpack::live::{self, mock, Army, Gear, Indicators, MapBounds, MapInfo, MapObject, Snapshot, State, Status};
 
 fn parse(s: &str) -> Value {
     serde_json::from_str(s).unwrap()
@@ -34,10 +34,30 @@ fn tank_indicators_parse_and_keep_unknown_keys() {
     assert_eq!(ind.army, Some(Army::Tank));
     assert_eq!(ind.unit.as_deref(), Some("tankModels/us_m4a1_76w_sherman"));
     assert_eq!(ind.unit_name(), Some("us_m4a1_76w_sherman"));
-    assert_eq!((ind.speed, ind.gear, ind.rpm), (Some(23.4), Some(3.0), Some(2100.0)));
-    assert_eq!(ind.compass_deg, None);
-    assert_eq!(ind.raw["crew_total"], 5);
-    assert_eq!(ind.raw.len(), 11);
+    assert_eq!((ind.speed, ind.gear, ind.gear_neutral, ind.rpm), (Some(23.4), Some(4.0), Some(1.0), Some(2100.0)));
+    assert_eq!((ind.crew_current, ind.crew_total), (Some(5.0), Some(5.0)));
+    assert_eq!(ind.gearbox(), Some(Gear::Forward(3)));
+    assert_eq!((ind.compass_deg, ind.throttle), (None, None), "tanks report neither");
+    // Untyped keys stay in the raw map
+    assert_eq!(ind.raw["first_stage_ammo"], 0.0);
+    assert_eq!(ind.raw.len(), 20);
+}
+
+#[test]
+fn gears_count_from_neutral() {
+    // The T-26: neutral at index 1, one reverse and five forward gears
+    let gear = |g: f64, n: Option<f64>| Indicators { gear: Some(g), gear_neutral: n, ..Default::default() }.gearbox().unwrap();
+    assert_eq!(gear(0.0, Some(1.0)), Gear::Reverse(1));
+    assert_eq!(gear(1.0, Some(1.0)), Gear::Neutral);
+    let forward: Vec<_> = (2..=6).map(|g| gear(f64::from(g), Some(1.0))).collect();
+    assert_eq!(forward, (1..=5).map(Gear::Forward).collect::<Vec<_>>());
+    // Neutral at 0 (seen while spawning), two reverse gears, no neutral index at all
+    assert_eq!(gear(0.0, Some(0.0)), Gear::Neutral);
+    assert_eq!(gear(0.0, Some(2.0)), Gear::Reverse(2));
+    assert_eq!(gear(3.0, None), Gear::Index(3));
+    let shown: Vec<_> = [Gear::Reverse(1), Gear::Reverse(2), Gear::Neutral, Gear::Forward(3), Gear::Index(3)].iter().map(Gear::to_string).collect();
+    assert_eq!(shown, ["R", "R2", "N", "3", "#3"]);
+    assert_eq!(Indicators::default().gearbox(), None);
 }
 
 #[test]
@@ -154,7 +174,7 @@ fn tank_snapshot_combines_endpoints() {
     let p = snap.player().unwrap();
     assert_eq!(p.army, Some(Army::Tank));
     assert_eq!(p.speed_kmh, Some(23.4));
-    assert_eq!(p.gear, Some(3.0));
+    assert_eq!(p.gear, Some(Gear::Forward(3)));
     assert_eq!(p.landing_gear_pct, None);
     assert_eq!(p.throttle_pct, None, "the sample tank reports no throttle");
     // x 0.6, y 0.25 on [-1500, -1700]..[2500, 2300]: 900 m east, 1300 m north
@@ -164,8 +184,10 @@ fn tank_snapshot_combines_endpoints() {
     let log = snap.to_log_json(1.5);
     assert_eq!(log["status"], "in_match");
     assert_eq!(log["vehicle"]["position_m"], json!([-900.0, 0.0, 1300.0]));
+    assert_eq!(log["vehicle"]["gear"], "3");
     assert_eq!(log["player_map_obj"]["icon"], "Player");
-    assert!(log.get("errors").is_none());
+    assert_eq!(log["map_info"]["map_generation"], 7);
+    assert!(log.get("errors").is_none() && log.get("held").is_none());
 }
 
 #[test]
@@ -201,6 +223,16 @@ fn status_from_valid_flags() {
     assert_eq!(only_state.status, Status::InMatch);
     let p = only_state.player().unwrap();
     assert_eq!((p.army, p.position, p.heading_deg), (None, None, None));
+}
+
+#[test]
+fn reverse_and_neutral_on_the_line() {
+    let mut ind = Indicators::from_json(parse(mock::TANK_INDICATORS));
+    let line = |ind: &Indicators| Snapshot::new(None, Some(ind.clone()), None, vec![], vec![]).player().unwrap().line();
+    (ind.gear, ind.speed) = (Some(0.0), Some(-4.0));
+    assert_eq!(line(&ind), "tank us_m4a1_76w_sherman  -4.0 km/h  hdg -  pos -  thr -  gear R");
+    (ind.gear, ind.speed) = (Some(1.0), Some(0.0));
+    assert!(line(&ind).ends_with("gear N"));
 }
 
 #[test]
@@ -295,7 +327,7 @@ mod client {
         assert!(snap.errors.iter().any(|e| e.starts_with("map_info: bad JSON")));
         assert!(snap.errors.iter().any(|e| e == "map_obj: HTTP 404"));
         let p = snap.player().unwrap();
-        assert_eq!((p.speed_kmh, p.gear, p.position), (Some(23.4), Some(3.0), None));
+        assert_eq!((p.speed_kmh, p.gear, p.position), (Some(23.4), Some(Gear::Forward(3)), None));
         assert_eq!(snap.to_log_json(0.0)["errors"].as_array().unwrap().len(), 3);
     }
 
@@ -329,6 +361,78 @@ mod client {
         assert_eq!(n, 6);
         // Five waits of 50 ms between six polls
         assert!(took >= Duration::from_millis(250) && took < Duration::from_millis(1000), "took {took:?}");
+    }
+
+    /// The tank sample, but `/map_obj.json` answers 200 with an empty body, as the game does now and then
+    fn empty_map_obj(path: &str) -> Option<mock::Response> {
+        if path == "/map_obj.json" { Some((200, "application/json", Vec::new())) } else { mock::tank_match(path) }
+    }
+
+    #[test]
+    fn empty_map_obj_body_is_a_note_not_an_error() {
+        let server = MockServer::start(empty_map_obj).unwrap();
+        let snap = client(&server).snapshot(None);
+        assert_eq!(snap.status, Status::InMatch);
+        assert!(snap.errors.is_empty(), "{:?}", snap.errors);
+        assert_eq!(snap.notes, vec!["map_obj: empty body".to_string()]);
+        assert_eq!(snap.failed, vec!["map_obj"]);
+        assert_eq!(snap.player().unwrap().position, None);
+        let log = snap.to_log_json(0.0);
+        assert!(log.get("errors").is_none());
+        assert_eq!(log["notes"][0], "map_obj: empty body");
+
+        // Under the poller the last position stands in
+        server.set_handler(mock::tank_match);
+        let mut poller = Poller::new(client(&server), 50.0);
+        let good = poller.next().unwrap().player().unwrap().position;
+        server.set_handler(empty_map_obj);
+        let bridged = poller.next().unwrap();
+        assert_eq!(bridged.status, Status::InMatch);
+        assert_eq!(bridged.held, vec!["map_obj"]);
+        assert_eq!(bridged.player().unwrap().position, good);
+    }
+
+    #[test]
+    fn indicators_timeout_mid_match_is_bridged() {
+        let server = MockServer::start(mock::tank_match).unwrap();
+        let mut poller = Poller::new(Client::new(&server.url(), Duration::from_millis(200)), 50.0);
+        poller.grace = Duration::from_millis(700);
+        assert_eq!(poller.next().unwrap().status, Status::InMatch);
+        // /indicators hangs; /state still answers {"valid": false} as it does for tanks
+        server.set_handler(|p: &str| {
+            if p == "/indicators" {
+                std::thread::sleep(Duration::from_millis(600));
+            }
+            mock::tank_match(p)
+        });
+        let bridged = poller.next().unwrap();
+        assert!(bridged.inconclusive);
+        assert_eq!(bridged.status, Status::InMatch, "{:?}", bridged.errors);
+        assert_eq!(bridged.held, vec!["indicators"]);
+        assert!(bridged.errors[0].starts_with("indicators: no answer"), "{:?}", bridged.errors);
+        let p = bridged.player().unwrap();
+        assert_eq!((p.speed_kmh, p.gear), (Some(23.4), Some(Gear::Forward(3))));
+        assert!(p.position.is_some(), "the map is still read live");
+        assert_eq!(bridged.to_log_json(0.0)["held"][0], "indicators");
+        // Past the grace period the poller gives up on the match
+        std::thread::sleep(Duration::from_millis(500));
+        let gone = poller.next().unwrap();
+        assert_eq!(gone.status, Status::NotInMatch);
+        assert!(gone.held.is_empty());
+    }
+
+    #[test]
+    fn map_info_is_logged_once_per_match() {
+        let server = MockServer::start(mock::tank_match).unwrap();
+        let mut poller = Poller::new(client(&server), 50.0);
+        let logs: Vec<Value> = (0..3).map(|_| poller.next().unwrap().to_log_json(0.0)).collect();
+        assert_eq!(logs[0]["map_info"]["map_max"], json!([2500.0, 2300.0]));
+        assert!(logs[1].get("map_info").is_none() && logs[2].get("map_info").is_none());
+        assert!(logs.iter().all(|l| l["vehicle"]["position_m"].is_array()), "the cached bounds still place the player");
+        server.set_handler(mock::hangar);
+        poller.next().unwrap();
+        server.set_handler(mock::tank_match);
+        assert!(poller.next().unwrap().to_log_json(0.0).get("map_info").is_some(), "a new match logs it again");
     }
 
     #[test]

@@ -8,14 +8,21 @@
 //! | Endpoint | Content |
 //! |---|---|
 //! | `/state` | Flight model of the player's aircraft, keys with units: `"H, m"`, `"TAS, km/h"`, `"IAS, km/h"`, `"M"`, `"AoA, deg"`, `"Vy, m/s"`, `"Mfuel, kg"`, `"Mfuel0, kg"`, `"throttle 1, %"`, `"RPM 1"`, `"gear, %"` (landing gear), `"flaps, %"`, ... |
-//! | `/indicators` | Cockpit and HUD gauges: `"army"` (`"air"`, `"tank"`, ...), `"type"` (the unit, e.g. `tankModels/us_m4a1_76w_sherman`), `"speed"`, `"compass"`, `"throttle"` (0..1), `"gear"` (gearbox, ground vehicles), `"rpm"`, ... The set depends on the vehicle |
+//! | `/indicators` | Cockpit and HUD gauges: `"army"` (`"air"`, `"tank"`, ...), `"type"` (the unit, e.g. `tankModels/us_m4a1_76w_sherman`), `"speed"`, `"compass"`, `"throttle"` (0..1, aircraft), `"gear"` and `"gear_neutral"` (gearbox, ground vehicles), `"rpm"`, `"crew_current"`, `"crew_total"`, ... The set depends on the vehicle |
 //! | `/map_info.json` | The minimap's world bounds: `"map_min"`, `"map_max"` (metres), `"grid_zero"`, `"grid_steps"`, `"grid_size"`, `"map_generation"`, `"hud_type"` |
 //! | `/map_obj.json` | The objects drawn on the player's minimap: `"type"`, `"icon"`, `"icon_bg"`, `"color"`, `"color[]"`, `"blink"`, position `"x"`/`"y"` and direction `"dx"`/`"dy"` normalised to the map, or a segment `"sx"`/`"sy"`..`"ex"`/`"ey"` (airfields) |
 //! | `/map.img` | The minimap image (`?gen=<map_generation>`) |
 //!
-//! Every endpoint answers `{"valid": false}` (or an empty list) outside a match. Each struct keeps the
+//! Every endpoint answers `{"valid": false}` (or an empty list) outside a match; for ground vehicles
+//! `/state` stays `{"valid": false}` in a match too, so a match is detected from either endpoint. Each
+//! struct keeps the
 //! whole JSON object in `raw`, so fields the game adds later are not lost, and reads the known keys
 //! leniently: a missing or oddly typed key becomes `None` instead of failing the parse.
+//!
+//! A real test drive (a T-26, about 1,100 polls in a match) confirmed the speed unit (km/h, negative
+//! in reverse), the metre scale of the bounds, the sign of `dx`/`dy`, and the gear numbering (see
+//! [`Gear`]). About 2% of polls fail on their own: an empty `/map_obj.json` body or a timeout. The
+//! [`Poller`] rides over those for a short grace period instead of leaving the match.
 //!
 //! # Coordinates
 //!
@@ -40,6 +47,7 @@
 //! above; heading `h` points along `[-sin h, 0, cos h]`, which is a rotation of `-h` about +Y applied
 //! to a model facing +Z. Vehicles assembled by [`crate::vehicle`] face +X instead and need `-h - 90°`.
 //! `grid_zero` is the corner the in-game grid letters count from and is not added to positions.
+//! Not yet checked: whether map north is +Z of the level geometry exported from the game files.
 
 #[cfg(feature = "live")]
 use std::time::Duration;
@@ -174,16 +182,22 @@ pub struct Indicators {
     pub army: Option<Army>,
     /// `"type"`: the unit, e.g. `tankModels/us_m4a1_76w_sherman` or `p-51d-5`
     pub unit: Option<String>,
-    /// `"speed"`: km/h for ground vehicles (the HUD speedometer)
+    /// `"speed"`: km/h for ground vehicles (the HUD speedometer), negative in reverse
     pub speed: Option<f64>,
     /// `"compass"`: heading in degrees (aircraft)
     pub compass_deg: Option<f64>,
-    /// `"throttle"`, 0..1
+    /// `"throttle"`, 0..1; ground vehicles do not report it
     pub throttle: Option<f64>,
-    /// `"gear"`: gearbox position of ground vehicles, as the game numbers it
+    /// `"gear"`: raw gearbox index of ground vehicles, counted from the lowest reverse gear. Use
+    /// [`Indicators::gearbox`] for the gear as the HUD shows it
     pub gear: Option<f64>,
+    /// `"gear_neutral"`: the index of neutral in `gear`
+    pub gear_neutral: Option<f64>,
     /// `"rpm"`
     pub rpm: Option<f64>,
+    /// `"crew_current"` and `"crew_total"`: crew members left and the full crew (ground vehicles)
+    pub crew_current: Option<f64>,
+    pub crew_total: Option<f64>,
     /// The whole object, including keys not listed above
     pub raw: Map<String, Value>,
 }
@@ -199,14 +213,64 @@ impl Indicators {
             compass_deg: num(&raw, "compass").or_else(|| num(&raw, "compass1")),
             throttle: num(&raw, "throttle").or_else(|| num(&raw, "throttle1")),
             gear: num(&raw, "gear"),
+            gear_neutral: num(&raw, "gear_neutral"),
             rpm: num(&raw, "rpm"),
+            crew_current: num(&raw, "crew_current"),
+            crew_total: num(&raw, "crew_total"),
             raw,
         }
+    }
+
+    /// The gearbox position as the HUD shows it, from `gear` and `gear_neutral`.
+    pub fn gearbox(&self) -> Option<Gear> {
+        let gear = self.gear?.round() as i64;
+        Some(match self.gear_neutral {
+            Some(n) => Gear::from_index(gear, n.round() as i64),
+            None => Gear::Index(gear),
+        })
     }
 
     /// The unit name without its folder, e.g. `us_m4a1_76w_sherman`.
     pub fn unit_name(&self) -> Option<&str> {
         self.unit.as_deref().map(|u| u.rsplit('/').next().unwrap_or(u))
+    }
+}
+
+/// A ground vehicle's gearbox position. The game counts `gear` up from the lowest reverse gear and gives
+/// the index of neutral in `gear_neutral`; on the T-26 (one reverse, five forward gears) neutral is 1,
+/// so `gear` 0 is reverse and 2..6 are first to fifth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gear {
+    /// Reverse gear `n`, 1 being the one next to neutral
+    Reverse(u32),
+    Neutral,
+    /// Forward gear `n`, from 1
+    Forward(u32),
+    /// The raw index, when the game sends no `gear_neutral`. This was the only output before the
+    /// numbering was confirmed and is superseded by the variants above
+    Index(i64),
+}
+
+impl Gear {
+    pub fn from_index(gear: i64, neutral: i64) -> Self {
+        match gear - neutral {
+            0 => Self::Neutral,
+            d if d > 0 => Self::Forward(d as u32),
+            d => Self::Reverse(d.unsigned_abs() as u32),
+        }
+    }
+}
+
+impl std::fmt::Display for Gear {
+    /// `R`, `N`, `1`..`n`; `R2` for a second reverse gear; a raw index as `#3`
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reverse(1) => write!(f, "R"),
+            Self::Reverse(n) => write!(f, "R{n}"),
+            Self::Neutral => write!(f, "N"),
+            Self::Forward(n) => write!(f, "{n}"),
+            Self::Index(i) => write!(f, "#{i}"),
+        }
     }
 }
 
@@ -391,6 +455,17 @@ pub struct Snapshot {
     pub objects: Vec<MapObject>,
     /// `endpoint: reason` for each endpoint that could not be read
     pub errors: Vec<String>,
+    /// Hiccups that are routine and not worth an error, e.g. `map_obj: empty body`
+    pub notes: Vec<String>,
+    /// Endpoints that gave nothing usable this poll (errors and notes alike)
+    pub failed: Vec<&'static str>,
+    /// `/indicators` failed in a way that says nothing about the match (a timeout, a dropped
+    /// connection, an empty or cut-off body), so `status` alone may be wrong; [`Poller`] handles it
+    pub inconclusive: bool,
+    /// Parts the [`Poller`] carried over from an earlier poll to bridge a hiccup
+    pub held: Vec<&'static str>,
+    /// `map_info` was fetched in this poll rather than reused from the match's first poll
+    pub map_info_fresh: bool,
 }
 
 /// The player's vehicle, combined from the endpoints.
@@ -398,7 +473,7 @@ pub struct Snapshot {
 pub struct PlayerVehicle {
     pub army: Option<Army>,
     pub unit: Option<String>,
-    /// Ground speed of ground vehicles, true airspeed of aircraft
+    /// Ground speed of ground vehicles (negative in reverse), true airspeed of aircraft
     pub speed_kmh: Option<f64>,
     /// Compass heading, degrees clockwise from north
     pub heading_deg: Option<f64>,
@@ -406,7 +481,7 @@ pub struct PlayerVehicle {
     pub position: Option<[f64; 3]>,
     pub throttle_pct: Option<f64>,
     /// Gearbox position (ground vehicles)
-    pub gear: Option<f64>,
+    pub gear: Option<Gear>,
     /// Landing gear extension (aircraft)
     pub landing_gear_pct: Option<f64>,
 }
@@ -421,7 +496,8 @@ impl Snapshot {
             (true, false) => Status::NotInMatch,
             (true, true) => Status::InMatch,
         };
-        Self { status, state, indicators, map_info, objects, errors }
+        let map_info_fresh = map_info.is_some();
+        Self { status, state, indicators, map_info, objects, errors, notes: Vec::new(), failed: Vec::new(), inconclusive: false, held: Vec::new(), map_info_fresh }
     }
 
     pub fn player_object(&self) -> Option<&MapObject> {
@@ -446,14 +522,15 @@ impl Snapshot {
             heading_deg: ind.and_then(|i| i.compass_deg).map(|h| h.rem_euclid(360.0)).or(map_heading),
             position: bounds.zip(me.and_then(|o| o.pos)).map(|(b, p)| b.to_scene(p, state.and_then(|s| s.altitude_m).unwrap_or(0.0))),
             throttle_pct: state.and_then(|s| s.throttle_pct).or(ind.and_then(|i| i.throttle).map(|t| t * 100.0)),
-            gear: if air { None } else { ind.and_then(|i| i.gear) },
+            gear: if air { None } else { ind.and_then(Indicators::gearbox) },
             landing_gear_pct: if air { state.and_then(|s| s.landing_gear_pct) } else { None },
             army,
         })
     }
 
     /// A JSON line for logs: status, the combined vehicle, and the raw `/state`, `/indicators` and the
-    /// player's own map entry. Other minimap objects are left out.
+    /// player's own map entry; `map_info` when it was fetched (once per match under the [`Poller`]).
+    /// Other minimap objects are left out.
     pub fn to_log_json(&self, t: f64) -> Value {
         let mut out = Map::new();
         out.insert("t".into(), serde_json::json!((t * 1000.0).round() / 1000.0));
@@ -468,7 +545,7 @@ impl Snapshot {
                     "heading_deg": p.heading_deg,
                     "position_m": p.position,
                     "throttle_pct": p.throttle_pct,
-                    "gear": p.gear,
+                    "gear": p.gear.map(|g| g.to_string()),
                     "landing_gear_pct": p.landing_gear_pct,
                 }),
             );
@@ -482,8 +559,17 @@ impl Snapshot {
         if let Some(o) = self.player_object() {
             out.insert("player_map_obj".into(), Value::Object(o.raw.clone()));
         }
+        if let Some(m) = self.map_info.as_ref().filter(|_| self.map_info_fresh) {
+            out.insert("map_info".into(), Value::Object(m.raw.clone()));
+        }
+        if !self.held.is_empty() {
+            out.insert("held".into(), self.held.clone().into());
+        }
         if !self.errors.is_empty() {
             out.insert("errors".into(), self.errors.clone().into());
+        }
+        if !self.notes.is_empty() {
+            out.insert("notes".into(), self.notes.clone().into());
         }
         Value::Object(out)
     }
@@ -513,25 +599,54 @@ impl PlayerVehicle {
 /// Why an endpoint could not be read.
 #[derive(Debug)]
 pub enum FetchError {
-    /// No connection: the game is not running
+    /// No connection (refused): the game is not running
     Unreachable(String),
+    /// A timeout or a connection dropped midway: the game is busy, not necessarily gone
+    Transient(String),
     /// The server answered with an error status
     Status(u16),
+    /// A 200 with an empty body, which the game sends now and then
+    Empty,
     /// The body is not JSON
     BadJson(String),
+}
+
+impl FetchError {
+    /// Whether the failure says nothing about the game's state
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_) | Self::Empty | Self::BadJson(_))
+    }
 }
 
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable(e) => write!(f, "unreachable ({e})"),
+            Self::Transient(e) => write!(f, "no answer ({e})"),
             Self::Status(code) => write!(f, "HTTP {code}"),
+            Self::Empty => write!(f, "empty body"),
             Self::BadJson(e) => write!(f, "bad JSON ({e})"),
         }
     }
 }
 
 impl std::error::Error for FetchError {}
+
+/// Refused connections mean no game; anything else (timeouts, connections dropped midway) is a hiccup.
+#[cfg(feature = "live")]
+fn classify(e: ureq::Error) -> FetchError {
+    use std::io::ErrorKind;
+    let refused = match &e {
+        ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => true,
+        ureq::Error::Io(io) => matches!(io.kind(), ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable),
+        _ => false,
+    };
+    if refused {
+        FetchError::Unreachable(e.to_string())
+    } else {
+        FetchError::Transient(e.to_string())
+    }
+}
 
 /// A blocking client for the telemetry API.
 #[cfg(feature = "live")]
@@ -551,18 +666,20 @@ impl Client {
 
     fn get(&self, path: &str, limit: u64) -> Result<Vec<u8>, FetchError> {
         let url = format!("{}{path}", self.base);
-        let mut resp = self.agent.get(&url).call().map_err(|e| FetchError::Unreachable(e.to_string()))?;
+        let mut resp = self.agent.get(&url).call().map_err(classify)?;
         let status = resp.status().as_u16();
         if status != 200 {
             return Err(FetchError::Status(status));
         }
-        // A connection that drops mid-body is as good as no game
-        resp.body_mut().with_config().limit(limit).read_to_vec().map_err(|e| FetchError::Unreachable(e.to_string()))
+        resp.body_mut().with_config().limit(limit).read_to_vec().map_err(classify)
     }
 
     /// GET a JSON endpoint, e.g. `/state`.
     pub fn json(&self, path: &str) -> Result<Value, FetchError> {
         let body = self.get(path, 4 << 20)?;
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Err(FetchError::Empty);
+        }
         serde_json::from_slice(&body).map_err(|e| FetchError::BadJson(e.to_string()))
     }
 
@@ -589,42 +706,73 @@ impl Client {
     }
 
     /// Reads every endpoint once. `map_info` can be passed in to skip refetching it, since it only
-    /// changes between matches. If `/indicators` is unreachable the game is taken as closed and the
-    /// other endpoints are not tried.
+    /// changes between matches. If `/indicators` refuses the connection the game is taken as closed
+    /// and the other endpoints are not tried. The map endpoints are read in a match, or when
+    /// `/indicators` hiccuped but the server still answers.
     pub fn snapshot(&self, map_info: Option<&MapInfo>) -> Snapshot {
-        fn keep<T>(errors: &mut Vec<String>, name: &str, r: Result<T, FetchError>) -> Option<T> {
-            r.map_err(|e| errors.push(format!("{name}: {e}"))).ok()
+        #[derive(Default)]
+        struct Outcome {
+            errors: Vec<String>,
+            notes: Vec<String>,
+            failed: Vec<&'static str>,
         }
-        let mut errors = Vec::new();
+        impl Outcome {
+            fn keep<T>(&mut self, name: &'static str, r: Result<T, FetchError>) -> Option<T> {
+                match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        let line = format!("{name}: {e}");
+                        if matches!(e, FetchError::Empty) { self.notes.push(line) } else { self.errors.push(line) }
+                        self.failed.push(name);
+                        None
+                    }
+                }
+            }
+        }
+        let mut out = Outcome::default();
         let indicators_result = self.indicators();
         let unreachable = matches!(indicators_result, Err(FetchError::Unreachable(_)));
-        let indicators = keep(&mut errors, "indicators", indicators_result);
-        if unreachable {
-            return Snapshot::new(None, None, None, Vec::new(), errors);
+        let inconclusive = indicators_result.as_ref().err().is_some_and(FetchError::is_transient);
+        let indicators = out.keep("indicators", indicators_result);
+        let (mut state, mut info, mut objects, mut fresh) = (None, None, Vec::new(), false);
+        if !unreachable {
+            state = out.keep("state", self.state());
+            let in_match = state.as_ref().is_some_and(|s| s.valid) || indicators.as_ref().is_some_and(|i| i.valid);
+            if in_match || (inconclusive && state.is_some()) {
+                info = match map_info {
+                    Some(m) => Some(m.clone()),
+                    None => {
+                        fresh = true;
+                        out.keep("map_info", self.map_info())
+                    }
+                };
+                objects = out.keep("map_obj", self.map_objects()).unwrap_or_default();
+            }
         }
-        let state = keep(&mut errors, "state", self.state());
-        let in_match = state.as_ref().is_some_and(|s| s.valid) || indicators.as_ref().is_some_and(|i| i.valid);
-        let (map_info, objects) = if in_match {
-            let info = match map_info {
-                Some(m) => Some(m.clone()),
-                None => keep(&mut errors, "map_info", self.map_info()),
-            };
-            (info, keep(&mut errors, "map_obj", self.map_objects()).unwrap_or_default())
-        } else {
-            (None, Vec::new())
-        };
-        Snapshot::new(state, indicators, map_info, objects, errors)
+        let mut snap = Snapshot::new(state, indicators, info, objects, out.errors);
+        snap.notes = out.notes;
+        snap.failed = out.failed;
+        snap.inconclusive = inconclusive;
+        snap.map_info_fresh = fresh && snap.map_info.is_some();
+        snap
     }
 }
 
 /// Polls the API at a fixed rate, as an iterator of snapshots. It slows to `idle_interval` while the
 /// game is closed or out of a match, and caches `/map_info.json` for the length of a match.
+///
+/// In a match it bridges hiccups for up to `grace`: when `/indicators` times out or `/map_obj.json`
+/// comes back empty, the last good answer stands in (listed in [`Snapshot::held`]) and the status stays
+/// [`Status::InMatch`]. A refused connection or an answer of `{"valid": false}` ends the match at once.
 #[cfg(feature = "live")]
 pub struct Poller {
     pub client: Client,
     pub interval: Duration,
     pub idle_interval: Duration,
+    pub grace: Duration,
     map_info: Option<MapInfo>,
+    good_indicators: Option<(std::time::Instant, Indicators, Option<State>)>,
+    good_objects: Option<(std::time::Instant, Vec<MapObject>)>,
     next: Option<std::time::Instant>,
 }
 
@@ -633,16 +781,60 @@ impl Poller {
     /// `rate_hz` polls per second in a match.
     pub fn new(client: Client, rate_hz: f64) -> Self {
         let interval = Duration::from_secs_f64(1.0 / rate_hz.clamp(0.1, 100.0));
-        Self { client, interval, idle_interval: interval.max(Duration::from_secs(1)), map_info: None, next: None }
+        Self {
+            client,
+            interval,
+            idle_interval: interval.max(Duration::from_secs(1)),
+            grace: Duration::from_secs(2),
+            map_info: None,
+            good_indicators: None,
+            good_objects: None,
+            next: None,
+        }
     }
 
     /// Takes one snapshot now, without waiting.
     pub fn poll(&mut self) -> Snapshot {
-        let snap = self.client.snapshot(self.map_info.as_ref().filter(|m| m.bounds().is_some()));
-        self.map_info = match snap.status {
-            Status::InMatch => snap.map_info.clone(),
-            _ => None,
-        };
+        let mut snap = self.client.snapshot(self.map_info.as_ref().filter(|m| m.bounds().is_some()));
+        let now = std::time::Instant::now();
+        let grace = self.grace;
+        let recent = |at: &std::time::Instant| now.duration_since(*at) <= grace;
+        if snap.inconclusive && snap.indicators.is_none() {
+            if let Some((_, ind, state)) = self.good_indicators.as_ref().filter(|g| recent(&g.0)) {
+                snap.indicators = Some(ind.clone());
+                snap.held.push("indicators");
+                if snap.state.as_ref().is_none_or(|s| !s.valid) && state.is_some() {
+                    snap.state = state.clone();
+                    snap.held.push("state");
+                }
+                snap.status = Status::InMatch;
+            }
+        }
+        if snap.status != Status::InMatch {
+            self.map_info = None;
+            self.good_indicators = None;
+            self.good_objects = None;
+            return snap;
+        }
+        if snap.map_info.is_none() {
+            snap.map_info = self.map_info.clone();
+        }
+        if snap.failed.contains(&"map_obj") {
+            if let Some((_, objects)) = self.good_objects.as_ref().filter(|g| recent(&g.0)) {
+                snap.objects = objects.clone();
+                snap.held.push("map_obj");
+            }
+        } else if snap.player_object().is_some() {
+            self.good_objects = Some((now, snap.objects.clone()));
+        }
+        if !snap.held.contains(&"indicators") {
+            if let Some(ind) = snap.indicators.clone().filter(|i| i.valid) {
+                self.good_indicators = Some((now, ind, snap.state.clone().filter(|s| s.valid)));
+            }
+        }
+        if snap.map_info.as_ref().is_some_and(|m| m.bounds().is_some()) {
+            self.map_info = snap.map_info.clone();
+        }
         snap
     }
 }
@@ -804,7 +996,8 @@ pub mod mock {
                     let mut v: serde_json::Value = serde_json::from_str(TANK_INDICATORS).ok()?;
                     let ramp = (t / 4.0).min(1.0);
                     v["speed"] = (30.0 * ramp).into();
-                    v["gear"] = (if ramp < 0.3 { 2 } else if ramp < 0.7 { 3 } else { 4 }).into();
+                    // gear_neutral is 1 in the sample, so 2..4 show as first to third
+                    v["gear"] = (if ramp < 0.3 { 2.0 } else if ramp < 0.7 { 3.0 } else { 4.0 }).into();
                     v["rpm"] = (900.0 + 1500.0 * ramp).into();
                     json(&v.to_string())
                 }

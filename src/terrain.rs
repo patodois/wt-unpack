@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use serde_json::json;
 
 use crate::level::{Heightmap, TriMesh};
-use crate::vehicle::{Material, Mesh, Node, Vehicle};
+use crate::vehicle::{Alpha, Material, Mesh, Node, Vehicle};
 
 /// Heights in metres on a regular grid in Dagor's world space: sample (x, y) is at world
 /// `origin + (x, y) * cell_size` in X and Z. `NaN` marks samples nothing covers.
@@ -265,7 +265,7 @@ pub fn to_model(name: &str, mesh: &TriMesh) -> Vehicle {
             metal_rough: None,
             normal: None,
             double_sided: false,
-            alpha_mask: false,
+            alpha: Alpha::Opaque,
             color_key: None,
             pbr_key: None,
         }],

@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::vehicle::{Image, Vehicle};
+use crate::vehicle::{Alpha, Image, Vehicle};
 
 fn write_png(path: &Path, img: &Image) -> Result<()> {
     let mut buf = Vec::new();
@@ -92,8 +92,13 @@ pub fn write(vehicle: &Vehicle, out_dir: &Path) -> Result<()> {
             mat["normalTexture"] = json!({"index": add_image(format!("{key}_normal.png"), n)?});
         }
         mat["pbrMetallicRoughness"] = pbr;
-        if m.alpha_mask {
-            mat["alphaMode"] = json!("MASK");
+        match m.alpha {
+            Alpha::Opaque => {}
+            Alpha::Mask(cutoff) => {
+                mat["alphaMode"] = json!("MASK");
+                mat["alphaCutoff"] = json!(cutoff);
+            }
+            Alpha::Blend => mat["alphaMode"] = json!("BLEND"),
         }
         gl_materials.push(mat);
     }
@@ -142,7 +147,7 @@ mod tests {
                 metal_rough: None,
                 normal: None,
                 double_sided: true,
-                alpha_mask: false,
+                alpha: Alpha::Opaque,
                 color_key: Some("paint_c".into()),
                 pbr_key: None,
             }],

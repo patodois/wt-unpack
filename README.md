@@ -139,7 +139,21 @@ wheel nodes, see above), and glass blends.
 cargo build --release --features bridge
 wt-unpack check-bridge              # load and validate every tank, aircraft and ship
 wt-unpack rig tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman   # print a tank's rig
+wt-unpack check-conformance -- --filter germ_he_115 -v          # rewrite-bridge's conformance checker over the vehicles
 ```
+
+### Materials and winding
+
+The bridge material of a vehicle part follows the shader class and parameters `dynModelDesc.bin` gives it
+(`vehicle::material_alpha`): glass classes, `*alpha_blend`, `aces_weapon_fire` and `propeller_side` blend; an
+`atest=N` parameter makes any class a cut-out at N/255 (a few `masked_chrome_bump` parts carry it); the
+`*atest` classes cut out at 0.5 without it; everything else is opaque, including the `masked_*` classes whose
+alpha is a paint or shine mask (their texels are transparent in 14 to 95% of cases and the hull is solid).
+Materials no mesh of the LOD uses are not decoded and are left out of the model. The blend state itself is in
+the compiled shader dumps, which are not decoded here. Triangles wind counter-clockwise around their vertex
+normals; a handful of parts are stored the other way round (`germ_he_115`'s `radiator2_25`, the Ontos' left
+suspension arms), which neither their node matrices nor their materials explain, so a mesh whose triangles
+mostly face against its normals is turned over.
 
 ## Using wt-unpack from another game (rewrite-bridge)
 

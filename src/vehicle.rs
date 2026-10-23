@@ -33,6 +33,44 @@ impl Image {
     }
 }
 
+/// How a material's alpha is used
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Alpha {
+    /// The alpha channel is not opacity (for masked tank, ship and chrome shaders it is a paint or shine mask)
+    Opaque,
+    /// Alpha-tested (cut-out): texels with alpha below the cutoff, in 0..=1, are discarded
+    Mask(f32),
+    /// Alpha-blended
+    Blend,
+}
+
+/// How a material uses its alpha, from the shader class and parameters that `dynModelDesc.bin` gives it
+/// (`cls`, and `atest=N` among the `par` lines, N in 0..=255):
+///
+/// - classes with `glass` in their name, `*alpha_blend`, `aces_weapon_fire` (muzzle flashes and tracers) and
+///   `propeller_side` (the blurred disc of a spinning propeller seen from the side) blend; the textures of
+///   the last three are mostly transparent, so they cannot be drawn opaque;
+/// - an `atest=N` parameter with N > 0 makes the material alpha-tested with cutoff N / 255, in any other
+///   class (`dynamic_masked_chrome_bump` with `atest=127` is a cut-out; without it, its alpha is a shine
+///   mask, as for every `masked_*` class);
+/// - the `*atest` classes (`dynamic_tank_atest`, `dynamic_tank_net_atest`, `dynamic_layered_atest`) are
+///   alpha-tested even without the parameter, at the cutoff 0.5 (the shader's own default is not in the data);
+/// - everything else is opaque.
+///
+/// The blend state itself lives in the compiled shader dumps (`compiledShaders/*.shdump.bin`), which are not
+/// decoded here; the classes above are the ones whose names and textures say it.
+pub fn material_alpha(class: &str, atest: Option<u32>) -> Alpha {
+    if class.contains("glass") || class.ends_with("alpha_blend") || class == "aces_weapon_fire" || class == "propeller_side" {
+        Alpha::Blend
+    } else if let Some(n) = atest.filter(|&n| n > 0) {
+        Alpha::Mask(n.min(255) as f32 / 255.0)
+    } else if class.contains("atest") && atest != Some(0) {
+        Alpha::Mask(0.5)
+    } else {
+        Alpha::Opaque
+    }
+}
+
 pub struct Material {
     pub name: String,
     /// Base colour, with camouflage and occlusion baked in where the material has them
@@ -42,8 +80,8 @@ pub struct Material {
     /// Tangent-space normal map, OpenGL convention (green up)
     pub normal: Option<Image>,
     pub double_sided: bool,
-    /// Alpha-tested (cut-out) material
-    pub alpha_mask: bool,
+    /// How the material's alpha is used, see [`material_alpha`]
+    pub alpha: Alpha,
     /// Stable names for the textures, derived from the game's texture names
     pub color_key: Option<String>,
     pub pbr_key: Option<String>,
@@ -227,9 +265,15 @@ struct MatInfo {
     double_sided: bool,
     skinned: bool,
     index: usize,
+    /// `atest=N` among the material's `par` lines
+    atest: Option<u32>,
 }
 
 impl MatInfo {
+    fn alpha(&self) -> Alpha {
+        material_alpha(&self.class, self.atest)
+    }
+
     /// Name of the baked colour texture, when the material needs baking
     fn bake_key(&self) -> Option<String> {
         let c = self.color.as_ref()?;
@@ -284,7 +328,13 @@ fn material_infos(descs: &HashMap<String, blk::Block>, name: &str) -> Result<Vec
             };
             // Masked tank shaders take the camouflage in t1; other masked shaders use t1 for something else
             let camo = tex("t1").filter(|t| class.contains("masked") && t.contains("_camo"));
+            let par = match get("par") {
+                Some(blk::Value::Str(s)) => s.as_str(),
+                _ => "",
+            };
+            let atest = par.lines().find_map(|l| l.trim().strip_prefix("atest")?.trim_start().strip_prefix('=')?.trim().parse::<u32>().ok());
             infos.push(MatInfo {
+                atest,
                 name: format!("{block}{i}_{class}"),
                 color: tex("t0"),
                 camo,
@@ -303,6 +353,37 @@ fn material_infos(descs: &HashMap<String, blk::Block>, name: &str) -> Result<Vec
 /// Column-major 4x4 node transform
 fn transform(m: &[f32; 16], p: [f32; 3], w: f32) -> [f32; 3] {
     [0, 1, 2].map(|r| m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r] * w)
+}
+
+/// Makes a mesh's triangles wind counter-clockwise around its vertex normals, as the bridge requires.
+///
+/// The stored triangles of most parts come out right once the z mirror reverses them, whatever the sign of
+/// the determinant of their node's matrix, because the exporter writes each part's winding for its own
+/// matrix. A few parts do not: `germ_he_115`'s `radiator2_25` (768 triangles, a node with determinant +2.36)
+/// and `prop_side_2` (2, determinant +0.08), the Ontos' `bone_suspension_l_02` and `_03` (886 each, proper
+/// rotations among nodes whose right-hand twins are mirrored). Neither the sign of the determinant nor the
+/// material tells them apart (the same materials and matrices wind correctly on other parts), so the stored
+/// data is read the way the shader reads it: the vertex normals say which side is the front, and a mesh
+/// whose triangles face the other way is turned over as a whole. The normals are the part lighting uses, so
+/// they are kept as they are; meshes that are only partly against them (smoothed edges) are left alone.
+fn face_normals_out(mesh: &mut Mesh) {
+    let (mut with, mut against) = (0usize, 0usize);
+    for t in mesh.indices.chunks_exact(3) {
+        let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[t[k] as usize]);
+        let (e1, e2) = ([0, 1, 2].map(|k| b[k] - a[k]), [0, 1, 2].map(|k| c[k] - a[k]));
+        let g = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let n: f32 = (0..3).map(|k| g[k] * (mesh.normals[t[0] as usize][k] + mesh.normals[t[1] as usize][k] + mesh.normals[t[2] as usize][k])).sum();
+        if n > 0.0 {
+            with += 1;
+        } else if n < 0.0 {
+            against += 1;
+        }
+    }
+    if against > with {
+        for t in mesh.indices.chunks_exact_mut(3) {
+            t.swap(1, 2);
+        }
+    }
 }
 
 fn normalize(v: [f32; 3]) -> [f32; 3] {
@@ -374,6 +455,9 @@ fn build_meshes(model: &DynModel, lod: &Lod, tree: &GeomNodeTree, skin_material_
         eprintln!("warning: parts without a skeleton node, left untransformed: {missing_nodes:?}");
     }
     let mut out: Vec<Mesh> = meshes.into_values().collect();
+    for m in &mut out {
+        face_normals_out(m);
+    }
     out.sort_by_key(|m| (m.material, m.node));
     out
 }
@@ -519,9 +603,14 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
     let infos = material_infos(&library.descs, name)?;
     let skin_material_base = infos.iter().position(|m| m.skinned).unwrap_or(infos.len());
 
+    let meshes = build_meshes(&model, lod, &tree, skin_material_base);
+    // Materials the description lists but no mesh of this LOD uses are neither decoded nor baked
+    let used: std::collections::HashSet<usize> = meshes.iter().map(|m| m.material).collect();
+    let is_used = |i: usize| used.contains(&i);
+
     // UV triangles of every material that needs baking, grouped by texture combination
     let mut bake_tris: HashMap<String, Vec<camo::UvTriangle>> = HashMap::new();
-    for info in infos.iter().filter(|_| with_textures) {
+    for (_, info) in infos.iter().enumerate().filter(|(i, _)| with_textures && is_used(*i)) {
         let Some(key) = info.bake_key() else { continue };
         let tris = bake_tris.entry(key).or_default();
         let (elems, vdata): (Vec<&Elem>, _) = if info.skinned {
@@ -546,15 +635,15 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
 
     let mut source = TextureSource { index: &library.textures, packs: HashMap::new() };
     let mut materials = Vec::with_capacity(infos.len());
-    for info in &infos {
-        if !with_textures {
+    for (i, info) in infos.iter().enumerate() {
+        if !with_textures || !is_used(i) {
             materials.push(Material {
                 name: info.name.clone(),
                 color: None,
                 metal_rough: None,
                 normal: None,
                 double_sided: info.double_sided,
-                alpha_mask: info.class.contains("atest"),
+                alpha: info.alpha(),
                 color_key: None,
                 pbr_key: None,
             });
@@ -566,7 +655,7 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
             let camo_img = source.decode_or_warn(&info.camo);
             let ao_img = source.decode_or_warn(&info.occlusion);
             // Alpha-tested materials keep their alpha; masked ones use it as the paint mask
-            let opaque = !info.class.contains("atest");
+            let opaque = !matches!(info.alpha(), Alpha::Mask(_));
             let (camo_view, ao_view) = (camo_img.as_ref().map(Image::view), ao_img.as_ref().map(Image::view));
             camo::bake(&mut img.rgba, img.width as usize, img.height as usize, camo_view.as_ref(), ao_view.as_ref(), &bake_tris[key], opaque);
         }
@@ -585,11 +674,10 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
             metal_rough,
             normal,
             double_sided: info.double_sided,
-            alpha_mask: info.class.contains("atest"),
+            alpha: info.alpha(),
         });
     }
 
-    let meshes = build_meshes(&model, lod, &tree, skin_material_base);
     let mut nodes: Vec<Node> = tree
         .nodes
         .into_iter()
@@ -721,5 +809,48 @@ mod tests {
         let rate = track_v_per_metre(&m).unwrap();
         assert!((rate - 0.6).abs() < 1e-5, "{rate}");
         assert_eq!(track_v_per_metre(&Mesh::default()), None);
+    }
+
+    #[test]
+    fn alpha_follows_the_shader_class_and_its_atest_parameter() {
+        // The glass, blend and flash classes blend, whatever else they carry
+        for class in ["dynamic_glass_chrome", "dynamic_pbr_glass", "dynamic_masked_glass_chrome", "dynamic_alpha_blend", "aces_weapon_fire", "propeller_side"] {
+            assert_eq!(material_alpha(class, None), Alpha::Blend, "{class}");
+        }
+        assert_eq!(material_alpha("dynamic_alpha_blend", Some(127)), Alpha::Blend);
+        // `atest=N` makes any other class a cut-out at N / 255; without it the masked classes' alpha is a mask
+        assert_eq!(material_alpha("dynamic_masked_chrome_bump", Some(127)), Alpha::Mask(127.0 / 255.0));
+        assert_eq!(material_alpha("dynamic_simple", Some(255)), Alpha::Mask(1.0));
+        for class in ["dynamic_masked_chrome_bump", "dynamic_masked_ship", "dynamic_masked_tank", "dynamic_simple", "propeller_front", "dynamic_perlin_layered"] {
+            assert_eq!(material_alpha(class, None), Alpha::Opaque, "{class}");
+        }
+        // The `atest` classes cut out even without the parameter, unless it says 0
+        assert_eq!(material_alpha("dynamic_tank_atest", None), Alpha::Mask(0.5));
+        assert_eq!(material_alpha("dynamic_tank_atest", Some(0)), Alpha::Opaque);
+        assert_eq!(material_alpha("dynamic_tank_atest", Some(100)), Alpha::Mask(100.0 / 255.0));
+    }
+
+    #[test]
+    fn meshes_that_face_away_from_their_normals_are_turned_over() {
+        let tri = |indices: Vec<u32>| Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            indices,
+            ..Mesh::default()
+        };
+        // Counter-clockwise seen from +Z, the normals' side: kept
+        let mut ok = tri(vec![0, 1, 2, 1, 3, 2]);
+        face_normals_out(&mut ok);
+        assert_eq!(ok.indices, [0, 1, 2, 1, 3, 2]);
+        // Clockwise: every triangle turned
+        let mut flipped = tri(vec![0, 2, 1, 1, 2, 3]);
+        face_normals_out(&mut flipped);
+        assert_eq!(flipped.indices, [0, 1, 2, 1, 3, 2]);
+        // Mostly right with one against (smoothing): left as it is
+        let mut mixed = tri(vec![0, 1, 2, 1, 3, 2, 0, 2, 1]);
+        face_normals_out(&mut mixed);
+        assert_eq!(mixed.indices, [0, 1, 2, 1, 3, 2, 0, 2, 1]);
+        // Nothing to say about an empty mesh
+        face_normals_out(&mut Mesh::default());
     }
 }

@@ -278,7 +278,11 @@ fn spawn_vehicle(
                 metallic: 0.0,
                 double_sided: m.double_sided,
                 cull_mode: if m.double_sided { None } else { Some(bevy::render::render_resource::Face::Back) },
-                alpha_mode: if m.alpha_mask { AlphaMode::Mask(0.5) } else { AlphaMode::Opaque },
+                alpha_mode: match m.alpha {
+                    wt_unpack::vehicle::Alpha::Opaque => AlphaMode::Opaque,
+                    wt_unpack::vehicle::Alpha::Mask(cutoff) => AlphaMode::Mask(cutoff),
+                    wt_unpack::vehicle::Alpha::Blend => AlphaMode::Blend,
+                },
                 ..default()
             };
             if let (Some(mr), Some(n)) = (&m.metal_rough, &m.normal) {

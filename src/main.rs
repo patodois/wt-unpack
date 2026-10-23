@@ -108,6 +108,16 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+    /// Check vehicles against rewrite-bridge's conventions (scale, orientation, winding, materials, ...) with its
+    /// conformance checker; the options after `--` are the checker's own (`--help` lists them)
+    #[cfg(feature = "bridge")]
+    CheckConformance {
+        #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
+        game: PathBuf,
+        /// Options of the checker: --id, --filter, --kind, --limit, --compare-load, --allow, -v, --strict
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Print the rig of a vehicle (turret, drive train, wheels, sockets) from the game's data, as the
     /// bridge provider's `vehicle_rig` gives it
     #[cfg(feature = "bridge")]
@@ -205,6 +215,11 @@ fn main() -> Result<()> {
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
         #[cfg(feature = "bridge")]
         Command::CheckBridge { game, filter, list } => check_bridge(&game, &filter, list),
+        #[cfg(feature = "bridge")]
+        Command::CheckConformance { game, args } => {
+            let wt = wt_unpack::bridge::WarThunder::new(game);
+            std::process::exit(rewrite_bridge::conformance::cli::run(&wt, args))
+        }
         #[cfg(feature = "bridge")]
         Command::Rig { id, game } => rig_cmd(&game, &id),
         Command::Level { file, heightmap, gltf, terrain, cell, objects, textures, scene_stats, lod_distance } => {

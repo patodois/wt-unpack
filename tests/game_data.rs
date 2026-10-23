@@ -732,3 +732,98 @@ fn berlin_collision_matches_the_placed_objects() {
     assert!(wt.load_object_collision("berlin_city_build_1").unwrap().unwrap() == *house);
     assert!(wt.load_object_collision("no_such_object").unwrap().is_none());
 }
+
+/// The conformance fixes: alpha modes from the shader data, winding that follows the node matrices, and no
+/// textures for materials nothing uses
+#[cfg(feature = "bridge")]
+mod conformance {
+    use rewrite_bridge::conformance::{check_animated, Expect};
+    use rewrite_bridge::{AlphaMode, Provider};
+
+    use super::*;
+
+    const HE_115: &str = "aircrafts/germ_he_115.grp:he_115c_1";
+
+    fn alpha_of(m: &rewrite_bridge::Model, suffix: &str) -> Vec<AlphaMode> {
+        m.materials.iter().filter(|x| x.name.ends_with(suffix)).map(|x| x.alpha).collect()
+    }
+
+    #[test]
+    fn alpha_modes_come_from_the_shader_class_and_atest() {
+        let Some(game) = game() else { return };
+        let wt = wt_unpack::bridge::WarThunder::new(&game);
+        let m = wt.load(HE_115).unwrap();
+        // The flash, tracer, propeller-disc and blend materials blend; so does glass
+        for suffix in ["_dynamic_alpha_blend", "_aces_weapon_fire", "_propeller_side", "_dynamic_glass_chrome"] {
+            let modes = alpha_of(&m, suffix);
+            assert!(!modes.is_empty() && modes.iter().all(|a| *a == AlphaMode::Blend), "{suffix}: {modes:?}");
+        }
+        // Masked chrome carries a shine mask in its alpha: opaque, unless the material says atest=N
+        let modes = alpha_of(&m, "_dynamic_masked_chrome_bump");
+        assert!(modes.contains(&AlphaMode::Opaque), "{modes:?}");
+        assert!(modes.iter().all(|a| matches!(a, AlphaMode::Opaque | AlphaMode::Mask(_))), "{modes:?}");
+        // The Sherman's masked hull and ship materials stay opaque, its atest materials cut out
+        let sherman = wt.load("tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman").unwrap();
+        assert!(alpha_of(&sherman, "_dynamic_masked_tank").iter().all(|a| *a == AlphaMode::Opaque));
+        assert!(alpha_of(&sherman, "_dynamic_tank_atest").iter().all(|a| matches!(a, AlphaMode::Mask(_))));
+    }
+
+    #[test]
+    fn mirrored_and_scaled_parts_wind_with_their_normals() {
+        let Some(game) = game() else { return };
+        let wt = wt_unpack::bridge::WarThunder::new(&game);
+        // radiator2_25 (768 triangles) and prop_side_2 (2) wound against their normals in the stored data; so do
+        // the Ontos' left suspension arms bone_suspension_l_02 and _03 (886 each)
+        let a = wt.load_animated(HE_115).unwrap();
+        let report = check_animated(&a, &Expect::generic());
+        assert!(!report.has("geometry.winding_flipped"), "{report}");
+        for name in ["radiator2_25", "prop_side_2"] {
+            let mesh = a.model.meshes.iter().find(|m| m.name.starts_with(name)).unwrap();
+            let (mut agree, mut against) = (0, 0);
+            for t in mesh.indices.chunks_exact(3) {
+                let [p0, p1, p2] = [0, 1, 2].map(|k| mesh.positions[t[k] as usize]);
+                let (e1, e2) = ([0, 1, 2].map(|k| p1[k] - p0[k]), [0, 1, 2].map(|k| p2[k] - p0[k]));
+                let g = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                let n: f32 = (0..3).map(|k| g[k] * (0..3).map(|c| mesh.normals[t[c] as usize][k]).sum::<f32>()).sum();
+                if n > 0.0 {
+                    agree += 1;
+                } else if n < 0.0 {
+                    against += 1;
+                }
+            }
+            assert!(agree > 0 && against == 0, "{name}: {agree} with, {against} against");
+        }
+        // Mirrored tank nodes, skinned tracks and a plane of each kind still wind with their normals
+        for id in ["tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman", "tanks/germ_pzkpfw_v_ausf_g_panther.grp:pzkpfw_V_ausf_g_panther", "aircrafts/usa_f_105.grp:f_105d", "aircrafts/fr_so_4050_vautour.grp:so_4050_vautour_2b", "tanks/usa_m50_ontos.grp:m50_ontos", "ships/usa_pc_451.grp:pc_451"] {
+            let report = check_animated(&wt.load_animated(id).unwrap(), &Expect::generic());
+            assert!(!report.has("geometry.winding_flipped"), "{id}: {report}");
+        }
+    }
+
+    #[test]
+    fn materials_no_mesh_uses_are_not_decoded() {
+        let Some(game) = game() else { return };
+        // The Chinese Sherman lists two alpha-tested materials its LOD 0 does not draw, and names textures for them
+        let pack = game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp");
+        let v = vehicle::load(&game, &pack, "cn_m4a1_76w_sherman", 0).unwrap();
+        let used: std::collections::HashSet<usize> = v.meshes.iter().map(|m| m.material).collect();
+        let unused: Vec<usize> = (0..v.materials.len()).filter(|i| !used.contains(i)).collect();
+        assert!(unused.len() >= 2, "{unused:?}");
+        for i in &unused {
+            let m = &v.materials[*i];
+            assert!(m.color.is_none() && m.metal_rough.is_none() && m.normal.is_none(), "{} was decoded", m.name);
+        }
+        assert!(used.iter().any(|i| v.materials[*i].color.is_some()));
+        // The bridge model leaves them out altogether, and indices still match
+        let wt = wt_unpack::bridge::WarThunder::new(&game);
+        let a = wt.load_animated("tanks/usa_m4a1_76w_sherman.grp:cn_m4a1_76w_sherman").unwrap();
+        assert_eq!(a.model.materials.len(), used.len());
+        assert!(a.model.meshes.iter().all(|m| m.material < a.model.materials.len()));
+        assert!(!check_animated(&a, &Expect::tank()).has("material.unused"));
+        // Several vehicles at once: none has an unused material
+        for id in [HE_115, "tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman", "ships/usa_aircraftcarrier_forrestal.grp:aircraftcarrier_forrestal"] {
+            let report = check_animated(&wt.load_animated(id).unwrap(), &Expect::generic());
+            assert!(!report.has("material.unused"), "{id}: {report}");
+        }
+    }
+}

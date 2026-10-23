@@ -335,7 +335,11 @@ fn material(m: vehicle::Material) -> Material {
         metallic: if textured { 1.0 } else { 0.0 },
         roughness: if textured { 1.0 } else { 0.85 },
         normal: m.normal.map(image),
-        alpha: if m.alpha_mask { AlphaMode::Mask(0.5) } else { AlphaMode::Opaque },
+        alpha: match m.alpha {
+            vehicle::Alpha::Opaque => AlphaMode::Opaque,
+            vehicle::Alpha::Mask(cutoff) => AlphaMode::Mask(cutoff),
+            vehicle::Alpha::Blend => AlphaMode::Blend,
+        },
         double_sided: m.double_sided,
         ..Material::default()
     };
@@ -365,6 +369,20 @@ pub fn to_model(v: Vehicle) -> Model {
         })
         .collect();
 
+    // Materials no mesh uses (the description lists some a LOD does not draw) are left out; the rest keep their order
+    let mut used = vec![false; v.materials.len()];
+    for m in &v.meshes {
+        used[m.material] = true;
+    }
+    let mut new_index = vec![usize::MAX; used.len()];
+    let mut kept = 0;
+    for (i, u) in used.iter().enumerate() {
+        if *u {
+            new_index[i] = kept;
+            kept += 1;
+        }
+    }
+
     // One skin per distinct set of bones; a skinned mesh keeps the game's per-vertex bones and weights
     let mut skins: Vec<Skin> = Vec::new();
     let mut skin_of: HashMap<Vec<usize>, usize> = HashMap::new();
@@ -374,7 +392,7 @@ pub fn to_model(v: Vehicle) -> Model {
         let mut mesh = Mesh {
             name,
             node: m.node,
-            material: m.material,
+            material: new_index[m.material],
             normals: m.normals.iter().map(|&n| turn(n)).collect(),
             uvs: m.uvs.clone(),
             indices: m.indices.clone(),
@@ -406,7 +424,7 @@ pub fn to_model(v: Vehicle) -> Model {
         meshes.push(mesh);
     }
     drop(v.meshes);
-    Model { name: v.name, nodes, meshes, materials: v.materials.into_iter().map(material).collect(), skins }
+    Model { name: v.name, nodes, meshes, materials: v.materials.into_iter().zip(used).filter(|(_, u)| *u).map(|(m, _)| material(m)).collect(), skins }
 }
 
 #[cfg(test)]
@@ -432,7 +450,7 @@ mod tests {
             metal_rough: None,
             normal: None,
             double_sided: false,
-            alpha_mask: false,
+            alpha: vehicle::Alpha::Opaque,
             color_key: None,
             pbr_key: None,
         };

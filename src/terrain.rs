@@ -36,16 +36,22 @@ impl HeightGrid {
 
     /// Rasterises a terrain mesh seen from above, keeping the highest surface at each sample
     pub fn rasterize(mesh: &TriMesh, cell_size: f32) -> Result<Self> {
-        ensure!(cell_size > 0.0, "cell size must be positive");
+        ensure!(cell_size.is_finite() && cell_size > 0.0, "cell size must be positive and finite, not {cell_size}");
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-        for p in &mesh.positions {
+        for (i, p) in mesh.positions.iter().enumerate() {
+            ensure!(p.iter().all(|c| c.is_finite()), "vertex {i} is not finite: {p:?}");
             lo = [lo[0].min(p[0]), lo[1].min(p[2])];
             hi = [hi[0].max(p[0]), hi[1].max(p[2])];
         }
         ensure!(lo[0] <= hi[0], "the mesh has no vertices");
-        let width = ((hi[0] - lo[0]) / cell_size).floor() as usize + 1;
-        let height = ((hi[1] - lo[1]) / cell_size).floor() as usize + 1;
-        ensure!(width <= 16384 && height <= 16384, "{width}x{height} grid is too large; use a bigger cell size");
+        if let Some(bad) = mesh.indices.iter().find(|&&i| i as usize >= mesh.positions.len()) {
+            anyhow::bail!("a triangle uses vertex index {bad} of {}", mesh.positions.len());
+        }
+        // Counted in f64: with finite vertices a span can still overflow f32, and `as usize` saturates
+        let cells = |lo: f32, hi: f32| (f64::from(hi) - f64::from(lo)) / f64::from(cell_size);
+        let (w, h) = (cells(lo[0], hi[0]).floor() + 1.0, cells(lo[1], hi[1]).floor() + 1.0);
+        ensure!(w <= 16384.0 && h <= 16384.0, "{w}x{h} grid is too large; use a bigger cell size");
+        let (width, height) = (w as usize, h as usize);
         let mut heights = vec![f32::NAN; width * height];
         for tri in mesh.indices.chunks_exact(3) {
             let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[tri[k] as usize]);
@@ -283,6 +289,30 @@ mod tests {
             positions: vec![[0.0, 5.0, 0.0], [10.0, 5.0, 0.0], [0.0, 5.0, 10.0], [10.0, 5.0, 10.0]],
             indices: vec![0, 2, 1, 1, 2, 3],
         }
+    }
+
+    #[test]
+    fn rasterizing_refuses_inputs_that_are_not_a_grid() {
+        let msg = |mesh: &TriMesh, cell: f32| HeightGrid::rasterize(mesh, cell).err().map(|e| e.to_string()).unwrap_or_default();
+        // An infinite vertex made (hi - lo) / cell infinite: `as usize` saturated and `+ 1` overflowed
+        let mut mesh = square();
+        mesh.positions[3][0] = f32::INFINITY;
+        assert!(msg(&mesh, 1.0).contains("not finite"), "{}", msg(&mesh, 1.0));
+        mesh.positions[3] = [f32::NAN, 5.0, 10.0];
+        assert!(msg(&mesh, 1.0).contains("not finite"));
+        // Finite, but a span of 6e38 metres: the f32 subtraction alone overflows
+        let mut mesh = square();
+        mesh.positions[0][0] = -3.0e38;
+        mesh.positions[1][0] = 3.0e38;
+        assert!(msg(&mesh, 16.0).contains("too large"), "{}", msg(&mesh, 16.0));
+        // A cell size that is zero, negative, NaN or infinite
+        for cell in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(msg(&square(), cell).contains("cell size"), "{cell}");
+        }
+        // A triangle that names a vertex the mesh does not have
+        let mut mesh = square();
+        mesh.indices[5] = 9;
+        assert!(msg(&mesh, 1.0).contains("index"), "{}", msg(&mesh, 1.0));
     }
 
     #[test]

@@ -275,12 +275,25 @@ fn weight_channels(ddsx: &[u8], size: usize) -> Result<Vec<[u8; 4]>> {
     Ok(rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect())
 }
 
+/// Most texels per side of a weight cell accepted. The game's levels use 64 to 512.
+const MAX_TEXELS: usize = 1024;
+/// Most texels all the cells of a level may add up to (the game's largest: 256 cells of 512 x 512 = 2^26)
+const MAX_WEIGHT_TEXELS: usize = 1 << 28;
+
 impl GroundWeights {
     /// Decodes the weights of a legacy detail map (`world_origin` is the landmesh's first cell corner,
     /// `cell_m` the metres a cell spans). Packed atlases are not decoded yet.
     pub fn from_detail_map(map: &DetailMap, world_origin: [f32; 2], cell_m: f32) -> Result<Self> {
         let texels = map.elem_size as usize;
-        ensure!(texels > 0, "weight cells of {} texels", map.elem_size);
+        ensure!(texels > 0 && texels <= MAX_TEXELS, "weight cells of {} texels per side (up to {MAX_TEXELS} are accepted)", map.elem_size as i32);
+        // Every cell gets a buffer of texels x texels x classes bytes whatever the file holds, so the whole grid
+        // is bounded rather than trusted
+        ensure!(
+            map.width.checked_mul(map.height).and_then(|cells| cells.checked_mul(texels * texels)).is_some_and(|n| n <= MAX_WEIGHT_TEXELS),
+            "{}x{} weight cells of {texels}x{texels} texels are more than {MAX_WEIGHT_TEXELS} texels in all",
+            map.width,
+            map.height
+        );
         let out = match &map.weights {
             DetailWeights::Legacy { cells } => {
                 ensure!(map.tex_size == map.elem_size, "weight textures of {} with {} texels per cell", map.tex_size, map.elem_size);
@@ -316,7 +329,7 @@ impl GroundWeights {
             if w <= 0.0 {
                 continue;
             }
-            for (class, cw) in self.texel(x0 + dx, z0 + dz) {
+            for (class, cw) in self.texel(x0.saturating_add(dx), z0.saturating_add(dz)) {
                 match out.iter_mut().find(|(c, _)| *c == class) {
                     Some((_, acc)) => *acc += w * cw,
                     None => out.push((class, w * cw)),
@@ -688,6 +701,50 @@ mod tests {
         // Two cells side by side: cell 0 blends class 3 (weight 1), cell 1 class 5
         let cell = |class: u8| CellWeights { classes: vec![class], weights: vec![255; texels * texels] };
         GroundWeights { width: 2, height: 1, texels, origin: [100.0, 200.0], cell_m: 8.0, cells: vec![cell(3), cell(5)] }
+    }
+
+    #[test]
+    fn weights_for_positions_off_the_map_do_not_overflow() {
+        let g = grid(2);
+        let mut out = Vec::new();
+        // floor() of an infinite coordinate saturates at i64::MAX, and `+ 1` on it overflowed
+        for (x, z) in [(f32::INFINITY, 0.0), (f32::NEG_INFINITY, 1e30), (f32::NAN, 5.0), (1e30, f32::INFINITY)] {
+            g.at(x, z, &mut out);
+        }
+        // Far outside the map the edge cell's weights stand in
+        g.at(1e30, 201.0, &mut out);
+        assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [5]);
+    }
+
+    fn legacy_map<'a>(width: usize, height: usize, elem_size: u32, ids: [u8; LAND_WEIGHT_DET_NUM]) -> DetailMap<'a> {
+        let cell = || LegacyCell { ids, tex1: &[], tex2: &[] };
+        DetailMap {
+            width,
+            height,
+            tex_size: elem_size,
+            elem_size,
+            land_classes: Vec::new(),
+            weights: DetailWeights::Legacy { cells: (0..width * height).map(|_| cell()).collect() },
+        }
+    }
+
+    #[test]
+    fn weight_cells_are_bounded_by_what_a_level_can_hold() {
+        let err = |map: &DetailMap| GroundWeights::from_detail_map(map, [0.0; 2], 100.0).err().map(|e| e.to_string()).unwrap_or_default();
+        let one_class = [0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        // The game's levels use 64 to 512 texels per cell
+        let g = GroundWeights::from_detail_map(&legacy_map(2, 2, 128, one_class), [0.0; 2], 100.0).unwrap();
+        assert_eq!((g.texels, g.texel(0, 0)), (128, vec![(0, 1.0)]));
+        // A cell of 4,000 x 4,000 texels (7 classes: 112 MB for the one cell, 17.5 GB at 50,000), a count
+        // the file negated (elem_size read as u32), and a grid whose cells add up to more than 2^28 texels
+        for (map, what) in [
+            (legacy_map(1, 1, 4000, [0, 1, 2, 3, 4, 5, 6]), "4000 texels"),
+            (legacy_map(1, 1, -1i32 as u32, one_class), "-1 texels"),
+            (legacy_map(17, 17, 1024, [0xFF; 7]), "17x17 cells of 1024"),
+        ] {
+            let e = err(&map);
+            assert!(e.contains("texels"), "{what}: {e:?}");
+        }
     }
 
     #[test]

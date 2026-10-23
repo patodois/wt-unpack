@@ -27,6 +27,15 @@ use crate::bytes::Reader;
 
 const IS_NAMEMAP_ID: u32 = 0x8000_0000;
 
+/// Deepest block nesting `parse` accepts. The deepest of the game's 31,651 binary BLKs nests 23 levels
+/// (`gamedata/ai/inf/ai_common_attack.blk`), so this leaves plenty. Every `Block` this crate builds is
+/// at most this deep, which is what keeps `Drop`, `to_text` and `to_json` (all recursive) off the stack limit.
+pub const MAX_DEPTH: usize = 128;
+
+/// Parameters the blocks of a dump may hold in total, counting the copies that format 6 makes when blocks
+/// share a range, unless 16 times the stored parameters is more. Every real file stores each parameter once.
+const MAX_COPIED_PARAMS: usize = 1 << 20;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Str(String),
@@ -155,6 +164,13 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
     ensure!(blocks_count > 0, "BLK has no root block");
     let complex = r.bytes(complex_size)?;
     let param_table = r.bytes(params_count.checked_mul(8).context("too many params")?)?;
+    // A block descriptor is at least three bytes (name, param count, block count), so a count the rest of
+    // the file cannot hold is refused before anything is sized by it
+    ensure!(
+        blocks_count <= r.remaining() / 3,
+        "BLK claims {blocks_count} blocks but only {} bytes follow its parameters",
+        r.remaining()
+    );
 
     let mut params = Vec::with_capacity(params_count);
     for raw in param_table.chunks_exact(8) {
@@ -166,6 +182,8 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
 
     let mut infos = Vec::with_capacity(blocks_count);
     let mut next_param = 0usize;
+    let copy_budget = MAX_COPIED_PARAMS.max(params_count.saturating_mul(16));
+    let mut copied = 0usize;
     for _ in 0..blocks_count {
         let name_id = r.varint()?;
         let pc = r.varint()? as usize;
@@ -175,22 +193,30 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
             if pc > 0 { r.varint()? as usize } else { 0 }
         } else {
             let s = next_param;
-            next_param += pc;
+            next_param = next_param.saturating_add(pc);
             s
         };
-        let slice = params.get(start..start + pc).context("block params out of range")?;
-        ensure!(bc == 0 || first_block + bc <= blocks_count, "block children out of range");
+        let slice = start
+            .checked_add(pc)
+            .and_then(|end| params.get(start..end))
+            .context("block params out of range")?;
+        copied += slice.len();
+        ensure!(copied <= copy_budget, "the blocks' shared parameter ranges expand to more than {copy_budget} parameters");
+        ensure!(bc == 0 || first_block.checked_add(bc).is_some_and(|end| end <= blocks_count), "block children out of range");
         infos.push(BlockInfo { name_id, params: slice.to_vec(), blocks_count: bc, first_block });
     }
 
     // Children always come after their parent, so build the tree back to front.
     let mut built: Vec<Option<Block>> = vec![None; blocks_count];
+    let mut depth = vec![1usize; blocks_count];
     for i in (0..blocks_count).rev() {
         let info = &infos[i];
         let block_name = if info.name_id == 0 { String::new() } else { name(info.name_id - 1)?.to_string() };
         let mut children = Vec::with_capacity(info.blocks_count);
         for c in info.first_block..info.first_block + info.blocks_count {
             ensure!(c > i, "block {i} references earlier block {c}");
+            depth[i] = depth[i].max(depth[c] + 1);
+            ensure!(depth[i] <= MAX_DEPTH, "blocks nest deeper than {MAX_DEPTH} levels");
             children.push(built[c].take().context("block used twice")?);
         }
         built[i] = Some(Block { name: block_name, params: info.params.clone(), blocks: children });
@@ -436,6 +462,90 @@ mod tests {
         // engine: name id 1+1, 1 param, 0 blocks
         d.extend_from_slice(&[2, 1, 0]);
         d
+    }
+
+    fn varint(mut v: u32, out: &mut Vec<u8>) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    /// Format 1, no names: `n` blocks, each the only child of the one before
+    fn deep_chain(n: u32) -> Vec<u8> {
+        let mut d = vec![1u8, 0];
+        varint(n, &mut d);
+        d.extend([0, 0]); // no params, no complex data
+        for i in 0..n - 1 {
+            d.extend([0, 0, 1]); // name id, params, one child
+            varint(i + 1, &mut d);
+        }
+        d.extend([0, 0, 0]);
+        d
+    }
+
+    #[test]
+    fn a_deep_chain_is_an_error_instead_of_a_stack_overflow() {
+        // 20,000 nested blocks overflowed an 8 MB stack in Drop and to_json
+        let err = parse(&deep_chain(20_000), None).unwrap_err().to_string();
+        assert!(err.contains("nest"), "{err}");
+    }
+
+    #[test]
+    fn nesting_up_to_the_limit_parses_and_prints() {
+        let root = parse(&deep_chain(MAX_DEPTH as u32), None).unwrap();
+        assert_eq!(root.to_text().lines().count(), 2 * (MAX_DEPTH - 1));
+        let mut json = root.to_json();
+        let mut depth = 1;
+        while let Some(child) = json.as_object_mut().and_then(|o| o.remove("")) {
+            json = child;
+            depth += 1;
+        }
+        assert_eq!(depth, MAX_DEPTH);
+        assert!(parse(&deep_chain(MAX_DEPTH as u32 + 1), None).is_err());
+    }
+
+    #[test]
+    fn a_huge_block_count_is_refused_before_anything_is_reserved() {
+        // 9 bytes that ask for 0xFFFFFFFF blocks
+        let mut d = vec![1u8, 0];
+        varint(0xFFFF_FFFF, &mut d);
+        d.extend([0, 0]);
+        let err = parse(&d, None).unwrap_err().to_string();
+        assert!(err.contains("claims"), "{err}");
+    }
+
+    /// Format 6: two params shared by `n` blocks that all point at the same range
+    fn shared_params(n: u32) -> Vec<u8> {
+        let mut d = vec![6u8, 1, 2, b'a', 0]; // one name, "a"
+        varint(n + 1, &mut d); // root + n children
+        d.extend([2, 0]); // two params, no complex data
+        for _ in 0..2 {
+            d.extend_from_slice(&(2u32 << 24).to_le_bytes()); // name 0, type int
+            d.extend_from_slice(&7u32.to_le_bytes());
+        }
+        d.extend([0, 0]); // root: name, no params
+        varint(n, &mut d); // n children
+        d.push(1); // starting at block 1
+        for _ in 0..n {
+            d.extend([1, 2, 0, 0]); // name, two params, no blocks, params start at 0
+        }
+        d
+    }
+
+    #[test]
+    fn shared_param_ranges_expand_within_a_budget() {
+        let root = parse(&shared_params(100), None).unwrap();
+        assert_eq!(root.blocks.len(), 100);
+        assert!(root.blocks.iter().all(|b| b.params.len() == 2));
+        // 1.2 million copies out of 2 stored params, in a 2.4 MB file
+        let err = parse(&shared_params(600_000), None).unwrap_err().to_string();
+        assert!(err.contains("expand"), "{err}");
     }
 
     #[test]

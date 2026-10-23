@@ -555,6 +555,40 @@ fn facing_leaves_decode_to_the_centres_and_corners_the_file_lists() {
     assert!(oak.leaf_vertex(trunk, 0).is_err());
 }
 
+/// A level's placed objects stay near their model's origin, so the level's extent is the level's: the
+/// leaf cards of trees used to put vertices 1e11 m out and its bounding box 2.4e11 m wide
+#[cfg(feature = "bridge")]
+#[test]
+fn norway_plain_scene_has_no_vertices_far_from_the_level() {
+    use rewrite_bridge::{Provider, SceneModel};
+    let Some(game) = game() else { return };
+    let wt = wt_unpack::bridge::WarThunder::new(&game);
+    let scene = wt.load_scene("levels/arcade_norway_plain.bin").unwrap();
+    scene.validate().unwrap();
+    let radius = |m: &rewrite_bridge::Model| m.meshes.iter().flat_map(|x| &x.positions).map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()).fold(0.0f32, f32::max);
+    let (mut far_models, mut reach) = (Vec::new(), 0.0f32);
+    for (i, m) in scene.models.iter().enumerate() {
+        let SceneModel::Inline(m) = m else { continue };
+        // The ground and the water are level-sized by nature; objects are not
+        if m.name == "terrain" || m.name == "water" {
+            continue;
+        }
+        let r = radius(m);
+        if r > 1000.0 {
+            far_models.push((m.name.clone(), r));
+        }
+        for inst in scene.instances.iter().filter(|x| x.model == i) {
+            let t = inst.transform.translation;
+            let s = inst.transform.scale.iter().cloned().fold(0.0f32, f32::max);
+            reach = reach.max((t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt() + r * s);
+        }
+    }
+    assert!(far_models.is_empty(), "objects with vertices more than a kilometre from their origin: {far_models:?}");
+    assert!(reach < 100_000.0, "an instance reaches {reach} m from the origin");
+    // The oaks are still there, as trunks and branches without their leaf cards
+    assert!(scene.models.iter().any(|m| matches!(m, SceneModel::Inline(m) if m.name == "liveoak_01_rendinst")));
+}
+
 #[test]
 fn kamchatka_terrain_comes_from_the_lts4_tracer() {
     let Some(game) = game() else { return };

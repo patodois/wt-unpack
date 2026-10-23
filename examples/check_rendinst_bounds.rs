@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use wt_blk::dxp_and_grp::grp_pack::GrpPack;
 use wt_unpack::blk::{self, Value};
+use wt_unpack::level::Level;
 use wt_unpack::rendinst::{is_facing_leaves, ResourceIndex, RiModel, REND_INST};
 
 /// Material classes of every model, in material order, from riDesc.bin (patched copy first)
@@ -152,7 +153,7 @@ fn main() {
                         // NaN compares false: count it as out of bounds
                         let inside = (0..3).all(|k| p[k] >= m.bbox[0][k] - margin && p[k] <= m.bbox[1][k] + margin);
                         worst = worst.max(if d.is_nan() { f32::INFINITY } else { d });
-                        far_n += usize::from(!(d <= far));
+                        far_n += usize::from(d.is_nan() || d > far);
                         out_n += usize::from(!inside);
                     }
                     st.vertices += seen_v.len();
@@ -210,6 +211,31 @@ fn main() {
         );
         println!("shadow mismatches: {:?}", leaf.shadow_mismatched);
         println!("no shadow points: {:?}", leaf.no_shadow);
+    }
+    // Where the offenders are placed, one level at a time
+    if !offenders.is_empty() {
+        let wanted: HashSet<&str> = offenders.iter().map(String::as_str).collect();
+        let mut files: Vec<PathBuf> = fs::read_dir(game.join("levels")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "bin")).collect();
+        files.sort();
+        let mut affected = 0;
+        for f in files {
+            let map = wt_unpack::vehicle::map(&f).unwrap();
+            let Ok(level) = Level::parse(&map) else { continue };
+            let Ok(layers) = level.rendinst_layers() else { continue };
+            let mut hit: BTreeMap<String, usize> = BTreeMap::new();
+            for l in &layers {
+                for (p, n) in l.pools.iter().zip(l.counts()) {
+                    if n > 0 && wanted.contains(p.name.as_str()) {
+                        *hit.entry(p.name.clone()).or_default() += n;
+                    }
+                }
+            }
+            if !hit.is_empty() {
+                affected += 1;
+                println!("LEVEL {}: {}", f.file_name().unwrap().to_string_lossy(), hit.iter().map(|(k, v)| format!("{k} x{v}")).collect::<Vec<_>>().join(", "));
+            }
+        }
+        println!("{affected} levels place a model with far vertices");
     }
     println!("OFFENDERS {}", offenders.join(" "));
 }

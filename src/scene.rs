@@ -34,7 +34,7 @@ use wt_blk::dxp_and_grp::grp_pack::GrpPack;
 use crate::blk::{self, Block, Value};
 use crate::landclass::{decode_colormaps, GroundBaker, GroundMaterial};
 use crate::level::{Heightmap, Level, RendInstLayer};
-use crate::rendinst::{model_descs_where, ResourceIndex, RiModel, LAND_CLASS, REND_INST};
+use crate::rendinst::{is_facing_leaves, model_descs_where, ResourceIndex, RiModel, LAND_CLASS, REND_INST};
 use crate::terrain::HeightGrid;
 use crate::texlib::{Rgba, TextureLibrary};
 use crate::vehicle::{self, TextureIndex};
@@ -86,6 +86,7 @@ pub const NOT_APPLIED: &[&str] = &[
     "water appearance: the water shader is not public; the plane carries the level's own water_aces_color_and_density colour, flat, when the level has one (28 of the 160 levels do) and the bridge's default material otherwise",
     "sun, sky and fog: the level stores only its place and date (stars{}); the time of day and weather come from the mission, and the sky colour from the atmosphere shader",
     "object shaders: layered, perlin and decal blending, wind, impostor billboards, interior mapping; objects use the first texture of each material",
+    "tree leaves (rendinst_facing_leaves): each leaf card is four vertices around one centre that the vertex shader moves to face the camera, so the data holds no corners in the object's space; the cards are left out and the trees are their trunks and branch meshes",
     "object normals and reflectance maps",
     "collision: Scene has no collision field, so the shapes of the placed objects come separately from WarThunder::load_level_collision (crate::level_collision); the ground's collision is the terrain model itself",
     "per-instance rotation of trees without a palette (the level stores none); scatter by land class (obj_plant_generate) and the SCN, FRT, Obj, Wire and spline blocks",
@@ -231,9 +232,11 @@ fn object_materials(desc: &Block) -> Vec<ObjMaterial> {
         .collect()
 }
 
-/// Meshes with these classes are left out (billboards and stickers laid over other geometry)
+/// Meshes with these classes are left out: billboards and stickers laid over other geometry, and the
+/// camera-facing leaf cards of trees, whose corners exist only in the camera's frame (see
+/// [`crate::rendinst::LeafVertex`])
 fn skipped_class(class: &str) -> bool {
-    class.contains("decal") || class.contains("baked_impostor")
+    class.contains("decal") || class.contains("baked_impostor") || is_facing_leaves(class)
 }
 
 /// Classes drawn with their first texture only: the engine blends further layers in the shader
@@ -950,6 +953,6 @@ mod tests {
         let m = object_materials(&desc);
         assert_eq!(m.len(), 1);
         assert_eq!((m[0].class.as_str(), m[0].color.as_deref(), m[0].atest, m[0].two_sided), ("rendinst_simple", Some("b*"), Some(127), true));
-        assert!(skipped_class("rendinst_deferred_decal") && skipped_class("rendinst_baked_impostor") && !skipped_class("rendinst_simple"));
+        assert!(skipped_class("rendinst_deferred_decal") && skipped_class("rendinst_baked_impostor") && skipped_class("rendinst_facing_leaves") && !skipped_class("rendinst_simple") && !skipped_class("rendinst_tree"));
     }
 }

@@ -337,6 +337,11 @@ Not in the scene, and why:
   `Scene::environment` are empty.
 - **Object shaders.** Layered, perlin and decal materials use their first texture, decals and impostor
   billboards are left out, and wind, interior mapping and normal and reflectance maps are not applied.
+- **Tree leaves.** The leaf cards of `rendinst_facing_leaves` materials are left out. A card is four vertices
+  around one centre (`HALF4`, in the object's space) plus a corner offset the vertex shader applies in the
+  camera's frame, so the data has no corners in the object's space to place; the trees keep their trunks and
+  branch meshes. `RiModel::leaf_vertex` decodes the centres and offsets for readers that want them, and
+  `cargo run --release --example check_rendinst_bounds` checks every placed-object model in the game.
 - **Blocks not decoded:** `SCN`, `FRT`, `Obj`, `Wire`, splines, `wt3d`, `lmct`, and the scatter of
   objects by land class (`obj_plant_generate`), which the game generates at load time.
 

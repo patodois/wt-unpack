@@ -15,6 +15,7 @@ use wt_blk::dxp_and_grp::{
 };
 use wt_unpack::level::Level;
 use wt_unpack::terrain::{self, HeightGrid};
+use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::{blk, gltf, vehicle, vromfs};
 
 #[derive(Parser)]
@@ -94,6 +95,43 @@ enum Command {
         #[arg(long, value_enum, default_value_t = BlkFormat::Text)]
         blk: BlkFormat,
     },
+    /// Read FMOD sound banks (`sound/*.assets.bank`)
+    Sound {
+        #[command(subcommand)]
+        command: SoundCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SoundCommand {
+    /// List the samples of a bank: rate, channels, length and name
+    List { bank: PathBuf },
+    /// Extract samples: Vorbis to Ogg (copied losslessly) and everything else to WAV
+    Extract {
+        bank: PathBuf,
+        /// Output directory
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Only extract samples whose name contains this text
+        #[arg(long)]
+        filter: Option<String>,
+        /// Output format; `wav` also decodes Vorbis
+        #[arg(long, value_enum, default_value_t = AudioFormat::Auto)]
+        format: AudioFormat,
+    },
+    /// Parse every bank in a folder and count samples per codec; `--decode` also decodes them all
+    Check {
+        dir: PathBuf,
+        #[arg(long)]
+        decode: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum AudioFormat {
+    /// Ogg for Vorbis, WAV for the rest
+    Auto,
+    Wav,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -122,6 +160,11 @@ fn main() -> Result<()> {
             level_cmd(&file, heightmap.as_deref(), gltf.as_deref(), terrain, cell, objects, textures.as_deref())
         }
         Command::CheckLevels { dir } => check_levels(&dir),
+        Command::Sound { command } => match command {
+            SoundCommand::List { bank } => sound_list(&bank),
+            SoundCommand::Extract { bank, out, filter, format } => sound_extract(&bank, &out, filter.as_deref(), format),
+            SoundCommand::Check { dir, decode } => sound_check(&dir, decode),
+        },
     }
 }
 
@@ -532,5 +575,174 @@ fn check_levels(dir: &Path) -> Result<()> {
 fn ensure_counts(counts: &[usize], decoded: usize) -> Result<()> {
     let total: usize = counts.iter().sum();
     anyhow::ensure!(total == decoded, "counters promise {total} objects, {decoded} decoded");
+    Ok(())
+}
+
+/// Calls `f` with each FSB5 of a bank and returns how many there were.
+fn with_fsbs(path: &Path, mut f: impl FnMut(usize, &Fsb5) -> Result<()>) -> Result<usize> {
+    let map = sound::map(path)?;
+    let ranges = sound::fsb5_ranges(&map).with_context(|| format!("reading {}", path.display()))?;
+    for (i, range) in ranges.iter().enumerate() {
+        let fsb = Fsb5::parse(&map[range.clone()]).with_context(|| format!("FSB5 at offset {}", range.start))?;
+        f(i, &fsb)?;
+    }
+    Ok(ranges.len())
+}
+
+fn no_samples_note(path: &Path) {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    match name.strip_suffix(".bank").filter(|n| !n.ends_with(".assets")) {
+        Some(stem) => eprintln!("{name} holds no sample data; its samples are in {stem}.assets.bank"),
+        None => eprintln!("{name} holds no sample data"),
+    }
+}
+
+fn sound_list(path: &Path) -> Result<()> {
+    let fsbs = with_fsbs(path, |i, fsb| {
+        println!("FSB5 {i}: version {}, {:?}, {} samples", fsb.version, fsb.codec, fsb.samples.len());
+        for (k, s) in fsb.samples.iter().enumerate() {
+            let looped = s.loop_points.map_or(String::new(), |(a, b)| format!("  loop {a}..{b}"));
+            println!(
+                "{k:>6} {:>6} Hz {}ch {:>9} frames {:>8.3}s {:>9} bytes  {}{looped}",
+                s.rate,
+                s.channels,
+                s.frames,
+                s.duration(),
+                s.data.len(),
+                s.name.as_deref().unwrap_or("-")
+            );
+        }
+        Ok(())
+    })?;
+    if fsbs == 0 {
+        no_samples_note(path);
+    }
+    Ok(())
+}
+
+/// A file name from a sample name: path separators and control characters become `_`.
+fn sample_file_name(name: Option<&str>, fsb: usize, index: usize) -> String {
+    match name {
+        Some(n) if !n.is_empty() && n != "." && n != ".." => {
+            n.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c }).collect()
+        }
+        _ => format!("sample_{fsb}_{index}"),
+    }
+}
+
+fn sound_extract(path: &Path, out: &Path, filter: Option<&str>, format: AudioFormat) -> Result<()> {
+    fs::create_dir_all(out)?;
+    let (mut written, mut failed) = (0, 0);
+    let mut used = std::collections::HashSet::new();
+    let fsbs = with_fsbs(path, |i, fsb| {
+        for (k, s) in fsb.samples.iter().enumerate() {
+            if filter.is_some_and(|needle| !s.name.as_deref().unwrap_or("").contains(needle)) {
+                continue;
+            }
+            let ogg = fsb.codec == Codec::Vorbis && format == AudioFormat::Auto;
+            let mut stem = sample_file_name(s.name.as_deref(), i, k);
+            if !used.insert(stem.clone()) {
+                stem = format!("{stem}_{i}_{k}");
+                used.insert(stem.clone());
+            }
+            let dest = out.join(format!("{stem}.{}", if ogg { "ogg" } else { "wav" }));
+            let result = (|| -> Result<()> {
+                let mut w = std::io::BufWriter::new(fs::File::create(&dest)?);
+                if ogg {
+                    sound::vorbis::write_ogg(s, fsb.data(s), &mut w)?;
+                } else {
+                    fsb.decode(s)?.write_wav(&mut w)?;
+                }
+                use std::io::Write;
+                w.flush()?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    let _ = fs::remove_file(&dest);
+                    eprintln!("{}: {e:#}", s.name.as_deref().unwrap_or("-"));
+                    failed += 1;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if fsbs == 0 {
+        no_samples_note(path);
+    }
+    eprintln!("wrote {written} samples to {} ({failed} failed)", out.display());
+    Ok(())
+}
+
+fn sound_check(dir: &Path, decode: bool) -> Result<()> {
+    use std::collections::BTreeMap;
+    let mut paths: Vec<_> = fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "bank")).collect();
+    paths.sort();
+    let (mut banks, mut fsbs, mut with_samples) = (0, 0, 0);
+    let mut per_codec: BTreeMap<String, (usize, f64)> = BTreeMap::new();
+    let mut layouts: BTreeMap<(u8, u32), usize> = BTreeMap::new();
+    let mut setups: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let (mut decoded, mut exact, mut longer) = (0, 0, 0);
+    for path in paths {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        banks += 1;
+        let result = with_fsbs(&path, |_, fsb| {
+            fsbs += 1;
+            for s in &fsb.samples {
+                let e = per_codec.entry(format!("{:?}", fsb.codec)).or_default();
+                e.0 += 1;
+                e.1 += s.duration();
+                *layouts.entry((s.channels, s.rate)).or_default() += 1;
+                if let Some(crc) = s.vorbis_setup {
+                    *setups.entry(crc).or_default() += 1;
+                }
+                if !decode {
+                    continue;
+                }
+                let mut check = || -> Result<()> {
+                    if fsb.codec == Codec::Vorbis {
+                        // Raw decode length, before trimming to the header's length
+                        let raw = sound::vorbis::decode(s, fsb.data(s))?;
+                        let frames = raw.len() / usize::from(s.channels);
+                        if frames == s.frames as usize {
+                            exact += 1;
+                        } else if frames > s.frames as usize {
+                            longer += 1;
+                        }
+                        sound::vorbis::write_ogg(s, fsb.data(s), std::io::sink())?;
+                    }
+                    fsb.decode(s)?;
+                    decoded += 1;
+                    Ok(())
+                };
+                if let Err(err) = check() {
+                    let key: String = format!("{err:#}").chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+                    errors.entry(key).or_default().push(format!("{file}:{}", s.name.as_deref().unwrap_or("-")));
+                }
+            }
+            Ok(())
+        });
+        match result {
+            Ok(0) => {}
+            Ok(_) => with_samples += 1,
+            Err(err) => errors.entry(format!("bank: {err:#}")).or_default().push(file),
+        }
+    }
+    println!("{banks} banks, {with_samples} with sample data in {fsbs} FSB5 sample banks");
+    for (codec, (n, secs)) in &per_codec {
+        println!("{codec:>10}: {n} samples, {:.1} hours", secs / 3600.0);
+    }
+    let layouts: Vec<String> = layouts.iter().map(|((c, r), n)| format!("{c}ch {r} Hz: {n}")).collect();
+    println!("layouts: {}", layouts.join(", "));
+    let setups: Vec<String> = setups.iter().map(|(c, n)| format!("{c:08X}: {n}")).collect();
+    println!("Vorbis setups ({}): {}", setups.len(), setups.join(", "));
+    if decode {
+        println!("decoded {decoded} samples; Vorbis decoded length equal to the header {exact}, longer {longer}");
+    }
+    for (msg, list) in &errors {
+        println!("{:>6}  {msg}\n        e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+    }
     Ok(())
 }

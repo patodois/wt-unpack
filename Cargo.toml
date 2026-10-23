@@ -18,6 +18,8 @@ wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "c7fd584a73384f8de7
 png = "0.18.1"
 # Oodle streams inside level files (the same decoder wt_blk uses)
 oozextract = "0.5.5"
+lewton = { version = "0.10.2", default-features = false }
+memmap2 = "0.9"
 
 [workspace]
 members = ["viewer"]

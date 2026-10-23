@@ -10,6 +10,8 @@ Rust tools for reading War Thunder's game data (Dagor Engine) from your own inst
   Dagor's packed normal maps split into PBR metal/roughness and normal textures.
 - **Levels:** the binary level dumps in `levels/` (`DBLD`): their blocks, the terrain (the `HM2`
   heightmap, or the landmesh's collision mesh) and the placed objects (rendinst) with their transforms.
+- **Sounds:** FMOD Studio sound banks (`sound/*.assets.bank`). Samples come out as Ogg Vorbis, copied
+  without re-encoding, or as WAV, including FMOD's own FADPCM codec.
 - **Export:** vehicles and terrain to glTF 2.0, which opens in Blender, three.js, Godot and most 3D tools;
   terrain heights to 16-bit PNG.
 - **Viewer:** `wt-viewer`, a [Bevy](https://bevyengine.org) app that opens a vehicle straight from the
@@ -57,6 +59,11 @@ wt-unpack level $GAME/levels/avg_berlin.bin --objects
 # Parse every level and summarise what decodes
 wt-unpack check-levels $GAME/levels
 
+# Sound banks: list the samples, then extract some (Vorbis to .ogg, FADPCM to .wav; --format wav decodes all)
+wt-unpack sound list $GAME/sound/tanks_engines.assets.bank
+wt-unpack sound extract $GAME/sound/tanks_weapons.assets.bank --filter dshk_close -o out/dshk
+wt-unpack sound check $GAME/sound --decode
+
 # Open a vehicle in 3D: drag to orbit, scroll to zoom, Q/E turn the turret, R/F elevate the gun
 wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V_ausf_g_panther --game $GAME
 
@@ -96,6 +103,12 @@ texture runs along the static track mesh.
   `compressedHeightmap.cpp`, `landRayTracerSoA4.cpp`, `bvhIO.cpp` and `rendInstGen.cpp`. The `HM2`
   heightmap covers the playable area (2 m per sample on tank maps); the landmesh's ray tracer
   covers the whole map at its own resolution and is rasterised into the same kind of grid.
+- The sound bank and FSB5 readers follow the layouts documented by the community in
+  [vgmstream](https://github.com/vgmstream/vgmstream) (ISC) and
+  [python-fsb5](https://github.com/HearthSim/python-fsb5) (MIT); no code was copied. FSB5 Vorbis drops
+  the stream headers, so they are rebuilt from FMOD's fixed set of setup headers, which python-fsb5
+  extracted and vgmstream ships (`src/sound/vorbis_setups.bin.zst`, ISC notice in `src/sound/vorbis.rs`).
+  Vorbis decoding to WAV uses [lewton](https://github.com/RustAudio/lewton).
 - The camouflage blend is an approximation, because the game's shaders are not public. The base
   texture's alpha marks painted areas, and the camouflage and occlusion maps are sampled through the
   mesh's second UV set.
@@ -115,6 +128,7 @@ Checked against War Thunder 2.59.0.80 on macOS:
 | Textures | 148,335, all decoded except 375 stored as deltas to a paired base texture |
 | Models | tanks 3,656/3,656, aircraft 1,695/1,695, ships 1,925/1,925, with every skeleton |
 | Levels | 160/160 parse fully: terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
+| Sound samples | 156,223 in 123 banks decoded: 148,743 Vorbis (91.7 hours) and 7,480 FADPCM |
 
 ## Disclaimer
 

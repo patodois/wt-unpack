@@ -671,6 +671,80 @@ fn parse_ltdump(raw: &[u8]) -> Result<TriMesh> {
     Ok(mesh)
 }
 
+/// A decoded `dBLi` quad BLAS (daBVH's `bvhIO` stream): vertices as packed 21-bit coordinates and the triangles
+/// of its leaves
+pub(crate) struct QuadBlas {
+    /// x, y, z in bits 0..20, 21..41, 42..62
+    pub verts: Vec<u64>,
+    /// Triangle corners, indices into `verts`
+    pub indices: Vec<u32>,
+}
+
+/// Reads one `dBLi` stream (see [`parse_lts4`] for the layout; the collision resources use the same stream
+/// per node)
+pub(crate) fn read_quad_blas(r: &mut Reader) -> Result<QuadBlas> {
+    ensure!(r.bytes(4)? == b"dBLi", "BVH has no dBLi signature");
+    let blas_version = r.u16()?;
+    let (stride, leaf_size) = (r.u8()?, r.u8()?);
+    ensure!((1..=2).contains(&blas_version) && stride == 8 && leaf_size == 28, "unsupported BVH layout");
+    let tree_bytes = r.u32()? as usize;
+    let vert_count = r.u32()? as usize;
+    r.skip(24)?;
+    let edge_flags = blas_version >= 2 && r.u32()? & 1 != 0;
+    ensure!(vert_count <= r.remaining() / 8, "{vert_count} vertices overrun the stream");
+    let mut verts = Vec::with_capacity(vert_count);
+    for _ in 0..vert_count {
+        verts.push(r.u64()?);
+    }
+    let mut indices = Vec::new();
+
+    // Nodes come in pre-order, so the leaves can be read in a flat loop; the runtime size of the
+    // nodes read so far tells where the tree ends
+    let (mut done, mut leaves) = (0usize, 0usize);
+    while done < tree_bytes {
+        let cc = r.u8()?;
+        let body = match cc {
+            0 | 0xFF => [r.u32()?, r.u32()?, r.u32()?, r.u32()?],
+            0xFE | 0xFD => [r.u32()?, r.u32()?, if cc == 0xFD { 1 << 29 } else { 0 }, 0],
+            _ => {
+                done += 16;
+                continue;
+            }
+        };
+        done += 28;
+        leaves += 1;
+        ensure!(done <= tree_bytes, "BVH tree overruns its size");
+        if cc == 0xFF {
+            continue;
+        }
+        let [w0, w1, w2, w3] = body;
+        let sx = |v: u32| ((v << 19) as i32 >> 19) as i64;
+        let apex = i64::from(w1 & 0xFF_FFFF);
+        let (o1, o2, o3) = (sx(w0), sx(w0 >> 13), sx(((w0 >> 26) & 0x1F) | (w1 >> 24) << 5));
+        let (o1b, o2b, o3b) = (sx(w2 >> 16), sx(w3), sx(w3 >> 13));
+        let mut quads = vec![(apex, o1, o2, o3, w2 & 1 << 29 != 0)];
+        if o1b != o2b {
+            quads.push((apex + i64::from(w2 & 0xFFFF), o1b, o2b, o3b, w2 & 1 << 30 != 0));
+        }
+        for (a, o1, o2, o3, flip) in quads {
+            let mut tris = vec![[a, a + o1, a + o2]];
+            if o3 != o2 {
+                tris.push(if flip { [a + o2, a + o1, a + o3] } else { [a + o1, a + o2, a + o3] });
+            }
+            for t in tris {
+                for v in t {
+                    ensure!((0..vert_count as i64).contains(&v), "leaf indexes vertex {v} of {vert_count}");
+                    indices.push(v as u32);
+                }
+            }
+        }
+    }
+    if edge_flags {
+        r.skip(leaves * 2)?;
+    }
+    Ok(QuadBlas { verts, indices })
+}
+
 /// Parses an `LTS4` stream (the unpacked newer land ray tracer): one quantised BVH per cell, whose
 /// leaves index the cell's vertices.
 ///
@@ -708,66 +782,13 @@ fn parse_lts4(raw: &[u8]) -> Result<TriMesh> {
         }
         let scale = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
         let ofs = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
-        ensure!(r.bytes(4)? == b"dBLi", "cell {ci}: BVH has no dBLi signature");
-        let blas_version = r.u16()?;
-        let (stride, leaf_size) = (r.u8()?, r.u8()?);
-        ensure!((1..=2).contains(&blas_version) && stride == 8 && leaf_size == 28, "cell {ci}: unsupported BVH layout");
-        let tree_bytes = r.u32()? as usize;
-        let vert_count = r.u32()? as usize;
-        r.skip(24)?;
-        let edge_flags = blas_version >= 2 && r.u32()? & 1 != 0;
-        ensure!(vert_count <= r.remaining() / 8, "cell {ci}: {vert_count} vertices overrun the stream");
+        let blas = read_quad_blas(&mut r).with_context(|| format!("cell {ci}"))?;
         let base = mesh.positions.len() as u32;
-        for _ in 0..vert_count {
-            let v = r.u64()?;
+        for v in &blas.verts {
             let q = [v & 0x1F_FFFF, (v >> 21) & 0x1F_FFFF, (v >> 42) & 0x1F_FFFF];
             mesh.positions.push([0, 1, 2].map(|k| (q[k] as f32 / 32.0 - ofs[k]) / scale[k]));
         }
-
-        // Nodes come in pre-order, so the leaves can be read in a flat loop; the runtime size of the
-        // nodes read so far tells where the tree ends
-        let (mut done, mut leaves) = (0usize, 0usize);
-        while done < tree_bytes {
-            let cc = r.u8()?;
-            let body = match cc {
-                0 | 0xFF => [r.u32()?, r.u32()?, r.u32()?, r.u32()?],
-                0xFE | 0xFD => [r.u32()?, r.u32()?, if cc == 0xFD { 1 << 29 } else { 0 }, 0],
-                _ => {
-                    done += 16;
-                    continue;
-                }
-            };
-            done += 28;
-            leaves += 1;
-            ensure!(done <= tree_bytes, "cell {ci}: BVH tree overruns its size");
-            if cc == 0xFF {
-                continue;
-            }
-            let [w0, w1, w2, w3] = body;
-            let sx = |v: u32| ((v << 19) as i32 >> 19) as i64;
-            let apex = i64::from(w1 & 0xFF_FFFF);
-            let (o1, o2, o3) = (sx(w0), sx(w0 >> 13), sx(((w0 >> 26) & 0x1F) | (w1 >> 24) << 5));
-            let (o1b, o2b, o3b) = (sx(w2 >> 16), sx(w3), sx(w3 >> 13));
-            let mut quads = vec![(apex, o1, o2, o3, w2 & 1 << 29 != 0)];
-            if o1b != o2b {
-                quads.push((apex + i64::from(w2 & 0xFFFF), o1b, o2b, o3b, w2 & 1 << 30 != 0));
-            }
-            for (a, o1, o2, o3, flip) in quads {
-                let mut tris = vec![[a, a + o1, a + o2]];
-                if o3 != o2 {
-                    tris.push(if flip { [a + o2, a + o1, a + o3] } else { [a + o1, a + o2, a + o3] });
-                }
-                for t in tris {
-                    for v in t {
-                        ensure!((0..vert_count as i64).contains(&v), "cell {ci}: leaf indexes vertex {v} of {vert_count}");
-                        mesh.indices.push(base + v as u32);
-                    }
-                }
-            }
-        }
-        if edge_flags {
-            r.skip(leaves * 2)?;
-        }
+        mesh.indices.extend(blas.indices.iter().map(|&i| base + i));
     }
     ensure!(r.remaining() == 0, "{} bytes left after the LTS4 cells", r.remaining());
     Ok(mesh)

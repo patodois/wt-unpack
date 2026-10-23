@@ -11,7 +11,10 @@ use wt_unpack::level::Level;
 use wt_unpack::rendinst::{ResourceIndex, RiModel, LAND_CLASS, REND_INST};
 use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::terrain::HeightGrid;
+use wt_unpack::collision::{Collision, NodeKind, COLLISION};
 use wt_unpack::gear::{RadiusSource, RunningGear, Side, WheelKind};
+use wt_unpack::rig::VehicleRig;
+use wt_unpack::tank::Controls;
 use wt_unpack::{blk, gltf, tank, vehicle, vromfs::Vromfs};
 
 fn game() -> Option<PathBuf> {
@@ -229,6 +232,121 @@ fn sherman_running_gear_comes_from_the_game_data() {
     let road = gear.wheels.iter().position(|w| w.kind == WheelKind::Road).unwrap();
     assert!((state.wheel_angles[road] - (std::f32::consts::TAU * 7.0 - 40.0)).abs() < 1e-3, "{}", state.wheel_angles[road]);
     assert!((state.belt_offsets[0] - (gear.belts[0].v_per_metre * 10.0).fract()).abs() < 1e-3);
+}
+
+/// The Sherman's rig, from the unit file and the model, without the bridge: turret limits and speeds, the drive
+/// train and its top speed, the wheels and belts, and the sockets
+#[test]
+fn sherman_rig_comes_from_the_unit_and_the_model() {
+    let Some(game) = game() else { return };
+    let pack = game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp");
+    let v = vehicle::load(&game, &pack, "m4a1_76w_sherman", 0).unwrap();
+    let tank = tank::load(&game, "m4a1_76w_sherman", None).unwrap().unwrap();
+    let rig = VehicleRig::new(&v, Some(&tank));
+    assert_eq!((rig.model.as_str(), rig.unit.as_deref()), ("m4a1_76w_sherman", Some("us_m4a1_76w_sherman")));
+
+    // The main gun, and the coaxial and anti-aircraft machine guns after it
+    let gun = rig.turret.as_ref().unwrap();
+    assert_eq!((gun.head.as_str(), gun.gun.as_str(), gun.barrel.as_deref()), ("bone_turret", "bone_gun", Some("bone_gun_barrel")));
+    assert_eq!((gun.emitter.as_deref(), gun.flash.as_deref()), (Some("bone_gun_barrel"), Some("emtr_gun_flame")));
+    assert_eq!((gun.yaw, gun.pitch), ([-180.0, 180.0], [-10.0, 25.0]));
+    assert_eq!((gun.speed_yaw, gun.speed_pitch), (24.0, 4.0));
+    assert_eq!(gun.pitch_by_yaw.len(), 3);
+    assert_eq!(rig.weapons.len(), 3);
+    assert_eq!(rig.weapons[2].head, "bone_mg_aa_h_01");
+
+    // 38.6 km/h forward and 5.0 reverse from the gearing; the BLK's own limits are kept as they are
+    let drive = rig.drive.as_ref().unwrap();
+    assert_eq!((drive.mass, drive.horse_powers, drive.max_rpm, drive.drive_gear_radius), (32673.0, 400.0, 2400.0, 0.305));
+    assert_eq!((drive.max_accel, drive.max_ang_speed), (Some(4.0), Some(30.0)));
+    let speeds = rig.speeds.unwrap();
+    assert!((speeds.top_speed_kmh - 38.6).abs() < 0.1 && (speeds.reverse_speed_kmh - 5.0).abs() < 0.1, "{speeds:?}");
+
+    let gear = rig.gear.as_ref().unwrap();
+    assert_eq!((gear.wheels.len(), gear.belts.len()), (22, 2));
+    assert!((gear.gauge_m.unwrap() - 2.163).abs() < 0.001);
+    // Bridge axes: the left side is +X, the front +Z
+    let wheel = |name: &str| gear.wheels.iter().find(|w| w.name == name).unwrap();
+    assert!(wheel("wheel_l_01").pivot[0] > 1.0 && wheel("wheel_r_01").pivot[0] < -1.0);
+    assert!(wheel("wheel_l_01").pivot[2] > wheel("wheel_l_06").pivot[2]);
+    assert_eq!(wheel("wheel_l_01").radius_m, 0.25);
+    assert!(gear.belts.iter().all(|b| (b.v_per_metre - 1.614).abs() < 0.01));
+
+    // The sockets name the unit's nodes and the model's wheels, tracks, cameras and hatches
+    let node = |s: &str| rig.socket(s).unwrap_or_else(|| panic!("no socket {s}")).node_name.as_str();
+    assert_eq!((node("turret"), node("gun"), node("barrel"), node("muzzle"), node("emitter")), ("bone_turret", "bone_gun", "bone_gun_barrel", "emtr_gun_flame", "bone_gun_barrel"));
+    assert_eq!((node("weapon_1_turret"), node("weapon_2_gun")), ("bone_mg_gun_twin", "bone_mg_aa_v_01"));
+    assert_eq!((node("wheel_l_01"), node("track_r"), node("camera_driver"), node("hatch_01"), node("emtr_exhaust_01")), ("wheel_l_01", "track_r", "bone_camera_driver", "hatch_01", "emtr_exhaust_01"));
+    assert_eq!(rig.sockets.iter().filter(|s| s.name.starts_with("wheel_")).count(), 22);
+    assert!(rig.missing_nodes.is_empty(), "{:?}", rig.missing_nodes);
+    // Every socket's node index is that node in the vehicle
+    assert!(rig.sockets.iter().all(|s| v.nodes[s.node].name == s.node_name));
+
+    // Driving: full throttle for a minute reaches the geared top speed, and the wheels have rolled forward
+    let mut m = rig.driving_model().unwrap();
+    for _ in 0..60 * 60 {
+        m.step(Controls { throttle: 1.0, steer: 0.0 }, 1.0 / 60.0);
+    }
+    assert!((m.speed_ms() * 3.6 - speeds.top_speed_kmh).abs() < 0.5);
+    assert_eq!(m.wheel_angles().len(), 22);
+    assert!(m.belt_offsets().iter().all(|o| (0.0..1.0).contains(o)));
+    // A model no unit uses has no turret or drive, but keeps its wheel and track sockets
+    let bare = VehicleRig::new(&v, None);
+    assert!(bare.turret.is_none() && bare.drive.is_none() && bare.socket("wheel_l_01").is_some() && bare.socket("turret").is_none());
+}
+
+/// Every collision resource in the game's packs decodes, with its vertices inside its nodes' boxes
+#[test]
+fn all_collision_resources_decode_and_stay_in_their_boxes() {
+    let Some(game) = game() else { return };
+    let mut packs: Vec<PathBuf> = fs::read_dir(game.join("content/base/res")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "grp")).collect();
+    packs.sort();
+    let (mut resources, mut triangles, mut kinds) = (0usize, 0usize, std::collections::BTreeSet::new());
+    for path in packs {
+        let file = vehicle::map(&path).unwrap();
+        let Ok(grp) = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file) else { continue };
+        for r in grp.resources.iter().filter(|r| r.class_id == COLLISION) {
+            let c = Collision::parse(&r.name, grp.data(r)).unwrap_or_else(|e| panic!("{}: {e:#}", r.name));
+            for n in &c.nodes {
+                kinds.insert(format!("{:?}", n.kind));
+                assert_eq!(n.indices.len() % 3, 0);
+                assert!(n.indices.iter().all(|&i| (i as usize) < n.positions.len()), "{}", r.name);
+                for p in &n.positions {
+                    assert!((0..3).all(|k| p[k] >= n.bbox[0][k] - 0.02 && p[k] <= n.bbox[1][k] + 0.02), "{}: {p:?} outside {:?}", r.name, n.bbox);
+                }
+            }
+            resources += 1;
+            triangles += c.triangles();
+        }
+    }
+    // 19,799 resources in War Thunder 2.59, with 11.5 million triangles
+    assert!(resources > 19_000 && triangles > 10_000_000, "{resources} resources, {triangles} triangles");
+    assert_eq!(kinds.len(), 6, "{kinds:?}");
+}
+
+/// A building's collision is one box; a tree's is a capsule; both match the object they belong to
+#[test]
+fn berlin_objects_have_collision_resources() {
+    let Some(game) = game() else { return };
+    let index = ResourceIndex::build(&game, &[COLLISION]).unwrap();
+    let load = |name: &str| {
+        let path = index.find(COLLISION, name).unwrap_or_else(|| panic!("no {name}")).to_path_buf();
+        let file = vehicle::map(&path).unwrap();
+        let grp = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+        let r = grp.find(name, COLLISION).unwrap();
+        Collision::parse(name, grp.data(r)).unwrap()
+    };
+    let building = load("berlin_city_build_1_collision");
+    assert_eq!(building.nodes.len(), 1);
+    let n = &building.nodes[0];
+    assert_eq!((n.kind, n.materials.as_slice()), (NodeKind::Box, ["concrete".to_string()].as_slice()));
+    assert!(n.traceable() && n.physics_collidable());
+    // 24 m wide and 22.5 m tall: the node's z axis is the object's up (its transform swaps y and z)
+    assert!((n.bbox[1][0] - n.bbox[0][0] - 24.0).abs() < 0.01 && (n.bbox[1][2] - n.bbox[0][2] - 22.49).abs() < 0.01, "{:?}", n.bbox);
+    assert_eq!(n.tm[1], [0.0, 0.0, 1.0]);
+    let tree = load("liveoak_03_rendinst_collision");
+    let cap = tree.nodes.iter().find(|n| n.kind == NodeKind::Capsule).unwrap().capsule.unwrap();
+    assert!(cap.radius > 0.3 && cap.radius < 1.0, "{cap:?}");
 }
 
 #[test]
@@ -471,6 +589,48 @@ fn tank_engine_bank_lists_and_decodes() {
     assert_eq!(u64::from_le_bytes(ogg[last + 6..last + 14].try_into().unwrap()), u64::from(idle.frames));
 }
 
+/// The Sherman through `load_animated`: the same model as `load`, plus the rig's sockets; and the rig by id
+#[cfg(feature = "bridge")]
+#[test]
+fn sherman_sockets_come_through_load_animated() {
+    use rewrite_bridge::Provider;
+    let Some(game) = game() else { return };
+    let wt = wt_unpack::bridge::WarThunder::new(&game);
+    let id = "tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman";
+    let a = wt.load_animated(id).unwrap();
+    a.validate().unwrap();
+    // `load` is the same model
+    assert!(wt.load(id).unwrap() == a.model);
+    let at = |name: &str| a.socket(name).unwrap_or_else(|| panic!("no socket {name}")).node;
+    let name_of = |name: &str| a.model.nodes[at(name)].name.as_str();
+    assert_eq!((name_of("turret"), name_of("gun"), name_of("barrel"), name_of("muzzle")), ("bone_turret", "bone_gun", "bone_gun_barrel", "emtr_gun_flame"));
+    assert_eq!((name_of("wheel_r_top_02"), name_of("track_l"), name_of("camera_gunner")), ("wheel_r_top_02", "track_l", "bone_camera_gunner"));
+    assert_eq!(a.model.nodes[at("gun")].parent, Some(at("turret")));
+    assert_eq!(a.model.nodes[at("muzzle")].parent, Some(at("gun")));
+    assert!(a.sockets.iter().all(|s| s.offset == rewrite_bridge::Transform::IDENTITY));
+
+    // The rig by id agrees, without decoding textures
+    let rig = wt.vehicle_rig(id).unwrap();
+    assert_eq!(rig.sockets.len(), a.sockets.len());
+    for s in &rig.sockets {
+        assert_eq!(at(&s.name), s.node);
+    }
+    let gun = rig.turret.unwrap();
+    assert_eq!((gun.yaw, gun.pitch), ([-180.0, 180.0], [-10.0, 25.0]));
+    assert!((rig.speeds.unwrap().top_speed_kmh - 38.6).abs() < 0.1);
+    // Wheels and belts index the bridge model's nodes and meshes
+    let gear = rig.gear.unwrap();
+    assert!(gear.wheels.iter().all(|w| a.model.nodes[w.node].name == w.name));
+    assert!(gear.belts.iter().all(|b| a.model.meshes[b.mesh].skin.is_some() && a.model.nodes[b.node].name == b.name));
+
+    // Clearing the caches changes nothing but memory
+    wt.clear_caches();
+    assert!(wt.load_animated(id).unwrap() == a);
+    // Aircraft have no sockets
+    let plane = wt.list("aircrafts/").unwrap().into_iter().next().unwrap();
+    assert!(wt.load_animated(&plane.id).unwrap().sockets.is_empty());
+}
+
 /// Levels are scenes: listed as levels, validated, with their placed objects, ground and water
 #[cfg(feature = "bridge")]
 #[test]
@@ -517,4 +677,58 @@ fn berlin_loads_as_a_scene_through_the_bridge() {
     assert_eq!(water.materials[0].base_color_factor, [0.82, 0.71, 0.58, 1.0]);
     // Sun, sky and lights are not in the level's data
     assert!(scene.lights.is_empty() && scene.environment.is_none());
+}
+
+/// The collision of the objects Berlin places, in the objects' own space: matches the render models
+#[cfg(feature = "bridge")]
+#[test]
+fn berlin_collision_matches_the_placed_objects() {
+    use rewrite_bridge::{Provider, SceneModel};
+    let Some(game) = game() else { return };
+    let wt = wt_unpack::bridge::WarThunder::new(&game);
+    let collision = wt.load_level_collision("levels/avg_berlin.bin").unwrap();
+    assert_eq!(collision.level, "avg_berlin");
+    assert!(collision.failed.is_empty(), "{:?}", collision.failed);
+    // 446 of the level's 476 objects have collision; the debris the destruction effects scatter do not
+    assert!(collision.objects.len() > 400 && collision.triangles() > 200_000, "{} objects, {} triangles", collision.objects.len(), collision.triangles());
+    assert!(collision.without_collision.iter().any(|n| n.starts_with("debris_")));
+
+    let scene = wt.load_scene("levels/avg_berlin.bin").unwrap();
+    let bounds = |m: &rewrite_bridge::Model| {
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in m.meshes.iter().flat_map(|x| &x.positions) {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        (lo, hi)
+    };
+    let (mut compared, mut outside) = (0, Vec::new());
+    for m in &scene.models {
+        let SceneModel::Inline(m) = m else { continue };
+        let Some(model) = collision.object(&m.name).and_then(|o| o.model.as_ref()) else { continue };
+        model.validate().unwrap();
+        // The collision sits inside the render model's box (give or take a metre and a half of fitting) in the
+        // same axes. The `_dp_` pieces of damaged buildings are drawn as fragments of the building but keep
+        // the whole one's collision, so they are left out.
+        if m.name.contains("_dp_") {
+            continue;
+        }
+        let (r, c) = (bounds(m), bounds(model));
+        if (0..3).any(|k| c.0[k] < r.0[k] - 1.5 || c.1[k] > r.1[k] + 1.5) {
+            outside.push(m.name.clone());
+        }
+        compared += 1;
+    }
+    assert!(compared > 250, "{compared}");
+    assert!(outside.is_empty(), "{} of {compared} outside: {outside:?}", outside.len());
+    // The house is one box of concrete; the oaks have capsule trunks
+    let house = collision.object("berlin_city_build_1").unwrap();
+    assert_eq!(house.model.as_ref().unwrap().materials[0].name, "concrete");
+    assert_eq!(house.triangles(), 12);
+    assert!(collision.object("liveoak_03_rendinst").unwrap().capsules.len() == 1);
+    // One object by name gives the same
+    assert!(wt.load_object_collision("berlin_city_build_1").unwrap().unwrap() == *house);
+    assert!(wt.load_object_collision("no_such_object").unwrap().is_none());
 }

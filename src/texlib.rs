@@ -3,13 +3,13 @@
 //! A name like `berlin_city_b*` stands for the texture `berlin_city_b` (the part before the `*`),
 //! preferring the high-quality copy (`berlin_city_b$hq`) when a pack has one.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use wt_blk::dxp_and_grp::dxp::DxpPack;
 
-use crate::vehicle;
+use crate::vehicle::{self, TextureIndex};
 
 /// An 8-bit RGBA image, rows top to bottom
 #[derive(Clone)]
@@ -20,7 +20,7 @@ pub struct Rgba {
 }
 
 pub struct TextureLibrary {
-    index: HashMap<String, PathBuf>,
+    index: Arc<TextureIndex>,
 }
 
 /// The name a texture is filed under: no `*` suffix, no `?options`
@@ -31,16 +31,26 @@ pub fn texture_key(name: &str) -> &str {
 impl TextureLibrary {
     /// Indexes every pack under the game folder (patched packs win)
     pub fn open(game: &Path) -> Result<Self> {
-        Ok(TextureLibrary { index: vehicle::texture_index(game)? })
+        Ok(TextureLibrary { index: Arc::new(vehicle::texture_index(game)?) })
+    }
+
+    /// A library over an index that is already built, e.g. the one a [`vehicle::Library`] uses
+    pub fn from_index(index: Arc<TextureIndex>) -> Self {
+        TextureLibrary { index }
+    }
+
+    /// The index this library looks textures up in
+    pub fn index(&self) -> &Arc<TextureIndex> {
+        &self.index
     }
 
     pub fn contains(&self, name: &str) -> bool {
         self.pack_of(name).is_some()
     }
 
-    fn pack_of(&self, name: &str) -> Option<(String, &PathBuf)> {
+    fn pack_of(&self, name: &str) -> Option<(String, &Path)> {
         let key = texture_key(name);
-        [format!("{key}$hq"), key.to_string()].into_iter().find_map(|n| self.index.get(&n).map(|p| (n, p)))
+        [format!("{key}$hq"), key.to_string()].into_iter().find_map(|n| self.index.get(&n).map(|p| (n, &**p)))
     }
 
     /// The size of a texture in pixels, from its header; `None` when no pack has it

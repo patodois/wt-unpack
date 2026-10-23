@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -33,10 +34,10 @@ use wt_blk::dxp_and_grp::grp_pack::GrpPack;
 use crate::blk::{self, Block, Value};
 use crate::landclass::{decode_colormaps, GroundBaker, GroundMaterial};
 use crate::level::{Heightmap, Level, RendInstLayer};
-use crate::rendinst::{model_descs, ResourceIndex, RiModel, LAND_CLASS, REND_INST};
+use crate::rendinst::{model_descs_where, ResourceIndex, RiModel, LAND_CLASS, REND_INST};
 use crate::terrain::HeightGrid;
 use crate::texlib::{Rgba, TextureLibrary};
-use crate::vehicle;
+use crate::vehicle::{self, TextureIndex};
 
 /// Parameters of the conversion that are about budget, not about the game's data
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ pub const NOT_APPLIED: &[&str] = &[
     "sun, sky and fog: the level stores only its place and date (stars{}); the time of day and weather come from the mission, and the sky colour from the atmosphere shader",
     "object shaders: layered, perlin and decal blending, wind, impostor billboards, interior mapping; objects use the first texture of each material",
     "object normals and reflectance maps",
+    "collision: Scene has no collision field, so the shapes of the placed objects come separately from WarThunder::load_level_collision (crate::level_collision); the ground's collision is the terrain model itself",
     "per-instance rotation of trees without a palette (the level stores none); scatter by land class (obj_plant_generate) and the SCN, FRT, Obj, Wire and spline blocks",
 ];
 
@@ -247,29 +249,54 @@ fn alpha_tested_class(class: &str) -> bool {
 struct ModelBuilder<'a> {
     textures: &'a TextureLibrary,
     opts: &'a SceneOptions,
-    /// Decoded object textures by name, shared by every model that uses them
-    cache: HashMap<String, Option<Rgba>>,
+    /// Where each object texture is already held, by name: `(model, material)` in the scene, or `None`
+    /// for a texture no pack has. A texture is decoded once and the later materials that use it copy it
+    /// from the first, so no second copy is kept here.
+    holders: HashMap<String, Option<(usize, usize)>>,
+    /// Textures decoded for the model being built, with the material that holds them
+    pending: Vec<(String, usize)>,
     report: &'a mut SceneReport,
 }
 
 impl ModelBuilder<'_> {
-    fn texture(&mut self, name: &str) -> Option<Image> {
+    /// The picture of a texture for the material about to be added at index `current.len()` of the model
+    /// being built (`current` holds its materials so far, `done` the models already in the scene)
+    fn texture(&mut self, name: &str, done: &[SceneModel], current: &[Material]) -> Option<Image> {
         let key = crate::texlib::texture_key(name).to_string();
-        if !self.cache.contains_key(&key) {
-            let img = match self.textures.decode(name, self.opts.object_texture_px) {
-                Ok(i) => i,
-                Err(e) => {
-                    self.report.warnings.push(format!("texture {name}: {e:#}"));
-                    None
+        let copy = |m: &Material| m.base_color.as_ref().map(|i| Image { width: i.width, height: i.height, rgba: i.rgba.clone() });
+        match self.holders.get(&key) {
+            Some(None) => return None,
+            Some(Some((model, material))) => {
+                return match done.get(*model) {
+                    Some(SceneModel::Inline(m)) => m.materials.get(*material).and_then(copy),
+                    _ => None,
                 }
-            };
-            self.cache.insert(key.clone(), img);
+            }
+            None => {}
         }
-        self.cache[&key].as_ref().map(|i| Image { width: i.width, height: i.height, rgba: i.rgba.clone() })
+        if let Some((_, material)) = self.pending.iter().find(|(k, _)| *k == key) {
+            return current.get(*material).and_then(copy);
+        }
+        match self.textures.decode(name, self.opts.object_texture_px) {
+            Ok(Some(i)) => {
+                self.pending.push((key, current.len()));
+                Some(image(i))
+            }
+            Ok(None) => {
+                self.holders.insert(key, None);
+                None
+            }
+            Err(e) => {
+                self.report.warnings.push(format!("texture {name}: {e:#}"));
+                self.holders.insert(key, None);
+                None
+            }
+        }
     }
 
     /// Converts one object model in its chosen LOD. `None` when nothing of it can be drawn.
-    fn build(&mut self, name: &str, model: &RiModel, desc: Option<&Block>) -> Option<(Model, usize)> {
+    fn build(&mut self, name: &str, model: &RiModel, desc: Option<&Block>, done: &[SceneModel]) -> Option<(Model, usize)> {
+        self.pending.clear();
         let lod = model.lod_for_distance(self.opts.lod_distance_m);
         let mats = desc.map(object_materials).unwrap_or_default();
         // Elements by material, in material order
@@ -316,7 +343,7 @@ impl ModelBuilder<'_> {
             fix_winding(&mut mesh);
             triangles += mesh.indices.len() / 3;
             let class = m.map_or("", |m| m.class.as_str());
-            let base_color = m.and_then(|m| m.color.as_deref()).and_then(|t| self.texture(t));
+            let base_color = m.and_then(|m| m.color.as_deref()).and_then(|t| self.texture(t, done, &materials));
             let alpha = match m.and_then(|m| m.atest) {
                 Some(0) => AlphaMode::Opaque,
                 Some(n) => AlphaMode::Mask(n as f32 / 255.0),
@@ -333,14 +360,29 @@ impl ModelBuilder<'_> {
                 double_sided: m.is_some_and(|m| m.two_sided) || !matches!(alpha, AlphaMode::Opaque),
                 ..Material::default()
             });
+            trim(&mut mesh);
             meshes.push(mesh);
         }
         if meshes.is_empty() || triangles == 0 {
+            self.pending.clear();
             return None;
+        }
+        // The model is accepted: it is the next one in the scene, and holds what it decoded
+        for (key, material) in self.pending.drain(..) {
+            self.holders.insert(key, Some((done.len(), material)));
         }
         self.report.object_textures += materials.iter().filter(|m| m.base_color.is_some()).count();
         Some((Model { name: name.to_string(), nodes: vec![Node::new(name, None)], meshes, materials, skins: Vec::new() }, triangles))
     }
+}
+
+/// Gives back the room the vectors grew into: a mesh built by pushing holds up to twice what it needs,
+/// and the scene keeps it for as long as it lives
+fn trim(mesh: &mut Mesh) {
+    mesh.positions.shrink_to_fit();
+    mesh.normals.shrink_to_fit();
+    mesh.uvs.shrink_to_fit();
+    mesh.indices.shrink_to_fit();
 }
 
 /// Turns the triangles of a mesh that faces against its own normals (the axis swap is a mirror, and
@@ -579,6 +621,7 @@ fn build_terrain(
             image(b.bake(*tile, texel))
         });
         materials.push(Material { name: mesh.name.clone(), base_color, metallic: 0.0, roughness: 1.0, ..Material::default() });
+        trim(&mut mesh);
         meshes.push(mesh);
     }
     report.terrain_tiles = meshes.len();
@@ -619,21 +662,58 @@ fn model_bytes(m: &Model) -> usize {
     meshes + images
 }
 
+/// What loading levels needs from the game folder, gathered once and shareable between loads: where each
+/// resource pack holds what, and where each texture is. About 20 MB, kept until dropped; there is no
+/// other state, so a program that has loaded its levels can drop this (the provider does, in
+/// `clear_caches`) to give the memory back.
+#[derive(Clone)]
+pub struct LevelSources {
+    pub resources: Arc<ResourceIndex>,
+    pub textures: Arc<TextureLibrary>,
+}
+
+/// The resource classes a level's packs are scanned for: placed-object models, land classes, and collision
+const LEVEL_CLASSES: &[u32] = &[REND_INST, LAND_CLASS, crate::collision::COLLISION];
+
+impl LevelSources {
+    /// Scans the game's `.grp` and `.dxp.bin` packs
+    pub fn open(game: &Path) -> Result<Self> {
+        Ok(Self { resources: Arc::new(ResourceIndex::build(game, LEVEL_CLASSES)?), textures: Arc::new(TextureLibrary::open(game)?) })
+    }
+
+    /// Like [`LevelSources::open`] over a texture index that is already built
+    pub fn with_index(game: &Path, textures: Arc<TextureIndex>) -> Result<Self> {
+        Ok(Self { resources: Arc::new(ResourceIndex::build(game, LEVEL_CLASSES)?), textures: Arc::new(TextureLibrary::from_index(textures)) })
+    }
+}
+
 /// Loads a level as a scene. `level_file` is a `levels/*.bin` file; `game` the game folder.
 pub fn load_level_scene(game: &Path, level_file: &Path, opts: &SceneOptions) -> Result<(Scene, SceneReport)> {
+    load_level_scene_with(game, level_file, opts, &LevelSources::open(game)?)
+}
+
+/// Like [`load_level_scene`], with the pack indexes already built (see [`LevelSources`]). When it
+/// returns, the allocator is asked to hand back the memory the load used and freed
+/// ([`crate::memory::release_freed_memory`]); the scene itself is the only thing it keeps.
+pub fn load_level_scene_with(game: &Path, level_file: &Path, opts: &SceneOptions, sources: &LevelSources) -> Result<(Scene, SceneReport)> {
+    let out = load_scene_inner(game, level_file, opts, sources);
+    crate::memory::release_freed_memory();
+    out
+}
+
+fn load_scene_inner(game: &Path, level_file: &Path, opts: &SceneOptions, sources: &LevelSources) -> Result<(Scene, SceneReport)> {
     let started = Instant::now();
     let name = level_file.file_stem().map_or("level".to_string(), |s| s.to_string_lossy().into_owned());
     let mut report = SceneReport { name: name.clone(), ..SceneReport::default() };
     let file = vehicle::map(level_file)?;
     let level = Level::parse(&file).with_context(|| format!("parsing {}", level_file.display()))?;
-    let index = ResourceIndex::build(game, &[REND_INST, LAND_CLASS])?;
-    let textures = TextureLibrary::open(game)?;
+    let (index, textures) = (&*sources.resources, &*sources.textures);
 
     let mut scene = Scene { name: name.clone(), ..Scene::default() };
 
     // Ground
     let mut extent = None;
-    if let Some((terrain, e)) = build_terrain(&level, &index, &textures, opts, &mut report)? {
+    if let Some((terrain, e)) = build_terrain(&level, index, textures, opts, &mut report)? {
         report.memory_bytes += model_bytes(&terrain);
         scene.models.push(SceneModel::Inline(terrain));
         scene.instances.push(Instance::new(scene.models.len() - 1, Transform::IDENTITY));
@@ -679,10 +759,10 @@ pub fn load_level_scene(game: &Path, level_file: &Path, opts: &SceneOptions) -> 
         }
     }
     report.unresolved.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    let mut descs = model_descs(game)?;
+    let mut descs = model_descs_where(game, |n| counts.contains_key(n))?;
     let mut model_of: HashMap<String, usize> = HashMap::new();
     {
-        let mut builder = ModelBuilder { textures: &textures, opts, cache: HashMap::new(), report: &mut report };
+        let mut builder = ModelBuilder { textures, opts, holders: HashMap::new(), pending: Vec::new(), report: &mut report };
         for (path, mut names) in by_pack {
             names.sort();
             let map = vehicle::map(&path)?;
@@ -697,7 +777,7 @@ pub fn load_level_scene(game: &Path, level_file: &Path, opts: &SceneOptions) -> 
                     }
                 };
                 let desc = descs.remove(&n);
-                let Some((model, tris)) = builder.build(&n, &ri, desc.as_ref()) else {
+                let Some((model, tris)) = builder.build(&n, &ri, desc.as_ref(), &scene.models) else {
                     builder.report.failed.push((n.clone(), "nothing to draw in its LOD".into()));
                     continue;
                 };
@@ -725,6 +805,7 @@ pub fn load_level_scene(game: &Path, level_file: &Path, opts: &SceneOptions) -> 
             placed += 1;
         }
     }
+    scene.instances.shrink_to_fit();
     report.instances = placed;
     report.memory_bytes += scene.instances.len() * std::mem::size_of::<Instance>();
     scene.validate().map_err(|e| anyhow::anyhow!("{}", e.0))?;

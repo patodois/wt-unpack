@@ -38,6 +38,14 @@ bridge = ["dep:rewrite-bridge", "dep:libc"]
 name = "render_scene"
 required-features = ["bridge"]
 
+[[example]]
+name = "drive_tank"
+required-features = ["bridge"]
+
+[[example]]
+name = "scene_memory"
+required-features = ["bridge"]
+
 [workspace]
 members = ["viewer"]
 

@@ -108,6 +108,15 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+    /// Print the rig of a vehicle (turret, drive train, wheels, sockets) from the game's data, as the
+    /// bridge provider's `vehicle_rig` gives it
+    #[cfg(feature = "bridge")]
+    Rig {
+        /// A vehicle id as `check-bridge --list` prints it, e.g. `tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman`
+        id: String,
+        #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
+        game: PathBuf,
+    },
     /// Print one BLK file (a loose file, or `archive.vromfs.bin:path/inside.blk`)
     Cat {
         target: String,
@@ -196,6 +205,8 @@ fn main() -> Result<()> {
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
         #[cfg(feature = "bridge")]
         Command::CheckBridge { game, filter, list } => check_bridge(&game, &filter, list),
+        #[cfg(feature = "bridge")]
+        Command::Rig { id, game } => rig_cmd(&game, &id),
         Command::Level { file, heightmap, gltf, terrain, cell, objects, textures, scene_stats, lod_distance } => {
             level_cmd(&file, heightmap.as_deref(), gltf.as_deref(), terrain, cell, objects, textures.as_deref())?;
             if scene_stats {
@@ -705,6 +716,13 @@ fn scene_stats_cmd(file: &Path, lod_distance: Option<f32>) -> Result<()> {
     }
     println!("  rotation: {} palette pools; {} placements of position-only pools without a palette keep identity rotation (the level stores none)", r.palette_pools, r.trees_without_rotation);
     println!("  memory estimate: {} MB of meshes, images and instances", r.memory_bytes >> 20);
+    match wt.load_level_collision(&id) {
+        Ok(c) => {
+            let capsules: usize = c.objects.iter().map(|o| o.capsules.len()).sum();
+            println!("  collision (WarThunder::load_level_collision): {} objects with {} triangles and {capsules} capsules; {} objects have no collision resource, {} failed", c.objects.len(), c.triangles(), c.without_collision.len(), c.failed.len());
+        }
+        Err(e) => println!("  collision: {e:#}"),
+    }
     let lost: usize = r.unresolved.iter().map(|(_, n)| n).sum();
     println!("  unresolved pools (no model in any pack): {} pools, {} placements", r.unresolved.len(), lost);
     for (n, c) in r.unresolved.iter().take(10) {
@@ -772,16 +790,19 @@ fn check_bridge(game: &Path, filter: &str, list_only: bool) -> Result<()> {
     // Per folder: (ok, failed); and how often each error came up, with one example
     let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut errors: BTreeMap<String, (usize, String)> = BTreeMap::new();
-    let (mut triangles, mut nodes) = (0usize, 0usize);
+    let (mut triangles, mut nodes, mut sockets, mut with_turret) = (0usize, 0usize, 0usize, 0usize);
     for (i, a) in assets.iter().enumerate() {
         let folder = a.id.split('/').next().unwrap_or("");
         let entry = counts.entry(bridge_folder(folder)).or_default();
         // One model at a time: each is dropped before the next loads
-        match wt.load(&a.id) {
-            Ok(model) => {
+        match wt.load_animated(&a.id) {
+            Ok(animated) => {
+                let model = &animated.model;
                 entry.0 += 1;
                 triangles += model.meshes.iter().map(|m| m.indices.len() / 3).sum::<usize>();
                 nodes += model.nodes.len();
+                sockets += animated.sockets.len();
+                with_turret += usize::from(animated.socket("turret").is_some());
             }
             Err(e) => {
                 entry.1 += 1;
@@ -804,11 +825,44 @@ fn check_bridge(game: &Path, filter: &str, list_only: bool) -> Result<()> {
         println!("  {n}x {msg} (e.g. {example})");
     }
     println!(
-        "{ok}/{} vehicles loaded and valid ({failed} failed), {triangles} LOD0 triangles, {nodes} nodes, {:.0} s, peak RSS {} MB",
+        "{ok}/{} vehicles loaded and valid ({failed} failed), {triangles} LOD0 triangles, {nodes} nodes, {sockets} sockets ({with_turret} vehicles with a turret socket), {:.0} s, peak RSS {} MB",
         ok + failed,
         start.elapsed().as_secs_f32(),
         peak_rss() >> 20
     );
+    Ok(())
+}
+
+#[cfg(feature = "bridge")]
+fn rig_cmd(game: &Path, id: &str) -> Result<()> {
+    use wt_unpack::bridge::WarThunder;
+
+    let rig = WarThunder::new(game).vehicle_rig(id)?;
+    println!("model {}, unit {}", rig.model, rig.unit.as_deref().unwrap_or("(none)"));
+    for (i, t) in rig.weapons.iter().enumerate() {
+        println!("weapon {i}: head {}, gun {}, barrel {:?}, emitter {:?}, flash {:?}", t.head, t.gun, t.barrel, t.emitter, t.flash);
+        println!("  yaw {:?} deg at {} deg/s, pitch {:?} deg at {} deg/s, pitch by yaw {:?}", t.yaw, t.speed_yaw, t.pitch, t.speed_pitch, t.pitch_by_yaw);
+    }
+    if let (Some(d), Some(s)) = (&rig.drive, &rig.speeds) {
+        println!("drive: {} kg, {} hp, {} RPM, sprocket {} m, ratios {:?} x {} x {}", d.mass, d.horse_powers, d.max_rpm, d.drive_gear_radius, d.gear_ratios, d.main_gear_ratio, d.side_gear_ratio);
+        println!("  top speed {:.1} km/h, reverse {:.1} km/h, first gear {:.1} km/h, maxAccel {:?} m/s2, maxAngSpeed {:?} deg/s", s.top_speed_kmh, s.reverse_speed_kmh, s.first_gear_speed_kmh, d.max_accel, d.max_ang_speed);
+    }
+    if let Some(g) = &rig.gear {
+        println!("gear: gauge {:?} m, {} wheels, {} belts", g.gauge_m, g.wheels.len(), g.belts.len());
+        for w in &g.wheels {
+            println!("  {} node {} {:?} {:?} r {:.3} m ({:?}) pivot {:?}", w.name, w.node, w.side, w.kind, w.radius_m, w.radius_source, w.pivot);
+        }
+        for b in &g.belts {
+            println!("  {} mesh {} {:?} {:.3} V per metre", b.name, b.mesh, b.side, b.v_per_metre);
+        }
+    }
+    println!("{} sockets:", rig.sockets.len());
+    for s in &rig.sockets {
+        println!("  {} -> node {} ({})", s.name, s.node, s.node_name);
+    }
+    if !rig.missing_nodes.is_empty() {
+        println!("named by the unit but not in the skeleton: {:?}", rig.missing_nodes);
+    }
     Ok(())
 }
 

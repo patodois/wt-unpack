@@ -361,12 +361,22 @@ pub const LAND_CLASS: u32 = 0x03FB_59C4;
 
 /// Material descriptions of every placed-object model, from riDesc.bin (patched copy first)
 pub fn model_descs(game: &Path) -> Result<HashMap<String, blk::Block>> {
+    model_descs_where(game, |_| true)
+}
+
+/// Like [`model_descs`], keeping only the models `wanted` accepts. The whole file is a big tree (hundreds
+/// of megabytes for the game's 20,000 models), so the rest is dropped as soon as it is parsed rather than
+/// held for the whole load.
+pub fn model_descs_where(game: &Path, wanted: impl Fn(&str) -> bool) -> Result<HashMap<String, blk::Block>> {
     let mut descs = HashMap::new();
     for rel in ["patch/content/base/res/riDesc.bin", "content/base/res/riDesc.bin"] {
         let Ok(raw) = fs::read(game.join(rel)) else { continue };
         let root = blk::parse(&raw, None).with_context(|| format!("parsing {rel}"))?;
+        drop(raw);
         for b in root.blocks {
-            descs.entry(b.name.clone()).or_insert(b);
+            if wanted(&b.name) {
+                descs.entry(b.name.clone()).or_insert(b);
+            }
         }
     }
     Ok(descs)

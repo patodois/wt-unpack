@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -119,8 +120,12 @@ pub struct Vehicle {
     pub nodes: Vec<Node>,
 }
 
-/// Texture name (without anything from the `*` on) -> pack holding a non-empty copy of it
-pub fn texture_index(game: &Path) -> Result<HashMap<String, PathBuf>> {
+/// Texture name (without anything from the `*` on) -> pack holding a non-empty copy of it. The paths are
+/// shared, since a pack holds thousands of textures.
+pub type TextureIndex = HashMap<String, Arc<Path>>;
+
+/// Indexes the textures of every `.dxp.bin` pack under the game folder (patched packs win)
+pub fn texture_index(game: &Path) -> Result<TextureIndex> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -139,6 +144,7 @@ pub fn texture_index(game: &Path) -> Result<HashMap<String, PathBuf>> {
     let mut index = HashMap::new();
     for path in packs {
         let mut f = fs::File::open(&path)?;
+        let shared: Arc<Path> = Arc::from(path.as_path());
         let mut head = [0u8; 16];
         if f.read_exact(&mut head).is_err() || &head[..4] != b"DxP2" {
             continue;
@@ -160,7 +166,7 @@ pub fn texture_index(game: &Path) -> Result<HashMap<String, PathBuf>> {
             let name = bytes::Reader::at(&dump, name_ofs)?.cstr()?;
             // Names look like "tex_c*", "tex_c$hq*" or "tex_c*?q0-1-1u01"
             let key = name.split('*').next().unwrap_or(&name).to_string();
-            index.insert(key, path.clone());
+            index.insert(key, shared.clone());
         }
     }
     Ok(index)
@@ -176,7 +182,7 @@ pub fn map(path: &Path) -> Result<Mmap> {
 
 /// Decodes textures by name, preferring the high-quality copy, keeping opened packs mapped
 struct TextureSource<'a> {
-    index: &'a HashMap<String, PathBuf>,
+    index: &'a TextureIndex,
     packs: HashMap<PathBuf, Mmap>,
 }
 
@@ -184,7 +190,7 @@ impl TextureSource<'_> {
     fn decode(&mut self, tex: &str) -> Result<Option<Image>> {
         let Some((full, path)) = [format!("{tex}$hq"), tex.to_string()]
             .into_iter()
-            .find_map(|n| self.index.get(&n).map(|p| (n, p.clone())))
+            .find_map(|n| self.index.get(&n).map(|p| (n, PathBuf::from(&**p))))
         else {
             return Ok(None);
         };
@@ -470,7 +476,7 @@ fn split_packed_normal(img: &Image) -> (Image, Image) {
 /// What loading vehicles needs from the game folder, gathered once: where each texture is, and every
 /// model's material description
 pub struct Library {
-    textures: HashMap<String, PathBuf>,
+    textures: Arc<TextureIndex>,
     descs: HashMap<String, blk::Block>,
 }
 
@@ -481,15 +487,27 @@ pub fn load(game: &Path, pack: &Path, name: &str, lod: usize) -> Result<Vehicle>
 
 impl Library {
     pub fn open(game: &Path) -> Result<Self> {
-        Ok(Self { textures: texture_index(game)?, descs: model_descs(game)? })
+        Self::with_index(game, Arc::new(texture_index(game)?))
+    }
+
+    /// Like [`Library::open`], with a texture index that is already built (it can be shared with
+    /// [`crate::texlib::TextureLibrary::from_index`])
+    pub fn with_index(game: &Path, textures: Arc<TextureIndex>) -> Result<Self> {
+        Ok(Self { textures, descs: model_descs(game)? })
     }
 
     pub fn load(&self, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
-        load_from(self, pack, name, lod)
+        load_from(self, pack, name, lod, true)
+    }
+
+    /// Like [`Library::load`] without decoding any texture: the materials are there, their images are not.
+    /// For the skeleton and meshes alone (the rig of a vehicle), this is orders of magnitude cheaper.
+    pub fn load_geometry(&self, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
+        load_from(self, pack, name, lod, false)
     }
 }
 
-fn load_from(library: &Library, pack: &Path, name: &str, lod: usize) -> Result<Vehicle> {
+fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textures: bool) -> Result<Vehicle> {
     let file = map(pack)?;
     let grp = GrpPack::parse(&file)?;
     let find = |res: &str, class: u32| {
@@ -503,7 +521,7 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize) -> Result<V
 
     // UV triangles of every material that needs baking, grouped by texture combination
     let mut bake_tris: HashMap<String, Vec<camo::UvTriangle>> = HashMap::new();
-    for info in &infos {
+    for info in infos.iter().filter(|_| with_textures) {
         let Some(key) = info.bake_key() else { continue };
         let tris = bake_tris.entry(key).or_default();
         let (elems, vdata): (Vec<&Elem>, _) = if info.skinned {
@@ -529,6 +547,19 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize) -> Result<V
     let mut source = TextureSource { index: &library.textures, packs: HashMap::new() };
     let mut materials = Vec::with_capacity(infos.len());
     for info in &infos {
+        if !with_textures {
+            materials.push(Material {
+                name: info.name.clone(),
+                color: None,
+                metal_rough: None,
+                normal: None,
+                double_sided: info.double_sided,
+                alpha_mask: info.class.contains("atest"),
+                color_key: None,
+                pbr_key: None,
+            });
+            continue;
+        }
         let bake_key = info.bake_key();
         let mut color = source.decode_or_warn(&info.color);
         if let (Some(img), Some(key)) = (color.as_mut(), &bake_key) {

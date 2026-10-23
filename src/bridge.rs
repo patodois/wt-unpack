@@ -15,8 +15,18 @@
 //! turning a node (the turret about Y, the gun about X) turns its subtree in the vehicle's own axes.
 //! Dagor's node axes vary from node to node and many are mirrored, which a glTF node cannot hold.
 //!
+//! Ground vehicles come with their rig: [`Provider::load_animated`] returns the model plus a socket for
+//! every data-named node worth attaching to or turning (the turret, gun, barrel and muzzle named by the
+//! unit file, the wheels, track belts, crew cameras, hatches and effect emitters), and
+//! [`WarThunder::vehicle_rig`] gives the turret limits and speeds, the drive train, the wheel radii and track
+//! texture rate as plain structs. See [`crate::rig`] for the socket names and what each field means.
+//!
 //! Levels are scenes: `levels/avg_berlin.bin` is listed as [`AssetKind::Level`] and loaded with
-//! `load_scene` (see [`crate::scene`]).
+//! `load_scene` (see [`crate::scene`]); the collision of their objects comes from
+//! [`WarThunder::load_level_collision`] (see [`crate::level_collision`]).
+//!
+//! The provider owns the indexes it builds (textures, packs, units), nothing is global, and
+//! [`WarThunder::clear_caches`] drops them and hands freed memory back.
 //!
 //! Skinned meshes (tracks, cables) become skins with the game's own bones and weights: each vertex
 //! follows up to four skeleton nodes, taken from the model's bone table (a track follows the `root` node
@@ -26,14 +36,17 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{bail, Context, Result};
-use rewrite_bridge::{AlphaMode, AssetInfo, AssetKind, BoxError, Image, Material, Mesh, Model, Node, Provider, Scene, Skin};
+use rewrite_bridge::{AlphaMode, AnimatedModel, AssetInfo, AssetKind, BoxError, Image, Material, Mesh, Model, Node, Provider, Scene, Skin, Socket, Transform};
 use wt_blk::dxp_and_grp::grp_pack::{class_id, GrpPack};
 
-use crate::scene::{load_level_scene, SceneOptions, SceneReport};
-use crate::vehicle::{self, Library, Vehicle};
+use crate::level_collision::{load_level_collision, load_object, LevelCollision, ObjectCollision};
+use crate::rig::{to_bridge_axes, VehicleRig};
+use crate::scene::{load_level_scene_with, LevelSources, SceneOptions, SceneReport};
+use crate::tank::{self, UnitIndex};
+use crate::vehicle::{self, Library, TextureIndex, Vehicle};
 
 /// Folders of `content/base/res` that hold vehicles
 pub const FOLDERS: [&str; 3] = ["tanks", "aircrafts", "ships"];
@@ -41,22 +54,84 @@ pub const FOLDERS: [&str; 3] = ["tanks", "aircrafts", "ships"];
 /// Damage and x-ray variants share their vehicle's pack but are not vehicles of their own
 const VARIANTS: [&str; 3] = ["_dmg", "_xray", "_dm"];
 
+/// What the provider keeps between loads, all of it rebuilt on demand: indexes of the game's packs and units.
+/// A few tens of megabytes together; [`WarThunder::clear_caches`] drops them.
+#[derive(Default)]
+struct Caches {
+    textures: Option<Arc<TextureIndex>>,
+    library: Option<Arc<Library>>,
+    levels: Option<LevelSources>,
+    units: Option<Arc<UnitIndex>>,
+}
+
+/// War Thunder as a bridge provider. It owns every cache it uses (nothing is global), so dropping it, or
+/// calling [`WarThunder::clear_caches`], gives the memory back.
 pub struct WarThunder {
     game: PathBuf,
-    library: OnceLock<Library>,
+    caches: Mutex<Caches>,
     scene_options: SceneOptions,
 }
 
 impl WarThunder {
     /// `game` is the installed game's folder, the one holding `content` and `aces.vromfs.bin`
     pub fn new(game: impl Into<PathBuf>) -> Self {
-        Self { game: game.into(), library: OnceLock::new(), scene_options: SceneOptions::default() }
+        Self { game: game.into(), caches: Mutex::new(Caches::default()), scene_options: SceneOptions::default() }
     }
 
     /// Sets the budget parameters of [`Provider::load_scene`]
     pub fn with_scene_options(mut self, options: SceneOptions) -> Self {
         self.scene_options = options;
         self
+    }
+
+    /// Drops everything the provider has cached (the texture and pack indexes, the model descriptions, the
+    /// unit index) and asks the allocator to hand its free pages back to the operating system. Scenes and
+    /// models already returned are the caller's and are not touched; drop them first to get their memory
+    /// back too. The caches are rebuilt by the next load (a second or two for the first vehicle or level).
+    ///
+    /// A program that loads a level and then drops the scene still shows the level's memory as resident
+    /// until the allocator releases it (see [`crate::memory`]); `drop(scene); wt.clear_caches();` does.
+    pub fn clear_caches(&self) {
+        *self.lock() = Caches::default();
+        crate::memory::release_freed_memory();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Caches> {
+        // A panic while holding the lock leaves only caches behind, which are safe to use or rebuild
+        self.caches.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn texture_index(&self) -> Result<Arc<TextureIndex>> {
+        if let Some(t) = self.lock().textures.clone() {
+            return Ok(t);
+        }
+        let built = Arc::new(vehicle::texture_index(&self.game)?);
+        Ok(self.lock().textures.get_or_insert(built).clone())
+    }
+
+    /// The texture index and material descriptions of the vehicles, gathered on first use
+    fn library(&self) -> Result<Arc<Library>> {
+        if let Some(l) = self.lock().library.clone() {
+            return Ok(l);
+        }
+        let built = Arc::new(Library::with_index(&self.game, self.texture_index()?)?);
+        Ok(self.lock().library.get_or_insert(built).clone())
+    }
+
+    fn level_sources(&self) -> Result<LevelSources> {
+        if let Some(l) = self.lock().levels.clone() {
+            return Ok(l);
+        }
+        let built = LevelSources::with_index(&self.game, self.texture_index()?)?;
+        Ok(self.lock().levels.get_or_insert(built).clone())
+    }
+
+    fn units(&self) -> Result<Arc<UnitIndex>> {
+        if let Some(u) = self.lock().units.clone() {
+            return Ok(u);
+        }
+        let built = Arc::new(UnitIndex::build(&self.game)?);
+        Ok(self.lock().units.get_or_insert(built).clone())
     }
 
     /// Levels (`levels/*.bin`), as `levels/<name>.bin`
@@ -89,18 +164,22 @@ impl WarThunder {
         Ok(file)
     }
 
-    /// Loads a level with the report of what went into it
-    pub fn load_level(&self, id: &str) -> Result<(Scene, SceneReport)> {
-        load_level_scene(&self.game, &self.level_file(id)?, &self.scene_options)
+    /// The collision of the objects a level places (`levels/avg_berlin.bin`), which `Scene` has no field for:
+    /// see [`crate::level_collision`]. The ground is not in it; the scene's `terrain` model is the ground's
+    /// collision mesh.
+    pub fn load_level_collision(&self, id: &str) -> Result<LevelCollision> {
+        load_level_collision(&self.level_file(id)?, &self.level_sources()?.resources)
     }
 
-    /// The texture index and material descriptions, gathered on first use
-    fn library(&self) -> Result<&Library> {
-        if let Some(l) = self.library.get() {
-            return Ok(l);
-        }
-        let l = Library::open(&self.game)?;
-        Ok(self.library.get_or_init(|| l))
+    /// The collision of one placed object by its model name in the scene (e.g. `berlin_city_build_1`);
+    /// `None` when the game has no collision resource for it
+    pub fn load_object_collision(&self, name: &str) -> Result<Option<ObjectCollision>> {
+        load_object(&self.level_sources()?.resources, name)
+    }
+
+    /// Loads a level with the report of what went into it
+    pub fn load_level(&self, id: &str) -> Result<(Scene, SceneReport)> {
+        load_level_scene_with(&self.game, &self.level_file(id)?, &self.scene_options, &self.level_sources()?)
     }
 
     /// Every vehicle pack, as `folder/pack.grp` -> its file (patched copies replace the originals)
@@ -156,12 +235,50 @@ impl WarThunder {
         Ok(out)
     }
 
-    fn load_vehicle(&self, id: &str) -> Result<Model> {
+    /// Splits `tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman` into its pack file and model name
+    fn vehicle_parts<'a>(&self, id: &'a str) -> Result<(&'a str, &'a str, PathBuf)> {
         let (rel, name) = id.split_once(':').with_context(|| format!("{id}: expected pack.grp:model"))?;
-        let v = self.library()?.load(&self.pack(rel)?, name, 0)?;
-        let model = to_model(v);
-        model.validate()?;
-        Ok(model)
+        Ok((rel, name, self.pack(rel)?))
+    }
+
+    /// The unit data of a tank model (`None` for aircraft and ships, and for tank models no unit uses)
+    fn tank_of(&self, rel: &str, model: &str) -> Result<Option<tank::Tank>> {
+        if !rel.starts_with("tanks/") {
+            return Ok(None);
+        }
+        match self.units()?.unit_of_model(model) {
+            Some(unit) => Ok(Some(tank::load_unit(&self.game, unit)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_vehicle(&self, id: &str) -> Result<AnimatedModel> {
+        let (rel, name, pack) = self.vehicle_parts(id)?;
+        let v = self.library()?.load(&pack, name, 0)?;
+        // Sockets are for ground vehicles, whose unit files and node names the rig knows
+        let rig = if rel.starts_with("tanks/") { Some(VehicleRig::new(&v, self.tank_of(rel, name)?.as_ref())) } else { None };
+        let mut animated = AnimatedModel::new(to_model(v));
+        if let Some(rig) = rig {
+            animated.sockets = rig.sockets.iter().map(|s| Socket::new(s.name.clone(), s.node, Transform::IDENTITY)).collect();
+        }
+        animated.validate()?;
+        Ok(animated)
+    }
+
+    /// The rig of a vehicle by the id [`Provider::list`] gave for it: the turret's nodes and limits, the drive
+    /// train, the wheels and track belts, and the sockets `load_animated` returns, as plain structs (see
+    /// [`crate::rig`]). Only the skeleton and meshes are read, not the textures, so it is much quicker than
+    /// loading the model. Aircraft and ships have no unit file, so their rigs hold only what the model gives.
+    pub fn vehicle_rig(&self, id: &str) -> Result<VehicleRig> {
+        let (rel, name, pack) = self.vehicle_parts(id)?;
+        let v = self.library()?.load_geometry(&pack, name, 0)?;
+        let tank = self.tank_of(rel, name)?;
+        Ok(VehicleRig::new(&v, tank.as_ref()))
+    }
+
+    /// The unit file's data for a tank model by name (e.g. `m4a1_76w_sherman`), without loading the model
+    pub fn unit_of_model(&self, model: &str) -> Result<Option<tank::Tank>> {
+        self.tank_of("tanks/", model)
     }
 }
 
@@ -180,6 +297,13 @@ impl Provider for WarThunder {
         if id.starts_with("levels/") {
             return Err(format!("{id} is a level: load it with load_scene").into());
         }
+        Ok(self.load_vehicle(id)?.model)
+    }
+
+    fn load_animated(&self, id: &str) -> Result<AnimatedModel, BoxError> {
+        if id.starts_with("levels/") {
+            return Err(format!("{id} is a level: load it with load_scene").into());
+        }
         Ok(self.load_vehicle(id)?)
     }
 
@@ -190,7 +314,7 @@ impl Provider for WarThunder {
 
 /// From [`vehicle`]'s space (front +X, right +Z) to the bridge's (front +Z, left +X)
 fn turn(p: [f32; 3]) -> [f32; 3] {
-    [-p[2], p[1], p[0]]
+    to_bridge_axes(p)
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {

@@ -6,12 +6,17 @@ pub mod blk;
 pub mod bridge;
 pub mod bytes;
 pub mod camo;
+pub mod collision;
 pub mod gear;
 pub mod gltf;
 pub mod landclass;
 pub mod level;
+pub mod memory;
 pub mod rendinst;
+pub mod rig;
 pub mod rodb;
+#[cfg(feature = "bridge")]
+pub mod level_collision;
 #[cfg(feature = "bridge")]
 pub mod scene;
 pub mod live;

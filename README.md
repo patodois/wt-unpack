@@ -9,7 +9,9 @@ Rust tools for reading War Thunder's game data (Dagor Engine) from your own inst
   materials. Textures come from `.dxp.bin` packs, with the camouflage and ambient occlusion baked in and
   Dagor's packed normal maps split into PBR metal/roughness and normal textures.
 - **Levels:** the binary level dumps in `levels/` (`DBLD`): their blocks, the terrain (the `HM2`
-  heightmap, or the landmesh's collision mesh) and the placed objects (rendinst) with their transforms.
+  heightmap, or the landmesh's collision mesh), the ground's land classes and weights, and the placed
+  objects (rendinst) with their transforms, rotations and real models. With the bridge feature a level
+  loads as a whole scene (see "Levels as scenes").
 - **Sounds:** FMOD Studio sound banks (`sound/*.assets.bank`). Samples come out as Ogg Vorbis, copied
   without re-encoding, or as WAV, including FMOD's own FADPCM codec.
 - **Export:** vehicles and terrain to glTF 2.0, which opens in Blender, three.js, Godot and most 3D tools;
@@ -57,6 +59,10 @@ wt-unpack level $GAME/levels/avg_berlin.bin
 wt-unpack level $GAME/levels/arcade_alps.bin --heightmap out/alps.png --gltf out/alps
 wt-unpack level $GAME/levels/avg_berlin.bin --terrain landmesh --heightmap out/berlin_wide.png
 wt-unpack level $GAME/levels/avg_berlin.bin --objects
+
+# The level as a rewrite-bridge scene (needs --features bridge): the models, the instances, the memory
+# estimate, and what is not in the scene
+wt-unpack level $GAME/levels/avg_berlin.bin --scene-stats
 
 # Parse every level and summarise what decodes
 wt-unpack check-levels $GAME/levels
@@ -130,6 +136,48 @@ wheel nodes, see above), and glass blends.
 cargo build --release --features bridge
 wt-unpack check-bridge              # load and validate every tank, aircraft and ship
 ```
+
+## Levels as scenes
+
+`WarThunder::load_scene("levels/avg_berlin.bin")` (and `wt-unpack level <file> --scene-stats`) turns a
+level into a `rewrite_bridge::Scene`. `Provider::list` lists the levels as `AssetKind::Level`; `load`
+of a level id says to use `load_scene`. Axes are the vehicles' (`(x, y, z)` becomes `(z, y, x)`).
+Everything in the scene is read from the level, the game's resources or the level's settings; what
+cannot be is left out and printed by `--scene-stats` (and listed in `wt_unpack::scene::NOT_APPLIED`).
+
+| In the scene | Where it comes from |
+|---|---|
+| **Ground** (`terrain`, one mesh per landmesh cell) | The landmesh's collision mesh for the whole map and the `HM2` heightmap for the area it covers finer than the landmesh. Colours: the level's land classes (`lmap` detail data, from the level or from `03FB59C4` resources in the `.grp` packs) have colour maps over `size` metres; they are blended by the level's per-cell weights (`LMp2` is the *physics* material map, not read) and baked into one picture per cell. Weights come from the per-cell textures or the packed atlas, decoded as `land_weight_inc.dshl` reads them. |
+| **Placed objects** (one model per distinct rendinst) | `RIGz` placements; each pool name resolves to a `RendInst` resource (class `77F8232F`, not a `DynModel`: LODs of rigid meshes with no skeleton), found by scanning the `.grp` headers; materials and textures from `riDesc.bin`. One LOD per model, chosen as the game's `getBestLodForDist` does from the model's own ranges at `SceneOptions::lod_distance_m` (250 m); the billboard impostor LOD is never chosen. Every placement is an `Instance`: no mesh is copied per instance. |
+| **Rotations** | Matrix placements carry their own. Position-only placements (all trees) pick one of the pool's preset rotations by the low 3 bits of their scale: a turn about Y of `id / count` of a circle (`rendInstRotationPalette.cpp`), with `count` stored in the level's pool. Position-only pools without a palette have no rotation anywhere in the data and keep the identity. |
+| **Water** (`water`) | One quad at the level settings' `water_level` (`levels/<name>.blk` in `aces.vromfs.bin`) over the landmesh, in the level's `water_aces_color_and_density` colour when it has one, else the bridge's default material. |
+
+Not in the scene, and why:
+
+- **The land shaders' detail layers.** Each class has a splat mask (mega classes) or an index map (the
+  biome class) and tiled detail textures (`detailRed`.., `details{}`), which `LandClassMaterial` lists
+  with their tile sizes, but the shaders that blend them are public only for the indexed class
+  (`make_clipmap.dshl`) and not for the mega and detailed ones, so no blend is invented. The ground is the
+  colour maps blended by the weights. Normals and roughness of the ground are likewise names only.
+- **Water appearance.** The water shader is not public. 154 of the 160 levels have a `water_level`, but
+  only 28 carry `water_aces_color_and_density` (the shader's default is not in the data), and the
+  other 126 planes keep the bridge's default material.
+- **Sun, sky, fog and lights.** The level stores its place and date (`stars{}`); the time of day and the
+  weather come from the mission, and the sky from the atmosphere shader, so `Scene::lights` and
+  `Scene::environment` are empty.
+- **Object shaders.** Layered, perlin and decal materials use their first texture, decals and impostor
+  billboards are left out, and wind, interior mapping and normal and reflectance maps are not applied.
+- **Blocks not decoded:** `SCN`, `FRT`, `Obj`, `Wire`, splines, `wt3d`, `lmct`, and the scatter of
+  objects by land class (`obj_plant_generate`), which the game generates at load time.
+
+The conversion is bounded by budgets that are not game data and live in `SceneOptions`: the colour map
+memory, the baked ground pictures (2 m per pixel where the heightmap is finer than the landmesh, 16 m
+elsewhere, spacings growing together past 384 MB), the terrain vertex count, and the object textures
+(256 px on the longest side). Berlin (512,641 placements of 452 models) loads in about 7 s and peaks near
+1.7 GB; `cargo run --release --features bridge --example render_scene -- $GAME levels/avg_berlin.bin
+out.png --eye 2150,90,1380 --at 2400,40,1560` draws a scene from a camera with a small software
+rasteriser (albedo with a headlight on a flat background, since the game's sun and sky are not in the
+data).
 
 ## Live telemetry (official localhost:8111 API)
 
@@ -208,7 +256,10 @@ The field names and units come from open-source community clients, chiefly the
   Rust with no proprietary library.
 - Materials and texture names come from `dynModelDesc.bin`.
 - Level files follow Dagor's `loadLevel.cpp`, `lmeshManager.cpp`, `heightmapPhysHandler.cpp`,
-  `compressedHeightmap.cpp`, `landRayTracerSoA4.cpp`, `bvhIO.cpp` and `rendInstGen.cpp`. The `HM2`
+  `compressedHeightmap.cpp`, `landRayTracerSoA4.cpp`, `bvhIO.cpp` and `rendInstGen.cpp`; the ground's
+  materials `lmeshLandClasses.cpp`, `lmeshWeightAtlas*.cpp`, `landClsExp.cpp` and `binDumpUtil.cpp`
+  (the read-only data block of land classes); placed objects `rendInstRes.cpp`,
+  `rendInstRotationPalette.cpp` and `genObjUtil.h`. The `HM2`
   heightmap covers the playable area (2 m per sample on tank maps); the landmesh's ray tracer
   covers the whole map at its own resolution and is rasterised into the same kind of grid.
 - The sound bank and FSB5 readers follow the layouts documented by the community in

@@ -86,6 +86,13 @@ enum Command {
         /// Write the textures stored inside the level (e.g. its lightmap) as PNG files to this directory
         #[arg(long)]
         textures: Option<PathBuf>,
+        /// Build the level's rewrite-bridge scene and print what is in it and what is missing (needs the
+        /// bridge feature; the game folder is the one holding levels/)
+        #[arg(long)]
+        scene_stats: bool,
+        /// Distance in metres the object LODs are chosen for (with --scene-stats)
+        #[arg(long)]
+        lod_distance: Option<f32>,
     },
     /// Parse every level file in a folder and summarise what decodes
     CheckLevels { dir: PathBuf },
@@ -189,8 +196,12 @@ fn main() -> Result<()> {
         Command::Model { pack, name, game, out, lod } => model_cmd(&pack, &name, &game, &out, lod),
         #[cfg(feature = "bridge")]
         Command::CheckBridge { game, filter, list } => check_bridge(&game, &filter, list),
-        Command::Level { file, heightmap, gltf, terrain, cell, objects, textures } => {
-            level_cmd(&file, heightmap.as_deref(), gltf.as_deref(), terrain, cell, objects, textures.as_deref())
+        Command::Level { file, heightmap, gltf, terrain, cell, objects, textures, scene_stats, lod_distance } => {
+            level_cmd(&file, heightmap.as_deref(), gltf.as_deref(), terrain, cell, objects, textures.as_deref())?;
+            if scene_stats {
+                scene_stats_cmd(&file, lod_distance)?;
+            }
+            Ok(())
         }
         Command::CheckLevels { dir } => check_levels(&dir),
         Command::Sound { command } => match command {
@@ -209,10 +220,7 @@ fn open(path: &Path) -> Result<Vromfs> {
 
 /// Loads the shared name map and zstd dictionary that slim BLK files need.
 fn shared_context(vfs: &Vromfs) -> Result<Option<SharedContext>> {
-    let Some(nm) = vfs.get(vromfs::SHARED_NAMEMAP_NAME) else { return Ok(None) };
-    let (mut ctx, dict_name) = SharedContext::from_namemap(&nm.data)?;
-    ctx.dict = vfs.get(&dict_name).map(|f| f.data.clone());
-    Ok(Some(ctx))
+    vromfs::shared_context(vfs)
 }
 
 fn list(path: &Path) -> Result<()> {
@@ -477,6 +485,24 @@ fn level_cmd(
             lm.cells[0], lm.cells[1], lm.land_cell_size, e[0], e[1], e[2], e[3], lm.grid_cell_size, lm.tracer_kind()
         );
     }
+    if let Some(lm) = &lmesh {
+        let map = lm.detail_map()?;
+        let names: Vec<&str> = map.land_classes.iter().map(|c| c.name.as_str()).collect();
+        println!(
+            "detail map: {}x{} cells, {} land classes ({}), {}",
+            map.width,
+            map.height,
+            names.len(),
+            names.join(", "),
+            match &map.weights {
+                wt_unpack::level::DetailWeights::Legacy { .. } => format!("per-cell weight textures of {0}x{0}", map.elem_size),
+                wt_unpack::level::DetailWeights::Packed { page_count, .. } => format!("packed atlas of {page_count} pages"),
+            }
+        );
+        if let Some(v) = &lm.vertical {
+            println!("vertical texture: {} (detail {}), blend from {} to {} m", v.texture, v.detail_texture, v.blend_from_y, v.blend_to_y);
+        }
+    }
     let hm = level.heightmap()?;
     if let Some(h) = &hm {
         println!(
@@ -566,6 +592,7 @@ fn check_levels(dir: &Path) -> Result<()> {
     let mut paths: Vec<_> = fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "bin")).collect();
     paths.sort();
     let (mut full, mut hm2, mut tracer, mut no_terrain, mut objects) = (0, 0, 0, 0, 0usize);
+    let (mut legacy_maps, mut packed_maps, mut inline_classes, mut palette_pools) = (0, 0, 0usize, 0usize);
     for path in &paths {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let raw = fs::read(path)?;
@@ -589,11 +616,25 @@ fn check_levels(dir: &Path) -> Result<()> {
             if terrain.is_empty() {
                 no_terrain += 1;
             }
+            let map = lm.detail_map()?;
+            let kind = match &map.weights {
+                wt_unpack::level::DetailWeights::Legacy { .. } => {
+                    legacy_maps += 1;
+                    "per-cell textures"
+                }
+                wt_unpack::level::DetailWeights::Packed { .. } => {
+                    packed_maps += 1;
+                    "packed atlas"
+                }
+            };
+            inline_classes += map.land_classes.iter().filter(|c| !c.inline_data.is_empty()).count();
+            terrain.push(format!("{} land classes, {}x{} weight cells ({kind})", map.land_classes.len(), map.width, map.height));
             let mut n = 0;
             for layer in level.rendinst_layers()? {
                 let inst = layer.instances()?;
                 ensure_counts(&layer.counts(), inst.len())?;
                 n += inst.len();
+                palette_pools += layer.pools.iter().filter(|p| p.palette_rotation).count();
             }
             objects += n;
             Ok(format!("{} blocks, {res} resources, {tex} textures, {}, {n} objects", level.blocks.len(), terrain.join(", ")))
@@ -610,6 +651,7 @@ fn check_levels(dir: &Path) -> Result<()> {
         "{full}/{} levels parse fully; terrain: {hm2} with HM2, {tracer} with a land ray tracer, {no_terrain} with neither; {objects} placed objects",
         paths.len()
     );
+    println!("ground weights: {legacy_maps} levels with per-cell weight textures, {packed_maps} with a packed atlas; {inline_classes} land classes stored inline; {palette_pools} rotation-palette pools");
     Ok(())
 }
 
@@ -617,6 +659,73 @@ fn ensure_counts(counts: &[usize], decoded: usize) -> Result<()> {
     let total: usize = counts.iter().sum();
     anyhow::ensure!(total == decoded, "counters promise {total} objects, {decoded} decoded");
     Ok(())
+}
+
+#[cfg(feature = "bridge")]
+fn scene_stats_cmd(file: &Path, lod_distance: Option<f32>) -> Result<()> {
+    use rewrite_bridge::SceneModel;
+    use wt_unpack::bridge::WarThunder;
+    use wt_unpack::scene::{SceneOptions, NOT_APPLIED};
+
+    let game = file.canonicalize()?.parent().and_then(Path::parent).map(Path::to_path_buf).context("a level file lives in <game>/levels")?;
+    let id = format!("levels/{}", file.file_name().context("no file name")?.to_string_lossy());
+    let mut options = SceneOptions::default();
+    if let Some(d) = lod_distance {
+        options.lod_distance_m = d;
+    }
+    let wt = WarThunder::new(&game).with_scene_options(options);
+    let start = std::time::Instant::now();
+    let (scene, r) = wt.load_level(&id)?;
+    let loaded = start.elapsed();
+    let distinct = scene.models.len();
+    println!();
+    println!("scene {}: {} distinct models, {} instances (validated, loaded in {:.1} s, peak RSS {} MB)", scene.name, distinct, scene.instances.len(), loaded.as_secs_f32(), peak_rss() >> 20);
+    println!("  terrain: {} tiles, {} triangles ({}{}), ground colours {}", r.terrain_tiles, r.terrain_triangles, if r.landmesh { "landmesh" } else { "no landmesh" }, if r.heightmap { " + HM2" } else { "" }, if r.ground_textured { format!("from {} land classes", r.land_classes) } else { "not available".into() });
+    match r.water_level {
+        Some(l) => println!("  water: plane at {l} m (level settings), colour {}", r.water_colour.map_or("not in the level (default material)".to_string(), |c| format!("{c:?} (water_aces_color_and_density)"))),
+        None => println!("  water: none (the level settings have no water_level)"),
+    }
+    println!("  objects: {} models resolved, {} placements, {} triangles in the models, {} drawn in all, {} textured materials", r.object_models, r.instances, r.object_triangles, r.drawn_triangles, r.object_textures);
+    let mut heavy: Vec<(usize, usize, &str)> = Vec::new();
+    for m in &scene.models {
+        if let SceneModel::Inline(m) = m {
+            let n = scene.instances.iter().filter(|i| matches!(&scene.models[i.model], SceneModel::Inline(x) if std::ptr::eq(x, m))).count();
+            heavy.push((n, m.meshes.iter().map(|x| x.indices.len() / 3).sum(), m.name.as_str()));
+        }
+    }
+    heavy.sort_by_key(|h| std::cmp::Reverse(h.0));
+    for (n, t, name) in heavy.iter().take(8) {
+        println!("    {n:>7} x {name} ({t} triangles)");
+    }
+    println!("  rotation: {} palette pools; {} placements of position-only pools without a palette keep identity rotation (the level stores none)", r.palette_pools, r.trees_without_rotation);
+    println!("  memory estimate: {} MB of meshes, images and instances", r.memory_bytes >> 20);
+    let lost: usize = r.unresolved.iter().map(|(_, n)| n).sum();
+    println!("  unresolved pools (no model in any pack): {} pools, {} placements", r.unresolved.len(), lost);
+    for (n, c) in r.unresolved.iter().take(10) {
+        println!("    {c:>7} x {n}");
+    }
+    for (n, e) in r.failed.iter().take(10) {
+        println!("  failed: {n}: {e}");
+    }
+    if !r.skipped_classes.is_empty() {
+        println!("  draw calls left out by material class: {:?}", r.skipped_classes);
+    }
+    if !r.approximated_classes.is_empty() {
+        println!("  draw calls with first texture only, by material class: {:?}", r.approximated_classes);
+    }
+    for w in r.warnings.iter().take(20) {
+        println!("  warning: {w}");
+    }
+    println!("  not applied (data the scene does not carry):");
+    for n in NOT_APPLIED {
+        println!("    - {n}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "bridge"))]
+fn scene_stats_cmd(_file: &Path, _lod_distance: Option<f32>) -> Result<()> {
+    anyhow::bail!("--scene-stats needs the bridge feature: cargo build --release --features bridge")
 }
 
 /// Peak resident memory of this process so far, in bytes
@@ -645,7 +754,8 @@ fn check_bridge(game: &Path, filter: &str, list_only: bool) -> Result<()> {
 
     let start = Instant::now();
     let wt = WarThunder::new(game);
-    let assets = wt.list(filter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut assets = wt.list(filter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    assets.retain(|a| a.kind == rewrite_bridge::AssetKind::Vehicle);
     eprintln!("{} vehicles listed in {:.1} s", assets.len(), start.elapsed().as_secs_f32());
     if list_only {
         for a in &assets {

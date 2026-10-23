@@ -12,6 +12,8 @@ pub mod landclass;
 pub mod level;
 pub mod rendinst;
 pub mod rodb;
+#[cfg(feature = "bridge")]
+pub mod scene;
 pub mod live;
 pub mod sound;
 pub mod tank;

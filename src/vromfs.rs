@@ -96,6 +96,14 @@ impl Vromfs {
     }
 }
 
+/// Loads the shared name map and zstd dictionary that slim BLK files in an archive depend on
+pub fn shared_context(vfs: &Vromfs) -> Result<Option<crate::blk::SharedContext>> {
+    let Some(nm) = vfs.get(SHARED_NAMEMAP_NAME) else { return Ok(None) };
+    let (mut ctx, dict_name) = crate::blk::SharedContext::from_namemap(&nm.data)?;
+    ctx.dict = vfs.get(&dict_name).map(|f| f.data.clone());
+    Ok(Some(ctx))
+}
+
 fn deobfuscate(data: &mut [u8]) {
     let len = data.len();
     if len < 16 {

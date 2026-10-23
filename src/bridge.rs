@@ -15,6 +15,9 @@
 //! turning a node (the turret about Y, the gun about X) turns its subtree in the vehicle's own axes.
 //! Dagor's node axes vary from node to node and many are mirrored, which a glTF node cannot hold.
 //!
+//! Levels are scenes: `levels/avg_berlin.bin` is listed as [`AssetKind::Level`] and loaded with
+//! `load_scene` (see [`crate::scene`]).
+//!
 //! Skinned meshes (tracks, cables) become skins with the game's own bones and weights: each vertex
 //! follows up to four skeleton nodes, taken from the model's bone table (a track follows the `root` node
 //! and the suspension wheel nodes `bone_wheel_<l|r>_<NN>`). A skin's inverse bind matrices undo the
@@ -26,9 +29,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
-use rewrite_bridge::{AlphaMode, AssetInfo, AssetKind, BoxError, Image, Material, Mesh, Model, Node, Provider, Skin};
+use rewrite_bridge::{AlphaMode, AssetInfo, AssetKind, BoxError, Image, Material, Mesh, Model, Node, Provider, Scene, Skin};
 use wt_blk::dxp_and_grp::grp_pack::{class_id, GrpPack};
 
+use crate::scene::{load_level_scene, SceneOptions, SceneReport};
 use crate::vehicle::{self, Library, Vehicle};
 
 /// Folders of `content/base/res` that hold vehicles
@@ -40,12 +44,54 @@ const VARIANTS: [&str; 3] = ["_dmg", "_xray", "_dm"];
 pub struct WarThunder {
     game: PathBuf,
     library: OnceLock<Library>,
+    scene_options: SceneOptions,
 }
 
 impl WarThunder {
     /// `game` is the installed game's folder, the one holding `content` and `aces.vromfs.bin`
     pub fn new(game: impl Into<PathBuf>) -> Self {
-        Self { game: game.into(), library: OnceLock::new() }
+        Self { game: game.into(), library: OnceLock::new(), scene_options: SceneOptions::default() }
+    }
+
+    /// Sets the budget parameters of [`Provider::load_scene`]
+    pub fn with_scene_options(mut self, options: SceneOptions) -> Self {
+        self.scene_options = options;
+        self
+    }
+
+    /// Levels (`levels/*.bin`), as `levels/<name>.bin`
+    fn list_levels(&self, filter: &str) -> Vec<AssetInfo> {
+        let Ok(rd) = std::fs::read_dir(self.game.join("levels")) else { return Vec::new() };
+        let mut out: Vec<AssetInfo> = rd
+            .flatten()
+            .filter_map(|e| {
+                let file = e.file_name().to_string_lossy().into_owned();
+                let stem = file.strip_suffix(".bin")?;
+                let id = format!("levels/{file}");
+                id.contains(filter).then(|| AssetInfo { id, name: stem.to_string(), kind: AssetKind::Level })
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// The file of a level named like `levels/avg_berlin.bin`
+    fn level_file(&self, id: &str) -> Result<PathBuf> {
+        let path = Path::new(id);
+        let ok = path.components().all(|c| matches!(c, Component::Normal(_))) && id.starts_with("levels/") && id.ends_with(".bin") && id.matches('/').count() == 1;
+        if !ok {
+            bail!("{id} is not a level");
+        }
+        let file = self.game.join(path);
+        if !file.is_file() {
+            bail!("no level {id}");
+        }
+        Ok(file)
+    }
+
+    /// Loads a level with the report of what went into it
+    pub fn load_level(&self, id: &str) -> Result<(Scene, SceneReport)> {
+        load_level_scene(&self.game, &self.level_file(id)?, &self.scene_options)
     }
 
     /// The texture index and material descriptions, gathered on first use
@@ -125,11 +171,20 @@ impl Provider for WarThunder {
     }
 
     fn list(&self, filter: &str) -> Result<Vec<AssetInfo>, BoxError> {
-        Ok(self.list_vehicles(filter)?)
+        let mut out = self.list_vehicles(filter)?;
+        out.extend(self.list_levels(filter));
+        Ok(out)
     }
 
     fn load(&self, id: &str) -> Result<Model, BoxError> {
+        if id.starts_with("levels/") {
+            return Err(format!("{id} is a level: load it with load_scene").into());
+        }
         Ok(self.load_vehicle(id)?)
+    }
+
+    fn load_scene(&self, id: &str) -> Result<Scene, BoxError> {
+        Ok(self.load_level(id)?.0)
     }
 }
 
@@ -298,6 +353,18 @@ mod tests {
         assert_eq!(m.nodes[2].translation, [1.0, 0.0, 0.0]);
         // Glass blends
         assert_eq!((m.materials[0].alpha, m.materials[1].alpha), (AlphaMode::Opaque, AlphaMode::Blend));
+    }
+
+    #[test]
+    fn level_ids_name_level_files_only() {
+        let wt = WarThunder::new("/nonexistent");
+        assert!(wt.level_file("levels/../x.bin").is_err());
+        assert!(wt.level_file("levels/sub/x.bin").is_err());
+        assert!(wt.level_file("tanks/x.bin").is_err());
+        assert!(wt.level_file("levels/x.grp").is_err());
+        assert!(wt.level_file("levels/x.bin").unwrap_err().to_string().contains("no level"));
+        assert!(wt.load("levels/avg_berlin.bin").unwrap_err().to_string().contains("load_scene"));
+        assert!(wt.list_levels("").is_empty());
     }
 
     #[test]

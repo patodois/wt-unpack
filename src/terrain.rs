@@ -110,6 +110,32 @@ impl HeightGrid {
         filled
     }
 
+    /// Height at a world position, interpolated between the four samples around it; `NaN` outside the
+    /// grid or where any of them is uncovered
+    pub fn height_at(&self, x: f32, z: f32) -> f32 {
+        let fx = (x - self.origin[0]) / self.cell_size;
+        let fz = (z - self.origin[1]) / self.cell_size;
+        if !(fx >= 0.0 && fz >= 0.0) || fx > (self.width - 1) as f32 || fz > (self.height - 1) as f32 {
+            return f32::NAN;
+        }
+        let (x0, z0) = ((fx.floor() as usize).min(self.width.saturating_sub(2)), (fz.floor() as usize).min(self.height.saturating_sub(2)));
+        let (ax, az) = (fx - x0 as f32, fz - z0 as f32);
+        let at = |dx: usize, dz: usize| self.heights[(z0 + dz).min(self.height - 1) * self.width + (x0 + dx).min(self.width - 1)];
+        let (a, b, c, d) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
+        (a * (1.0 - ax) + b * ax) * (1.0 - az) + (c * (1.0 - ax) + d * ax) * az
+    }
+
+    /// Like [`HeightGrid::height_at`], but a position up to one sample beyond the grid's edge takes the edge's
+    /// height (the rasterised landmesh stops at its last vertex, short of the world box's edge)
+    pub fn height_near(&self, x: f32, z: f32) -> f32 {
+        let (w, h) = ((self.width - 1) as f32 * self.cell_size, (self.height - 1) as f32 * self.cell_size);
+        let (dx, dz) = (x - self.origin[0], z - self.origin[1]);
+        if dx < -self.cell_size || dz < -self.cell_size || dx > w + self.cell_size || dz > h + self.cell_size {
+            return f32::NAN;
+        }
+        self.height_at(self.origin[0] + dx.clamp(0.0, w), self.origin[1] + dz.clamp(0.0, h))
+    }
+
     /// Lowest and highest covered height, if any sample is covered
     pub fn range(&self) -> Option<(f32, f32)> {
         let mut it = self.heights.iter().copied().filter(|h| !h.is_nan());
@@ -287,6 +313,22 @@ mod tests {
         assert_eq!(coarse.fill_from(&fine), 1);
         assert_eq!(coarse.heights[4], 7.0);
         assert_eq!(coarse.covered(), 9);
+    }
+
+    #[test]
+    fn heights_interpolate_and_stop_at_the_edge() {
+        let mut mesh = square();
+        mesh.positions[3][1] = 15.0;
+        let grid = HeightGrid::rasterize(&mesh, 5.0).unwrap();
+        assert_eq!(grid.height_at(5.0, 5.0), 5.0);
+        assert_eq!(grid.height_at(5.0, 10.0), 10.0);
+        assert_eq!(grid.height_at(10.0, 10.0), 15.0);
+        assert!((grid.height_at(7.5, 5.0) - 7.5).abs() < 1e-5);
+        assert!(grid.height_at(-0.1, 5.0).is_nan() && grid.height_at(5.0, 10.1).is_nan());
+        // Within one sample of the edge the edge's height stands in; farther out there is none
+        assert_eq!(grid.height_near(-1.0, 5.0), grid.height_at(0.0, 5.0));
+        assert_eq!(grid.height_near(5.0, 14.0), grid.height_at(5.0, 10.0));
+        assert!(grid.height_near(-5.1, 5.0).is_nan());
     }
 
     #[test]

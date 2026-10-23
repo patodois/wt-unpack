@@ -6,7 +6,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+use wt_unpack::landclass::{self, GroundMaterial, LandClassKind};
 use wt_unpack::level::Level;
+use wt_unpack::rendinst::{ResourceIndex, RiModel, LAND_CLASS, REND_INST};
 use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::terrain::HeightGrid;
 use wt_unpack::gear::{RadiusSource, RunningGear, Side, WheelKind};
@@ -263,6 +265,98 @@ fn berlin_level_has_terrain_and_placed_objects() {
     assert!(layers[0].pools.iter().any(|p| p.name.starts_with("liveoak_")));
 }
 
+/// The ground's material data: the level's land classes by name, their weights per cell, and the
+/// land class resources in the game's packs
+#[test]
+fn berlin_ground_material_comes_from_the_level_and_its_land_classes() {
+    let Some(game) = game() else { return };
+    let raw = fs::read(game.join("levels/avg_berlin.bin")).unwrap();
+    let level = Level::parse(&raw).unwrap();
+    let map = level.landmesh().unwrap().unwrap().detail_map().unwrap();
+    // One weight texture of 128 x 128 per landmesh cell (4096 m), so a texel is 32 m
+    assert_eq!((map.width, map.height, map.elem_size), (16, 16, 128));
+    let names: Vec<&str> = map.land_classes.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["berlin_fields_a", "berlin_fields_b", "berlin_forest", "berlin_village", "berlin_city_b", "berlin_coast", "berlin_detailed_biome", "berlin_forest_b"]);
+
+    let index = ResourceIndex::build(&game, &[LAND_CLASS]).unwrap();
+    let ground = GroundMaterial::load(&level, &index).unwrap().unwrap();
+    assert!(ground.errors.is_empty(), "{:?}", ground.errors);
+    let class = |name: &str| ground.classes.iter().flatten().find(|c| c.name == name).unwrap_or_else(|| panic!("no land class {name}"));
+    let city = class("berlin_city_b");
+    assert_eq!((city.kind, city.colormap.as_deref(), city.size), (LandClassKind::Mega, Some("berlin_city_b*"), [2048.0, 2048.0]));
+    assert_eq!(city.splat_map.as_deref(), Some("berlin_city_a_tex_m"));
+    let red = &city.layers[0];
+    assert_eq!((red.slot.as_str(), red.albedo.as_deref(), red.tile_m), ("Red", Some("detail_jungle_grass_fields_tex_d"), Some(31.0)));
+    let biome = class("berlin_detailed_biome");
+    assert_eq!((biome.kind, biome.shader.as_deref()), (LandClassKind::Indexed, Some("landmesh_indexed_landclass")));
+    assert!(biome.layers.len() > 50);
+    assert!(biome.extra_textures.contains(&("indices".to_string(), "berlin_detailed_biome_tex_b".to_string())));
+
+    // The game's own copy of a land class holds the same kind of data
+    let path = index.find(LAND_CLASS, "berlin_detailed_biome").expect("the biome land class is in a pack");
+    let file = fs::read(path).unwrap();
+    let pack = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+    let res = pack.find("berlin_detailed_biome", LAND_CLASS).unwrap();
+    let from_pack = landclass::LandClassMaterial::from_block("berlin_detailed_biome", &landclass::resource_detail(pack.data(res)).unwrap());
+    assert_eq!((from_pack.kind, from_pack.size, from_pack.colormap.as_deref()), (LandClassKind::Indexed, [4096.0, 4096.0], Some("berlin_detailed_biome_tex_d")));
+
+    // Weights blend to 1 everywhere, and the tank battle area (cell 7, 11) is the biome class's
+    let weights = ground.weights.as_ref().unwrap();
+    let mut blend = Vec::new();
+    for (x, z) in [(2048.0, 2048.0), (100.0, 4000.0), (-20000.0, -30000.0), (30000.0, 15000.0)] {
+        weights.at(x, z, &mut blend);
+        let sum: f32 = blend.iter().map(|b| b.1).sum();
+        assert!((sum - 1.0).abs() < 0.02, "({x}, {z}): {blend:?}");
+    }
+    weights.at(2048.0, 1500.0, &mut blend);
+    assert!(blend.iter().any(|&(c, w)| c == 6 && w > 0.5), "{blend:?}");
+}
+
+/// Placed-object models are RendInst resources, and trees turn by their palette
+#[test]
+fn berlin_objects_resolve_to_rendinst_models_and_trees_have_rotation() {
+    let Some(game) = game() else { return };
+    let index = ResourceIndex::build(&game, &[REND_INST]).unwrap();
+    let model = |name: &str| {
+        let path = index.find(REND_INST, name).unwrap_or_else(|| panic!("{name} is in no pack"));
+        let file = fs::read(path).unwrap();
+        let pack = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+        let res = pack.find(name, REND_INST).unwrap();
+        RiModel::parse(pack.data(res)).unwrap()
+    };
+    // A house: 24 m tall, two LODs, the first used up to 100 m
+    let house = model("berlin_city_build_1");
+    assert_eq!(house.lods.iter().map(|l| l.range).collect::<Vec<_>>(), [100.0, 8000.0]);
+    assert!(house.bbox[1][1] > 24.0 && house.bbox[0][1] < 0.0);
+    assert!(house.triangles(0) > house.triangles(1));
+    assert_eq!(house.lod_for_distance(50.0), 0);
+    assert_eq!(house.lod_for_distance(250.0), 1);
+    // A tree: its last LOD is the billboard impostor, which is never a mesh LOD
+    let oak = model("liveoak_03_rendinst");
+    assert!(oak.has_impostor && oak.lods.len() == 3);
+    assert_eq!(oak.lod_for_distance(1.0e6), 1);
+
+    let raw = fs::read(game.join("levels/avg_berlin.bin")).unwrap();
+    let level = Level::parse(&raw).unwrap();
+    let layers = level.rendinst_layers().unwrap();
+    let layer = &layers[0];
+    let pool = layer.pools.iter().position(|p| p.name == "liveoak_03_rendinst").unwrap();
+    let p = &layer.pools[pool];
+    assert!(p.pos_only && p.palette_rotation && p.palette_count > 1, "{p:?}");
+    // The palette's rotations are turns of i / count about Y: every instance has a turned frame, with
+    // as many distinct turns as the palette has presets
+    let mut turns = std::collections::BTreeSet::new();
+    for inst in layer.instances().unwrap().iter().filter(|i| i.pool == pool) {
+        let [x, y, z, _] = inst.tm;
+        let s = y[1];
+        assert!(s > 0.0 && (x[0] * x[0] + x[2] * x[2]).sqrt() - s < 1e-3 * s.max(1.0), "{inst:?}");
+        // x axis (cos, 0, sin) and z axis (-sin, 0, cos), times the scale
+        assert!((x[0] - z[2]).abs() < 1e-4 && (x[2] + z[0]).abs() < 1e-4);
+        turns.insert((x[2].atan2(x[0]) / std::f32::consts::TAU * p.palette_count as f32).round().rem_euclid(p.palette_count as f32) as usize);
+    }
+    assert_eq!(turns.len(), p.palette_count, "{turns:?}");
+}
+
 #[test]
 fn kamchatka_terrain_comes_from_the_lts4_tracer() {
     let Some(game) = game() else { return };
@@ -375,4 +469,52 @@ fn tank_engine_bank_lists_and_decodes() {
     let last = ogg.windows(4).rposition(|w| w == b"OggS").unwrap();
     assert_eq!(ogg[last + 5] & 4, 4);
     assert_eq!(u64::from_le_bytes(ogg[last + 6..last + 14].try_into().unwrap()), u64::from(idle.frames));
+}
+
+/// Levels are scenes: listed as levels, validated, with their placed objects, ground and water
+#[cfg(feature = "bridge")]
+#[test]
+fn berlin_loads_as_a_scene_through_the_bridge() {
+    use rewrite_bridge::{AssetKind, Provider, SceneModel};
+    let Some(game) = game() else { return };
+    let wt = wt_unpack::bridge::WarThunder::new(&game);
+    let listed = wt.list("levels/avg_berlin").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].id.as_str(), listed[0].kind), ("levels/avg_berlin.bin", AssetKind::Level));
+    // A level is not a model
+    assert!(wt.load("levels/avg_berlin.bin").is_err());
+
+    let scene = wt.load_scene("levels/avg_berlin.bin").unwrap();
+    scene.validate().unwrap();
+    assert_eq!(scene.name, "avg_berlin");
+    let inline = |i: usize| match &scene.models[i] {
+        SceneModel::Inline(m) => m,
+        other => panic!("model {i} is {other:?}"),
+    };
+    let by_name = |name: &str| (0..scene.models.len()).find(|&i| inline(i).name == name).unwrap_or_else(|| panic!("no model {name}"));
+    let count = |model: usize| scene.instances.iter().filter(|i| i.model == model).count();
+
+    // The placed objects: the level's 512,641 instances of 452 resolved models, one model each
+    assert_eq!(count(by_name("liveoak_03_rendinst")), 321_161);
+    assert_eq!(count(by_name("berlin_city_build_1")), 1_878);
+    assert!(scene.instances.len() > 512_000 && scene.models.len() < 460, "{} instances of {} models", scene.instances.len(), scene.models.len());
+    let house = inline(by_name("berlin_city_build_1"));
+    assert!(house.materials.iter().any(|m| m.base_color.is_some()));
+
+    // The ground: one tile per landmesh cell, textured, from -28672 to 36864 in the game's X (the bridge's Z)
+    let terrain = inline(by_name("terrain"));
+    assert_eq!(terrain.meshes.len(), 256);
+    assert!(terrain.materials.iter().all(|m| m.base_color.is_some()));
+    let z_max = terrain.meshes.iter().flat_map(|m| m.positions.iter().map(|p| p[2])).fold(f32::MIN, f32::max);
+    assert!((z_max - 36864.0).abs() < 1.0, "{z_max}");
+    let heights = terrain.meshes.iter().flat_map(|m| m.positions.iter().map(|p| p[1]));
+    let (lo, hi) = heights.fold((f32::MAX, f32::MIN), |(l, h), y| (l.min(y), h.max(y)));
+    assert!(lo > -20.0 && hi < 205.0 && hi - lo > 40.0, "{lo}..{hi}");
+
+    // The water: the level's own water_level and colour
+    let water = inline(by_name("water"));
+    assert!(water.meshes[0].positions.iter().all(|p| p[1] == 35.0));
+    assert_eq!(water.materials[0].base_color_factor, [0.82, 0.71, 0.58, 1.0]);
+    // Sun, sky and lights are not in the level's data
+    assert!(scene.lights.is_empty() && scene.environment.is_none());
 }

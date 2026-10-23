@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use wt_unpack::landclass::{self, GroundMaterial, LandClassKind};
 use wt_unpack::level::Level;
-use wt_unpack::rendinst::{ResourceIndex, RiModel, LAND_CLASS, REND_INST};
+use wt_unpack::rendinst::{is_facing_leaves, model_descs_where, ResourceIndex, RiModel, LAND_CLASS, REND_INST};
 use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::terrain::HeightGrid;
 use wt_unpack::collision::{Collision, NodeKind, COLLISION};
@@ -473,6 +473,86 @@ fn berlin_objects_resolve_to_rendinst_models_and_trees_have_rotation() {
         turns.insert((x[2].atan2(x[0]) / std::f32::consts::TAU * p.palette_count as f32).round().rem_euclid(p.palette_count as f32) as usize);
     }
     assert_eq!(turns.len(), p.palette_count, "{turns:?}");
+}
+
+/// The material class of each material of a placed-object model, from riDesc.bin
+fn material_classes(game: &std::path::Path, name: &str) -> Vec<String> {
+    let descs = model_descs_where(game, |n| n == name).unwrap();
+    let desc = descs.get(name).unwrap_or_else(|| panic!("{name} is not in riDesc.bin"));
+    let mats = desc.blocks.iter().find(|b| b.name == "mat").unwrap();
+    mats.blocks
+        .iter()
+        .map(|m| m.params.iter().find_map(|(n, v)| if n == "cls" { if let blk::Value::Str(s) = v { Some(s.clone()) } else { None } } else { None }).unwrap_or_default())
+        .collect()
+}
+
+fn load_rendinst(game: &std::path::Path, name: &str) -> RiModel {
+    let index = ResourceIndex::build(game, &[REND_INST]).unwrap();
+    let file = fs::read(index.find(REND_INST, name).unwrap_or_else(|| panic!("{name} is in no pack"))).unwrap();
+    let pack = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+    RiModel::parse(pack.data(pack.find(name, REND_INST).unwrap())).unwrap()
+}
+
+/// The leaf cards of trees (`rendinst_facing_leaves`) are four vertices around one centre, moved by the
+/// shader: their 24-byte vertices are not laid out as the buffer's declaration of the trunk says, and read
+/// that way they land 1e11 m from the tree. Read as the shader's layout they sit inside the model's box and
+/// are the very centres and corner offsets the file lists in its impostor data.
+#[test]
+fn facing_leaves_decode_to_the_centres_and_corners_the_file_lists() {
+    let Some(game) = game() else { return };
+    for name in ["liveoak_01_rendinst", "liveoak_03_rendinst", "bush3_r_rendinst"] {
+        let model = load_rendinst(&game, name);
+        let classes = material_classes(&game, name);
+        let shadow = &model.impostor_data.as_ref().unwrap().shadow_points;
+        let (mut leaf_elems, mut trunk_vertices) = (0, 0);
+        for (l, lod) in model.lods.iter().enumerate() {
+            for e in &lod.elems {
+                let vd = &model.vdata[e.vdata];
+                let range = &vd.indices[e.first_index..e.first_index + e.triangles * 3];
+                let mut unique: Vec<usize> = range.iter().map(|&i| i as usize + e.base_vertex).collect();
+                unique.sort_unstable();
+                unique.dedup();
+                if !is_facing_leaves(&classes[e.material]) {
+                    // Everything else in a tree is the declaration's layout, and inside the box
+                    for &v in &unique {
+                        let p = model.vertex(vd, v).unwrap().pos;
+                        assert!((0..3).all(|k| p[k] >= model.bbox[0][k] - 0.1 && p[k] <= model.bbox[1][k] + 0.1), "{name} lod {l}: {p:?}");
+                    }
+                    trunk_vertices += unique.len();
+                    continue;
+                }
+                leaf_elems += 1;
+                // Four vertices per card, every card's centre inside the model's box
+                assert_eq!(unique.len() % 4, 0, "{name}");
+                for &v in &unique {
+                    let c = model.leaf_vertex(vd, v).unwrap().centre;
+                    assert!((0..3).all(|k| c[k] >= model.bbox[0][k] - 0.1 && c[k] <= model.bbox[1][k] + 0.1), "{name} lod {l}: {c:?} outside {:?}", model.bbox);
+                }
+                if l == 0 {
+                    // The file's list is made from LOD 0 with the centres' Y clamped to 0 and above. Each
+                    // vertex is one of its records, to the precision of a half float, and none is left over.
+                    assert_eq!(unique.len(), shadow.len(), "{name}");
+                    let mut left: Vec<_> = shadow.iter().collect();
+                    for &v in &unique {
+                        let lv = model.leaf_vertex(vd, v).unwrap();
+                        let c = [lv.centre[0], lv.centre[1].max(0.0), lv.centre[2]];
+                        let near = |a: f32, b: f32| (a - b).abs() <= 0.0011 * b.abs() + 2e-4;
+                        let at = left.iter().position(|b| (0..3).all(|k| near(c[k], b[0][k]) && near(lv.corner[k], b[1][k]))).unwrap_or_else(|| panic!("{name}: leaf vertex {v} {lv:?} is not in the impostor data"));
+                        left.swap_remove(at);
+                    }
+                    assert!(left.is_empty());
+                }
+            }
+        }
+        assert!(leaf_elems >= 2 && trunk_vertices > 0, "{name}: {leaf_elems} leaf elements, {trunk_vertices} other vertices");
+    }
+    // The impostor data also says how far a card's corner reaches from its centre
+    let oak = load_rendinst(&game, "liveoak_01_rendinst");
+    let reach = oak.impostor_data.as_ref().unwrap().max_facing_leaves_delta;
+    assert!((reach - 15.7074).abs() < 1e-3, "{reach}");
+    // A layout the shader does not ask for is refused rather than read as leaves
+    let trunk = &oak.vdata[0];
+    assert!(oak.leaf_vertex(trunk, 0).is_err());
 }
 
 #[test]

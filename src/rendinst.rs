@@ -17,6 +17,11 @@
 //!                      part); if the voxel offset is not 0: i32 size, voxel surface data
 //! ```
 //!
+//! Not every element's vertices follow the vertex declaration stored with the buffer: the declaration
+//! describes the buffer's first meshes, but the layout of an element's vertices is the one its shader
+//! asks for, and a buffer can hold several. `rendinst_facing_leaves` elements (camera-facing leaf cards of
+//! trees) are the case this reader knows: see [`LeafVertex`] and [`is_facing_leaves`].
+//!
 //! A LOD's `range` is the distance up to which it is used. A model with an impostor has one more LOD
 //! at the end: a camera-facing billboard (material class `rendinst_baked_impostor`).
 
@@ -69,6 +74,25 @@ pub struct RiModel {
     pub lods: Vec<RiLod>,
     pub bbox: [[f32; 3]; 2],
     pub has_impostor: bool,
+    /// What `RenderableInstanceLodsResource::ImpostorData` records about the model, for models that have it
+    pub impostor_data: Option<ImpostorData>,
+}
+
+/// `RenderableInstanceLodsResource::ImpostorData`, written by `RenderableInstanceLodsResSrc::save`
+/// (`rendInstResSrc.cpp`): the points the impostor is baked from, and the extent of the facing leaves
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImpostorData {
+    /// Vertices of the mesh LODs, as the builder saw them (Y clamped to 0 or above)
+    pub points: Vec<[f32; 3]>,
+    /// One box per distinct (vertex, leaf corner) of a `facing_leaves` material: the leaf's centre (Y
+    /// clamped to 0 or above, like [`ImpostorData::points`]) and the corner delta from its extra channel 0
+    pub shadow_points: Vec<[[f32; 3]; 2]>,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub cyl_rad: f32,
+    /// The largest |x| or |y| of any facing-leaf corner delta, in metres
+    pub max_facing_leaves_delta: f32,
+    pub bbox_aspect_ratio: f32,
 }
 
 /// One decoded vertex
@@ -77,6 +101,41 @@ pub struct RiVertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+}
+
+/// Whether a material class is a camera-facing leaf card (`rendinst_facing_leaves`). The vertices of its
+/// elements are [`LeafVertex`] records, not what the buffer's declaration says (see [`RiModel::leaf_vertex`]).
+pub fn is_facing_leaves(class: &str) -> bool {
+    class.contains("facing_leaves")
+}
+
+/// One vertex of a `rendinst_facing_leaves` element. A leaf card is four vertices that share one centre;
+/// the vertex shader moves each by `corner` (x right and y up in the camera's frame, so the card always
+/// faces the viewer). Nothing in the file gives a card a fixed place in the object's space beyond its
+/// centre.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LeafVertex {
+    /// The card's centre in the object's space, metres
+    pub centre: [f32; 3],
+    /// Offset of this corner from the centre (the third component is the depth offset), metres
+    pub corner: [f32; 3],
+    pub uv: [f32; 2],
+    pub normal: [f32; 3],
+}
+
+/// Bytes per vertex of a facing-leaves element
+const LEAF_STRIDE: usize = 24;
+
+/// IEEE half to single
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (exp, frac) = (i32::from((h >> 10) & 0x1F), f32::from(h & 0x3FF));
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 if frac == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+    }
 }
 
 fn read_block<'a>(r: &mut Reader<'a>) -> Result<&'a [u8]> {
@@ -219,6 +278,42 @@ fn read_mesh(dump: &[u8], vdata: &[VData]) -> Result<Vec<Elem>> {
     Ok(elems)
 }
 
+/// The `ImpostorData` block, found through the `u16` at +60 of the lods dump (0: none): two pointers,
+/// two `u16` counts and five floats, then the points (12 bytes each) and the shadow boxes (24 bytes each)
+fn read_impostor_data(dump: &[u8]) -> Result<Option<ImpostorData>> {
+    let ofs = usize::from(Reader::at(dump, 60)?.u16()?);
+    if ofs == 0 {
+        return Ok(None);
+    }
+    let mut r = Reader::at(dump, ofs)?;
+    let (points_ofs, shadow_ofs) = (pptr(&mut r)?, pptr(&mut r)?);
+    let (point_count, shadow_count) = (usize::from(r.u16()?), usize::from(r.u16()?));
+    let (min_y, max_y, cyl_rad, max_facing_leaves_delta, bbox_aspect_ratio) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?, r.f32()?);
+    let mut points = Vec::with_capacity(point_count);
+    if point_count > 0 {
+        let at = points_ofs.context("impostor points pointer is null")?;
+        check_table(dump, at, point_count, 12)?;
+        let mut p = Reader::at(dump, at)?;
+        for _ in 0..point_count {
+            points.push([p.f32()?, p.f32()?, p.f32()?]);
+        }
+    }
+    let mut shadow_points = Vec::with_capacity(shadow_count);
+    if shadow_count > 0 {
+        let at = shadow_ofs.context("impostor shadow pointer is null")?;
+        check_table(dump, at, shadow_count, 24)?;
+        let mut p = Reader::at(dump, at)?;
+        for _ in 0..shadow_count {
+            let mut b = [[0.0f32; 3]; 2];
+            for c in b.iter_mut().flatten() {
+                *c = p.f32()?;
+            }
+            shadow_points.push(b);
+        }
+    }
+    Ok(Some(ImpostorData { points, shadow_points, min_y, max_y, cyl_rad, max_facing_leaves_delta, bbox_aspect_ratio }))
+}
+
 impl RiModel {
     /// Parses the data of a `RendInst` resource (see the module docs)
     pub fn parse(res: &[u8]) -> Result<Self> {
@@ -263,7 +358,8 @@ impl RiModel {
             }
             lods.push(RiLod { range, elems });
         }
-        Ok(RiModel { vdata, lods, bbox, has_impostor })
+        let impostor_data = if has_impostor { read_impostor_data(dump)? } else { None };
+        Ok(RiModel { vdata, lods, bbox, has_impostor, impostor_data })
     }
 
     /// The index of the LOD the game uses at `dist` metres (`getBestLodForDist`): the first whose range
@@ -310,6 +406,29 @@ impl RiModel {
             }
         }
         Ok(out)
+    }
+}
+
+impl RiModel {
+    /// Decodes vertex `index` of vertex buffer `vdata` as the vertex of a `rendinst_facing_leaves`
+    /// element. The layout is the shader's (the buffer's declaration describes the tree's other meshes),
+    /// 24 bytes: `HALF4` centre (w is 1), `SHORT2` texture coordinates in 1/4096, `HALF4` corner offset
+    /// (z, then 0), `E3DCOLOR` normal. The file checks it: the model's `ImpostorData` lists the same
+    /// centres and corner offsets in single precision ([`ImpostorData::shadow_points`]).
+    pub fn leaf_vertex(&self, vdata: &VData, index: usize) -> Result<LeafVertex> {
+        ensure!(vdata.stride == LEAF_STRIDE, "facing leaves have {LEAF_STRIDE}-byte vertices, the buffer has {}", vdata.stride);
+        let v = index
+            .checked_mul(LEAF_STRIDE)
+            .and_then(|start| vdata.vertices.get(start..start + LEAF_STRIDE))
+            .with_context(|| format!("vertex {index} out of range"))?;
+        let half = |o: usize| half_to_f32(u16::from_le_bytes([v[o], v[o + 1]]));
+        let short = |o: usize| f32::from(i16::from_le_bytes([v[o], v[o + 1]]));
+        Ok(LeafVertex {
+            centre: [half(0), half(2), half(4)],
+            corner: [half(12), half(14), half(16)],
+            uv: [short(8), short(10)].map(|x| x * TEXCOORD_SCALE),
+            normal: [v[22], v[21], v[20]].map(|x| f32::from(x) / 127.5 - 1.0),
+        })
     }
 }
 
@@ -392,6 +511,7 @@ mod tests {
             lods: ranges.iter().map(|&range| RiLod { range, elems: Vec::new() }).collect(),
             bbox: [[0.0; 3]; 2],
             has_impostor: impostor,
+            impostor_data: None,
         }
     }
 
@@ -420,6 +540,43 @@ mod tests {
         };
         assert_eq!(m.vertex(&vd, 0).unwrap().pos, [3.0, 0.0, 4.0]);
         assert!(m.vertex(&vd, 1).is_err());
+    }
+
+    #[test]
+    fn half_floats_convert() {
+        assert_eq!([0x3C00, 0xC000, 0x0000, 0x8000, 0x4333, 0x0001, 0x7BFF].map(half_to_f32), [1.0, -2.0, 0.0, -0.0, 3.599_609_4, 2f32.powi(-24), 65504.0]);
+        assert!(half_to_f32(0x7C00).is_infinite() && half_to_f32(0x7E00).is_nan());
+    }
+
+    /// The bytes of the first leaf vertex of liveoak_01_rendinst
+    const LEAF: [u8; 24] = [0x46, 0xC8, 0xEE, 0x4D, 0x8D, 0xC4, 0x00, 0x3C, 0x00, 0x08, 0x00, 0x08, 0x33, 0x43, 0x63, 0x4B, 0xA7, 0x3C, 0x00, 0x00, 0x69, 0xF5, 0x55, 0x80];
+
+    fn leaf_buffer(stride: usize) -> VData {
+        VData { stride, vertices: LEAF.to_vec(), indices: Vec::new(), channels: Vec::new() }
+    }
+
+    #[test]
+    fn leaf_vertices_are_the_shaders_layout_not_the_trunks() {
+        let m = model(&[10.0], false);
+        let lv = m.leaf_vertex(&leaf_buffer(24), 0).unwrap();
+        // The file's own record for this vertex: centre (-8.547323, 23.721893, -4.5499086), corner (3.5996037, 14.773094, 1.1629229)
+        assert!(lv.centre.iter().zip([-8.547_323, 23.721_893, -4.549_908_6]).all(|(a, b)| (a - b).abs() < 0.02), "{:?}", lv.centre);
+        assert!(lv.corner.iter().zip([3.599_603_7, 14.773_094, 1.162_922_9]).all(|(a, b)| (a - b).abs() < 0.03), "{:?}", lv.corner);
+        assert_eq!(lv.uv, [0.5, 0.5]);
+        let len = lv.normal.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((len - 1.0).abs() < 0.02, "{len}");
+        // The trunk's declaration (float3 position) reads the same bytes as a point half a billion metres out
+        let trunk = VData { channels: vec![Channel { ty: FLOAT3, usage: USAGE_POSITION, index: 0, offset: 0 }], ..leaf_buffer(24) };
+        assert!(m.vertex(&trunk, 0).unwrap().pos[0] > 1.0e8);
+        // Other strides are not leaves, and neither is a vertex that is not there
+        assert!(m.leaf_vertex(&leaf_buffer(12), 0).is_err());
+        assert!(m.leaf_vertex(&leaf_buffer(24), 1).is_err());
+    }
+
+    #[test]
+    fn only_the_leaf_class_is_facing_leaves() {
+        assert!(is_facing_leaves("rendinst_facing_leaves"));
+        assert!(!is_facing_leaves("rendinst_tree") && !is_facing_leaves("rendinst_baked_impostor") && !is_facing_leaves(""));
     }
 
     #[test]

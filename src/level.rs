@@ -309,9 +309,33 @@ pub struct LandMesh<'a> {
     pub origin: [i32; 2],
     pub tile_texture: Option<(String, [f32; 2])>,
     pub vertical_texture: Option<String>,
+    /// The cliff texture's placement, when the landmesh has one
+    pub vertical: Option<VerticalTexture>,
     /// Packed ray tracer streams (codec, data); decode with [`LandMesh::tracer_mesh`]
     ltdump: Option<(u8, &'a [u8])>,
     lts4: Option<(u8, &'a [u8])>,
+    /// The whole `lmap` block, and where the detail data starts in it
+    data: &'a [u8],
+    base: usize,
+    detail_ofs: usize,
+}
+
+/// How the landmesh paints its steep slopes (`vertical_param*` shader variables): a texture
+/// projected sideways, blended in by height
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerticalTexture {
+    /// Colour texture, and the normal and detail textures named after it
+    pub texture: String,
+    pub detail_texture: String,
+    pub scale_xz: f32,
+    pub scale_y: f32,
+    pub blend_from_y: f32,
+    pub blend_to_y: f32,
+    pub horizontal_blend: f32,
+    pub y_offset: f32,
+    pub detail_tile_xz: f32,
+    pub detail_tile_y: f32,
+    pub detail_y_offset: f32,
 }
 
 impl<'a> LandMesh<'a> {
@@ -327,7 +351,7 @@ impl<'a> LandMesh<'a> {
         let use_tile = r.u32()? != 0;
         let base = r.pos();
         let _mesh_ofs = r.i32()?;
-        let _detail_ofs = r.i32()?;
+        let detail_ofs = r.i32()?;
         let tile_ofs = r.i32()?;
         let tracer_ofs = r.i32()?;
         let mut r = Reader::at(data, base + usize::try_from(tile_ofs).context("negative tile offset")?)?;
@@ -344,16 +368,32 @@ impl<'a> LandMesh<'a> {
             None
         };
         let vert = dstring(&mut r)?;
-        let vertical_texture = if vert.is_empty() {
-            None
+        let (vertical_texture, vertical) = if vert.is_empty() {
+            (None, None)
         } else {
-            r.skip(6 * 4)?;
-            dstring(&mut r)?;
-            r.skip(3 * 4)?;
-            Some(vert)
+            let f = |r: &mut Reader| r.f32();
+            let (scale_xz, scale_y, blend_from_y, blend_to_y, horizontal_blend, y_offset) =
+                (f(&mut r)?, f(&mut r)?, f(&mut r)?, f(&mut r)?, f(&mut r)?, f(&mut r)?);
+            let detail_texture = dstring(&mut r)?;
+            let (detail_tile_xz, detail_tile_y, detail_y_offset) = (f(&mut r)?, f(&mut r)?, f(&mut r)?);
+            let v = VerticalTexture {
+                texture: vert.clone(),
+                detail_texture,
+                scale_xz,
+                scale_y,
+                blend_from_y,
+                blend_to_y,
+                horizontal_blend,
+                y_offset,
+                detail_tile_xz,
+                detail_tile_y,
+                detail_y_offset,
+            };
+            (Some(vert), Some(v))
         };
         let lts4 = if r.remaining() >= 8 && r.bytes(4)? == b"LTS4" { Some(sub_block(&mut r)?) } else { None };
-        Ok(LandMesh { grid_cell_size, land_cell_size, cells, origin, tile_texture, vertical_texture, ltdump, lts4 })
+        let detail_ofs = base + usize::try_from(detail_ofs).context("negative detail offset")?;
+        Ok(LandMesh { grid_cell_size, land_cell_size, cells, origin, tile_texture, vertical_texture, vertical, ltdump, lts4, data, base, detail_ofs })
     }
 
     /// Which ray tracer streams the landmesh carries: `LTdump`, `LTS4`, both or `none`
@@ -385,6 +425,127 @@ impl<'a> LandMesh<'a> {
             return parse_lts4(&raw).map(Some);
         }
         Ok(None)
+    }
+}
+
+/// One land class the landmesh paints with: a game resource (class `03FB59C4`) found by name
+#[derive(Debug, Clone)]
+pub struct LandClassRef<'a> {
+    pub name: String,
+    /// Data the level stores next to the name instead of the resource's own, when it does
+    pub inline_data: &'a [u8],
+}
+
+/// How a cell's weights over its land classes are stored
+pub enum DetailWeights<'a> {
+    /// The level's own packed atlas: one `LAND_WEIGHT_CELL_STRIDE` record per cell and a DDSx
+    /// texture holding the pages (see [`DetailMap::cell_classes`] and [`DetailMap::cell_blend_count`])
+    Packed { pages_per_row: usize, page_count: usize, records: Vec<u32>, atlas: &'a [u8] },
+    /// One record per cell: 7 land class id bytes, two lengths, then up to two DDSx weight textures
+    Legacy { cells: Vec<LegacyCell<'a>> },
+}
+
+pub struct LegacyCell<'a> {
+    /// Land class ids by slot; 0xFF is a free slot
+    pub ids: [u8; LAND_WEIGHT_DET_NUM],
+    /// First weight texture (4 channels) and second (2 channels); empty when absent
+    pub tex1: &'a [u8],
+    pub tex2: &'a [u8],
+}
+
+/// The landmesh's detail data: which land classes it uses, and for every cell of the detail grid
+/// which of them blend there, with what weights
+pub struct DetailMap<'a> {
+    pub width: usize,
+    pub height: usize,
+    /// Side of a legacy per-cell weight texture, and the texels of it a cell owns (0 in packed levels)
+    pub tex_size: u32,
+    pub elem_size: u32,
+    pub land_classes: Vec<LandClassRef<'a>>,
+    pub weights: DetailWeights<'a>,
+}
+
+/// Land classes blended per cell (`LAND_WEIGHT_DET_NUM`)
+pub const LAND_WEIGHT_DET_NUM: usize = 7;
+const LAND_WEIGHT_COUNT_SHIFT: u32 = 28;
+const LAND_WEIGHT_COUNT_MASK: u32 = 7;
+const LAND_WEIGHT_CELL_WORDS: usize = 3;
+
+impl<'a> DetailMap<'a> {
+    /// Number of land classes a cell blends
+    pub fn cell_blend_count(&self, cell: usize) -> Option<usize> {
+        match &self.weights {
+            DetailWeights::Packed { records, .. } => {
+                let rec = *records.get(cell * LAND_WEIGHT_CELL_WORDS)?;
+                Some(((rec >> LAND_WEIGHT_COUNT_SHIFT) & LAND_WEIGHT_COUNT_MASK) as usize + 1)
+            }
+            DetailWeights::Legacy { cells } => Some(cells.get(cell)?.ids.iter().filter(|&&i| i != 0xFF).count()),
+        }
+    }
+
+    /// Land class ids (indices into [`DetailMap::land_classes`]) a cell blends, by weight channel
+    pub fn cell_classes(&self, cell: usize) -> Option<Vec<u8>> {
+        let n = self.cell_blend_count(cell)?;
+        match &self.weights {
+            DetailWeights::Packed { records, .. } => {
+                let rec = records.get(cell * LAND_WEIGHT_CELL_WORDS..(cell + 1) * LAND_WEIGHT_CELL_WORDS)?;
+                let bytes: Vec<u8> = rec[1..].iter().flat_map(|w| w.to_le_bytes()).collect();
+                Some(bytes[..n.min(LAND_WEIGHT_DET_NUM)].to_vec())
+            }
+            DetailWeights::Legacy { cells } => Some(cells.get(cell)?.ids.iter().copied().filter(|&i| i != 0xFF).collect()),
+        }
+    }
+}
+
+impl<'a> LandMesh<'a> {
+    /// Reads the detail data: the land classes by name, then the per-cell weights (see
+    /// `LandMeshManager::loadDetailData` and `DetailMap::load` in Dagor's `lmeshManager.cpp`)
+    pub fn detail_map(&self) -> Result<DetailMap<'a>> {
+        let mut r = Reader::at(self.data, self.detail_ofs)?;
+        let (_, classes) = sub_block(&mut r).context("land class list")?;
+        let mut c = Reader::new(classes);
+        let count = c.u32()? as usize;
+        ensure!(count <= classes.len() / 8 + 1, "{count} land classes in {} bytes", classes.len());
+        let mut land_classes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (_, one) = sub_block(&mut c)?;
+            let mut o = Reader::new(one);
+            let name = dstring(&mut o)?;
+            land_classes.push(LandClassRef { name, inline_data: o.rest() });
+        }
+        let (width, height) = (r.i32()?, r.i32()?);
+        let (tex_size, elem_size) = (r.i32()?, r.i32()?);
+        ensure!(width > 0 && height > 0 && width <= 1 << 14 && height <= 1 << 14, "bad detail grid {width}x{height}");
+        let (width, height) = (width as usize, height as usize);
+        let cells = width * height;
+        let weights = if tex_size == 0 {
+            // Packed: the legacy offset table (every entry names an empty record) and one empty record
+            // (`LEGACY_CELL_HDR`: the id bytes and two lengths) come first
+            r.skip(cells * 4 + LAND_WEIGHT_DET_NUM + 8)?;
+            let pages_per_row = r.i32()?;
+            let page_count = r.i32()?;
+            ensure!(pages_per_row > 0 && (0..=1 << 14).contains(&page_count), "bad weight atlas layout");
+            ensure!(cells * LAND_WEIGHT_CELL_WORDS * 4 <= r.remaining(), "weight atlas records overrun the landmesh");
+            let records = (0..cells * LAND_WEIGHT_CELL_WORDS).map(|_| r.u32()).collect::<Result<Vec<_>>>()?;
+            let len = r.i32()?;
+            let atlas = r.bytes(usize::try_from(len).context("negative atlas length")?)?;
+            DetailWeights::Packed { pages_per_row: pages_per_row as usize, page_count: page_count as usize, records, atlas }
+        } else {
+            ensure!(cells * 4 <= r.remaining(), "detail offsets overrun the landmesh");
+            let offsets = (0..cells).map(|_| r.i32()).collect::<Result<Vec<_>>>()?;
+            let mut out = Vec::with_capacity(cells);
+            for ofs in offsets {
+                let mut rec = Reader::at(self.data, self.base + usize::try_from(ofs).context("negative cell offset")?)?;
+                let ids: [u8; LAND_WEIGHT_DET_NUM] = rec.bytes(LAND_WEIGHT_DET_NUM)?.try_into().unwrap();
+                let (len, tex2) = (rec.i32()?, rec.i32()?);
+                ensure!(len >= 0 && tex2 >= 0 && tex2 <= len, "bad weight record lengths {len} / {tex2}");
+                let body = rec.bytes(len as usize)?;
+                let (tex1, tex2) = body.split_at(if tex2 != 0 { tex2 as usize } else { body.len() });
+                out.push(LegacyCell { ids, tex1, tex2 });
+            }
+            DetailWeights::Legacy { cells: out }
+        };
+        Ok(DetailMap { width, height, tex_size: tex_size as u32, elem_size: elem_size as u32, land_classes, weights })
     }
 }
 
@@ -723,7 +884,8 @@ fn decode_cblock(r: &mut Reader, w: usize, h: usize, chunk_info: u32) -> Result<
 /// An instance is 12 i16 (a 3x4 matrix, rows of x, y, z: axis components / 256 and the position) or,
 /// for position-only pools, 4 i16 (position and scale / 256), followed by the per-instance dwords
 /// unless the pool has no seeds. In pools with palette rotation the scale's low 3 bits instead pick
-/// one of the pool's preset rotations about Y (the palette itself is not in the level). Positions are fractions of 32767 of the cell: x and z of
+/// one of the pool's preset rotations about Y: id `i` of `n` (the pool's palette count, which the level
+/// stores) is a turn of `i / n` of a circle. Positions are fractions of 32767 of the cell: x and z of
 /// `cell_size * grid2world` from the cell corner, y of `ht_delta` (8192 if 0) above `ht_min`.
 pub struct RendInstLayer<'a> {
     pub cells_w: usize,
@@ -741,11 +903,16 @@ pub struct RendInstLayer<'a> {
     pregen: &'a [u8],
 }
 
+#[derive(Debug, Clone)]
 pub struct RendInstPool {
     pub name: String,
     pub pos_only: bool,
     pub palette_rotation: bool,
     pub zero_inst_seeds: bool,
+    /// Number of preset rotations about Y the pool's instances choose from (palette pools only). The
+    /// instance's palette id `i` means a turn of `i / count` of a full circle (`PaletteEntry` in
+    /// Dagor's `rendInstRotationPalette.cpp`).
+    pub palette_count: usize,
 }
 
 struct RendInstCell {
@@ -766,7 +933,8 @@ pub struct RendInstance {
 const RIGEN_DUMP_HEADER: usize = 160;
 const RIGEN_CELL: usize = 552;
 const SUBCELLS: usize = 64;
-const PALETTE_ID_MASK: u16 = 7;
+const PALETTE_ID_BITS: u32 = 3;
+const PALETTE_ID_MASK: u16 = (1 << PALETTE_ID_BITS) - 1;
 
 impl<'a> RendInstLayer<'a> {
     /// Parses every layer of a `RIGz` block
@@ -819,7 +987,8 @@ impl<'a> RendInstLayer<'a> {
                 let name = name_at(pptr(&mut p)?)?;
                 p.skip(8)?;
                 let bits = p.u32()?;
-                Ok(RendInstPool { name, pos_only: bits & 1 != 0, palette_rotation: bits & 2 != 0, zero_inst_seeds: bits & 4 != 0 })
+                let palette_count = p.i32()?.clamp(0, 1 << 16) as usize;
+                Ok(RendInstPool { name, pos_only: bits & 1 != 0, palette_rotation: bits & 2 != 0, zero_inst_seeds: bits & 4 != 0, palette_count })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -904,10 +1073,18 @@ impl<'a> RendInstLayer<'a> {
                     d.skip(seeds)?;
                     let f = |v: i16| f32::from(v);
                     let tm = if p.pos_only {
-                        // With palette rotation the low bits pick one of the pool's preset rotations
-                        let s = if p.palette_rotation { f32::from(q[3] as u16 & !PALETTE_ID_MASK) } else { f(q[3]) } / 256.0;
+                        // With palette rotation the low bits pick one of the pool's preset rotations:
+                        // a turn about Y of id / count of a circle, as `rotyTM`
+                        // (x axis (cos, 0, sin), z axis (-sin, 0, cos))
+                        let (s, (sin, cos)) = if p.palette_rotation {
+                            let id = q[3] as u16 & PALETTE_ID_MASK;
+                            let count = p.palette_count.clamp(1, 1 << PALETTE_ID_BITS);
+                            (f32::from(q[3] as u16 & !PALETTE_ID_MASK) / 256.0, (std::f32::consts::TAU * f32::from(id) / count as f32).sin_cos())
+                        } else {
+                            (f(q[3]) / 256.0, (0.0, 1.0))
+                        };
                         let pos = [0, 1, 2].map(|k| f(q[k]) * mul[k] + add[k]);
-                        [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s], pos]
+                        [[s * cos, 0.0, s * sin], [0.0, s, 0.0], [-s * sin, 0.0, s * cos], pos]
                     } else {
                         let axis = |c: usize| [f(q[c]) / 256.0, f(q[4 + c]) / 256.0, f(q[8 + c]) / 256.0];
                         [axis(0), axis(1), axis(2), [0, 1, 2].map(|k| f(q[4 * k + 3]) * mul[k] + add[k])]

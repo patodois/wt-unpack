@@ -358,22 +358,34 @@ pub struct Pcm {
 }
 
 impl Pcm {
+    /// The 44-byte header of a PCM WAV holding `data_bytes` of samples. Every size in it is checked: the format
+    /// stores them in 32 bits.
+    fn wav_header(&self, data_bytes: usize) -> io::Result<[u8; 44]> {
+        let too_big = || io::Error::other("too long for WAV");
+        let data_bytes = u32::try_from(data_bytes).map_err(|_| too_big())?;
+        let riff_size = data_bytes.checked_add(36).ok_or_else(too_big)?;
+        let align = self.channels.checked_mul(2).ok_or_else(too_big)?;
+        let byte_rate = self.rate.checked_mul(u32::from(align)).ok_or_else(too_big)?;
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&riff_size.to_le_bytes());
+        h.extend_from_slice(b"WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        h.extend_from_slice(&self.channels.to_le_bytes());
+        h.extend_from_slice(&self.rate.to_le_bytes());
+        h.extend_from_slice(&byte_rate.to_le_bytes());
+        h.extend_from_slice(&align.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&data_bytes.to_le_bytes());
+        Ok(h.try_into().expect("a WAV header is 44 bytes"))
+    }
+
     pub fn write_wav<W: Write>(&self, mut w: W) -> io::Result<()> {
-        let data_bytes = u32::try_from(self.samples.len() * 2).map_err(|_| io::Error::other("too long for WAV"))?;
-        let align = self.channels * 2;
-        w.write_all(b"RIFF")?;
-        w.write_all(&(36 + data_bytes).to_le_bytes())?;
-        w.write_all(b"WAVEfmt ")?;
-        w.write_all(&16u32.to_le_bytes())?;
-        w.write_all(&1u16.to_le_bytes())?; // PCM
-        w.write_all(&self.channels.to_le_bytes())?;
-        w.write_all(&self.rate.to_le_bytes())?;
-        w.write_all(&(self.rate * u32::from(align)).to_le_bytes())?;
-        w.write_all(&align.to_le_bytes())?;
-        w.write_all(&16u16.to_le_bytes())?;
-        w.write_all(b"data")?;
-        w.write_all(&data_bytes.to_le_bytes())?;
-        let mut bytes = Vec::with_capacity(self.samples.len() * 2);
+        let data_bytes = self.samples.len().checked_mul(2).ok_or_else(|| io::Error::other("too long for WAV"))?;
+        w.write_all(&self.wav_header(data_bytes)?)?;
+        let mut bytes = Vec::with_capacity(data_bytes);
         for s in &self.samples {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
@@ -384,6 +396,28 @@ impl Pcm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wav_headers_check_the_32_bit_sizes_they_store() {
+        let pcm = |channels, rate| Pcm { channels, rate, samples: Vec::new() };
+        let h = pcm(2, 44100).wav_header(1000).unwrap();
+        assert_eq!(&h[..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 1036);
+        assert_eq!(u32::from_le_bytes(h[28..32].try_into().unwrap()), 44100 * 4);
+        assert_eq!(&h[36..40], b"data");
+        // The RIFF size is the data plus 36 (an overflow in debug builds near 4 GB), the byte rate the rate
+        // times the frame size, and the frame size twice the channel count
+        assert!(pcm(2, 44100).wav_header(u32::MAX as usize).is_err());
+        assert!(pcm(2, u32::MAX).wav_header(8).is_err());
+        assert!(pcm(u16::MAX, 8000).wav_header(8).is_err());
+        assert!(pcm(2, 44100).wav_header(u32::MAX as usize - 36).is_ok());
+        // The same through write_wav, which multiplied the rate by the frame size unchecked
+        assert!(Pcm { channels: 2, rate: u32::MAX, samples: Vec::new() }.write_wav(Vec::new()).is_err());
+        // A WAV written to memory is the header and the samples
+        let mut out = Vec::new();
+        Pcm { channels: 1, rate: 8000, samples: vec![1, -2] }.write_wav(&mut out).unwrap();
+        assert_eq!((out.len(), &out[44..]), (48, &[1, 0, 0xFE, 0xFF][..]));
+    }
 
     /// Name, rate index, channel index, frames, (type, body) chunks and data of a test sample.
     type TestSample<'a> = (&'a str, u64, u64, u64, Vec<(u32, Vec<u8>)>, Vec<u8>);

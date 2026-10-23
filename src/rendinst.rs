@@ -337,7 +337,7 @@ impl RiModel {
             }
             v
         };
-        ensure!(lod_count <= 16, "{lod_count} LODs");
+        ensure!((1..=16).contains(&lod_count), "{lod_count} LODs: a model has at least one");
         check_table(dump, lod_ofs, lod_count, 16)?;
         let mut ranges = Vec::with_capacity(lod_count);
         for l in 0..lod_count {
@@ -369,7 +369,7 @@ impl RiModel {
         if dist <= 0.0 {
             return 0;
         }
-        (0..=last).find(|&i| dist < self.lods[i].range).unwrap_or(last)
+        (0..=last).find(|&i| self.lods.get(i).is_some_and(|l| dist < l.range)).unwrap_or(last)
     }
 
     /// Triangles in a LOD
@@ -519,6 +519,33 @@ mod tests {
     fn lod_follows_the_ranges() {
         let m = model(&[50.0, 150.0, 400.0], false);
         assert_eq!([0.0, 10.0, 50.0, 149.0, 150.0, 399.0, 5000.0].map(|d| m.lod_for_distance(d)), [0, 0, 1, 1, 2, 2, 2]);
+    }
+
+    /// A resource with embedded nothing: an empty vertex-data header and a dump of `lod_count` LODs (none
+    /// are listed, so only a count of 0 is valid)
+    fn resource(lod_count: u32) -> Vec<u8> {
+        let mut dump = vec![0u8; 40];
+        dump[4..8].copy_from_slice(&lod_count.to_le_bytes());
+        let mut res = Vec::new();
+        for word in [dump.len() as u32, u32::MAX, u32::MAX, 0, 32] {
+            res.extend_from_slice(&word.to_le_bytes());
+        }
+        res.extend_from_slice(&[0; 32]); // vertex data header: no buffers
+        res.extend_from_slice(&dump);
+        res
+    }
+
+    #[test]
+    fn a_model_without_lods_is_refused_and_cannot_panic() {
+        let err = RiModel::parse(&resource(0)).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("0 LODs"), "{err}");
+        // Built by hand, with or without an impostor, it still has an answer for every distance
+        for impostor in [false, true] {
+            let m = model(&[], impostor);
+            assert_eq!([0.0, 250.0, f32::INFINITY].map(|d| m.lod_for_distance(d)), [0, 0, 0]);
+        }
+        // One LOD and an impostor billboard stays valid
+        assert_eq!(model(&[50.0], true).lod_for_distance(250.0), 0);
     }
 
     #[test]

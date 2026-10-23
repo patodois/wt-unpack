@@ -135,6 +135,21 @@ wt-viewer --turret 60 --gun 10 --screenshot sherman.png
 wt-viewer --drive --auto W:30,WA:3 --turret 90 --screenshot drive.png
 ```
 
+`wt-viewer --help` prints the options; a mistyped option is refused with the same text, and nothing opens. They are:
+
+| Option | Meaning |
+|---|---|
+| `PACK.grp MODEL` | the model to open (a `.grp` of `content/base/res/tanks`, `aircrafts` or `ships`, and a model in it); with neither it opens the Sherman |
+| `--game <folder>` | the game folder `$GAME` (default: the macOS launcher's) |
+| `--unit <name>` | the unit BLK for the turret limits and drive train, when it is not found from the model's name |
+| `--turret <deg>`, `--gun <deg>` | starting traverse (positive left) and elevation (positive up), within the unit's limits |
+| `--orbit <yaw,pitch,dist>`, `--target <x,y,z>` | starting camera: angles in degrees and distance in metres; the point it looks at (model space, metres) |
+| `--lift <node=metres>` | raise a skeleton node, to see the skinned tracks follow it (comma-separate several) |
+| `--drive` | drive on flat ground with WASD |
+| `--auto <script>` | drive by script (with `--drive`): `W:20,WA:3,S:2` holds W for 20 s, then W and A for 3 s, then S for 2 s |
+| `--screenshot <file.png>` | save one frame (after the script, if any) and close; a relative path lands in the folder you ran it from |
+| `-h`, `--help` | print this list |
+
 The viewer finds the tank's unit file (`gamedata/units/tankmodels/<unit>.blk` in `aces.vromfs.bin`) by
 its model name, or takes `--unit <name>`. From it come the turret and gun nodes with their traverse and
 elevation limits and speeds, and the mass, engine power, gearing, sprocket and wheel radii and braking

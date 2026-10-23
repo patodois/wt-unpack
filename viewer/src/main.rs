@@ -2,7 +2,7 @@
 //!
 //! Usage: `wt-viewer [pack.grp model_name] [--game <game folder>] [--unit <unit>] [--screenshot <file.png>]
 //! [--turret <deg>] [--gun <deg>] [--orbit <yaw,pitch,distance>] [--target <x,y,z>] [--drive] [--auto <script>]
-//! [--lift <node=metres>]`
+//! [--lift <node=metres>]` (`wt-viewer --help` lists them; see `args.rs`)
 //!
 //! Drag with the mouse to orbit, scroll to zoom. Q/E traverse the turret and R/F elevate the gun, within
 //! the limits of the tank's unit BLK (found by its model name, or named with `--unit`). `--drive` puts
@@ -18,6 +18,7 @@
 //! `--lift bone_wheel_l_03=0.15` raises a node by that many metres, to see the skin follow it; the game
 //! moves those nodes with a suspension simulation that the viewer does not have.
 
+mod args;
 mod drive;
 
 use std::path::PathBuf;
@@ -139,25 +140,23 @@ fn floats<const N: usize>(s: &str) -> Result<[f32; N]> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match args::check(&args) {
+        Ok(args::Action::Run) => {}
+        Ok(args::Action::Help) => {
+            print!("{}", args::usage(DEFAULT_GAME));
+            return Ok(());
+        }
+        Err(problem) => {
+            eprintln!("error: {problem}\n\n{}", args::usage(DEFAULT_GAME));
+            std::process::exit(2);
+        }
+    }
     let option = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let game = option("--game").map_or_else(|| PathBuf::from(DEFAULT_GAME), PathBuf::from);
     let screenshot = option("--screenshot").map(PathBuf::from);
-    // Flags that take no value
-    const SWITCHES: [&str; 1] = ["--drive"];
     let driving = args.iter().any(|a| a == "--drive");
     // Positional arguments are everything that is neither a flag nor a flag's value
-    let mut positional = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if SWITCHES.contains(&args[i].as_str()) {
-            i += 1;
-        } else if args[i].starts_with("--") {
-            i += 2;
-        } else {
-            positional.push(&args[i]);
-            i += 1;
-        }
-    }
+    let positional = args::positional(&args);
     let (pack, name) = match positional.as_slice() {
         [pack, name, ..] => (PathBuf::from(pack.as_str()), name.to_string()),
         _ => (game.join("content/base/res/tanks/usa_m4a1_76w_sherman.grp"), "m4a1_76w_sherman".to_string()),

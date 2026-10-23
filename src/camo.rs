@@ -185,7 +185,7 @@ mod tests {
         let camo = Image { width: 2, height: 2, rgba: &camo };
         bake(&mut base, 2, 2, Some(&camo), None, &tris, true).unwrap();
         // Nothing was drawn, so every texel got the camouflage average
-        assert!(base.chunks_exact(4).all(|p| p == [80, 70, 50, 255]), "{base:?}");
+        assert_eq!(base, solid([80, 70, 50, 255]));
     }
 
     #[test]

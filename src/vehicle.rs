@@ -630,7 +630,7 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
     let infos = material_infos(&library.descs, name)?;
     let skin_material_base = infos.iter().position(|m| m.skinned).unwrap_or(infos.len());
 
-    let meshes = build_meshes(&model, lod, &tree, skin_material_base, infos.len()).with_context(|| format!("{name}"))?;
+    let meshes = build_meshes(&model, lod, &tree, skin_material_base, infos.len()).with_context(|| name.to_string())?;
     // Materials the description lists but no mesh of this LOD uses are neither decoded nor baked
     let used: std::collections::HashSet<usize> = meshes.iter().map(|m| m.material).collect();
     let is_used = |i: usize| used.contains(&i);

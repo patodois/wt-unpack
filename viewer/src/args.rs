@@ -3,7 +3,17 @@
 //! opens.
 
 /// Options that take the next argument as their value
-pub const VALUE_FLAGS: [&str; 9] = ["--game", "--unit", "--screenshot", "--turret", "--gun", "--orbit", "--target", "--auto", "--lift"];
+pub const VALUE_FLAGS: [&str; 9] = [
+    "--game",
+    "--unit",
+    "--screenshot",
+    "--turret",
+    "--gun",
+    "--orbit",
+    "--target",
+    "--auto",
+    "--lift",
+];
 /// Options that stand alone
 pub const SWITCHES: [&str; 1] = ["--drive"];
 
@@ -67,7 +77,10 @@ pub fn check(args: &[String]) -> Result<Action, String> {
             }
             i += 2;
         } else if a.starts_with('-') && a.parse::<f32>().is_err() {
-            let hint = a.split_once('=').filter(|(flag, _)| VALUE_FLAGS.contains(flag)).map(|(flag, _)| format!(" (write `{flag} <value>`, with a space)"));
+            let hint = a
+                .split_once('=')
+                .filter(|(flag, _)| VALUE_FLAGS.contains(flag))
+                .map(|(flag, _)| format!(" (write `{flag} <value>`, with a space)"));
             return Err(format!("unknown option {a}{}", hint.unwrap_or_default()));
         } else {
             positional += 1;
@@ -76,7 +89,10 @@ pub fn check(args: &[String]) -> Result<Action, String> {
     }
     match positional {
         0 | 2 => Ok(Action::Run),
-        n => Err(format!("expected a pack and a model name (or neither), got {n} argument{}", if n == 1 { "" } else { "s" })),
+        n => Err(format!(
+            "expected a pack and a model name (or neither), got {n} argument{}",
+            if n == 1 { "" } else { "s" }
+        )),
     }
 }
 
@@ -102,12 +118,22 @@ mod tests {
     use super::*;
 
     fn check_line(line: &str) -> Result<Action, String> {
-        check(&line.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        check(
+            &line
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]
     fn help_is_asked_for_by_either_spelling_wherever_it_stands() {
-        for line in ["--help", "-h", "pack.grp model --help", "--turret 60 --help"] {
+        for line in [
+            "--help",
+            "-h",
+            "pack.grp model --help",
+            "--turret 60 --help",
+        ] {
             assert_eq!(check_line(line), Ok(Action::Help), "{line}");
         }
     }
@@ -140,7 +166,11 @@ mod tests {
         let err = |line: &str| check_line(line).unwrap_err();
         assert!(err("--turrett 60").contains("unknown option --turrett"));
         assert!(err("-x").contains("unknown option -x"));
-        assert!(err("--game=/g").contains("with a space"), "{}", err("--game=/g"));
+        assert!(
+            err("--game=/g").contains("with a space"),
+            "{}",
+            err("--game=/g")
+        );
         assert!(err("a.grp m --gun").contains("--gun needs a value"));
         assert!(err("only.grp").contains("got 1 argument"));
         assert!(err("a.grp b c").contains("got 3 arguments"));
@@ -148,7 +178,10 @@ mod tests {
 
     #[test]
     fn positional_arguments_skip_options_and_their_values() {
-        let args: Vec<String> = "--game /g pack.grp --drive model --turret 5".split_whitespace().map(str::to_string).collect();
+        let args: Vec<String> = "--game /g pack.grp --drive model --turret 5"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
         assert_eq!(positional(&args), ["pack.grp", "model"]);
     }
 }

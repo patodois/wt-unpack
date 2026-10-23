@@ -14,10 +14,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 zstd = "0.13"
 # Texture and model readers from Warthunder-Open-Source-Foundation/wt_blk#28 and #29 (fork branch);
 # switch to crates.io once they are released
-wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "2de16e1deb6771532cbc426aa6950c4b99ba850b", features = ["png"] }
+wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "498c996d30e95eac334d33bb7cdcc9ff88e16799", features = ["png"] }
 png = "0.18.1"
 # Oodle streams inside level files (the same decoder wt_blk uses)
-oozextract = "0.5.5"
+oozextract = "0.5.6"
 lewton = { version = "0.10.2", default-features = false }
 memmap2 = "0.9"
 # Blocking HTTP client for the live telemetry poller (plain HTTP to localhost only, so no TLS)
@@ -49,8 +49,3 @@ debug = false
 
 [profile.dev]
 debug = "line-tables-only"
-
-# oozextract 0.5.5 on crates.io lacks the fix for valid streams it rejected (lvlvllvlvllvlvl/oozextract#3);
-# use the fixed revision until a release is out (lvlvllvlvllvlvl/oozextract#5)
-[patch.crates-io]
-oozextract = { git = "https://github.com/lvlvllvlvllvlvl/oozextract", rev = "71ca5f5" }

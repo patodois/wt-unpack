@@ -114,6 +114,8 @@ jobs:
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+          # this job has no checkout, so gh needs the repository named
+          GH_REPO: ${{ github.repository }}
         run: |
           cat > notes.md <<'NOTES'
           Prebuilt `wt-unpack` for macOS (Apple silicon and Intel), Linux and Windows (x86_64). The archives contain

@@ -35,6 +35,34 @@ This repository contains no game code or game data, and the tools never modify t
 read from a copy of the game you already have installed. Words you may not know are explained in the
 [glossary](#glossary) at the end.
 
+## Download
+
+Programs built for each release are on the [Releases page](https://github.com/patodois/wt-unpack/releases). Pick the archive for your system:
+
+| System | Archive |
+|--------|---------|
+| macOS, Apple silicon | `wt-unpack-<tag>-macos-arm64.tar.gz` |
+| macOS, Intel | `wt-unpack-<tag>-macos-x86_64.tar.gz` |
+| Linux, x86_64 (glibc 2.35 or newer) | `wt-unpack-<tag>-linux-x86_64.tar.gz` |
+| Windows, x86_64 | `wt-unpack-<tag>-windows-x86_64.zip` |
+
+Each archive holds the program, this README, both license files and an `INSTALL.txt`. `SHA256SUMS` on the release page has
+the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256sum -c SHA256SUMS` on Linux,
+`Get-FileHash` on Windows). They are built with the `live` and `bridge` features, so `wt-unpack live` and the rewrite-bridge commands are included. The 3D viewer (`wt-viewer`) is not in the archives: it needs extra system libraries to build on Linux, so build it from source (see [Build](#build)).
+
+**The binaries contain no game data.** They are the program only; it reads the files of a copy of War Thunder that you already have
+installed.
+
+They are not code-signed, so the first run may be blocked:
+
+- **macOS (Gatekeeper)**: a file downloaded in a browser is quarantined, and macOS refuses to open it ("Apple could not
+  verify ..."). Remove the mark once, from the folder you extracted to: `xattr -d com.apple.quarantine ./wt-unpack`. Or open
+  System Settings > Privacy & Security and press "Open Anyway" after the first refusal.
+- **Windows (SmartScreen)**: "Windows protected your PC" appears the first time. Choose "More info", then "Run anyway". Or
+  right-click the downloaded `.zip`, open Properties and tick "Unblock" before you extract it.
+
+To build it yourself instead, see [Build](#build).
+
 ## Prerequisites
 
 - **Rust 1.90 or newer** ([rustup.rs](https://rustup.rs)); the code is written and tested with 1.99.

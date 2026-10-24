@@ -1,0 +1,134 @@
+name: release
+
+# Push a tag like v0.1.0 and this builds wt-unpack for macOS (Apple silicon and Intel), Linux and Windows,
+# packs each into an archive with the README, the licenses and an INSTALL.txt, and attaches them and a
+# SHA256SUMS file to a GitHub Release that it creates.
+#
+# Run it by hand (Actions > release > Run workflow) for a dry run: the same builds, archives and
+# checksums, uploaded as workflow artifacts, but no release is created.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: wt-unpack
+  CARGO_ARGS: -p wt-unpack --features live,bridge
+  PKG_GAME: a copy of War Thunder
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            smoke: true
+          # Cross-compiled on the Apple silicon runner: GitHub's Intel macOS runners are being retired
+          - platform: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            smoke: false
+          # The oldest Ubuntu runner image, so the binary runs on older distributions (glibc 2.35)
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            smoke: true
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+            smoke: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+            crate="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+            if [ "$crate" != "$GITHUB_REF_NAME" ]; then
+              echo "::warning::tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($crate)"
+            fi
+          else
+            echo "VERSION=dev-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        run: |
+          # CARGO_ARGS is several arguments on purpose
+          # shellcheck disable=SC2086
+          cargo build --release --locked --target ${{ matrix.target }} $CARGO_ARGS
+      - name: Smoke test
+        if: matrix.smoke
+        run: ./target/${{ matrix.target }}/release/${{ env.BIN }}${{ matrix.exe }} --help
+      - name: Archive
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/${BIN}${{ matrix.exe }}" bash packaging/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Checksums and release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+      # A dry run (workflow_dispatch) ends here: the files are kept as one workflow artifact
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type != 'tag'
+        with:
+          name: dry-run-release-assets
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'NOTES'
+          Prebuilt `wt-unpack` for macOS (Apple silicon and Intel), Linux and Windows (x86_64). The archives contain
+          no game data: the program reads the files of a copy of the game that you already have.
+
+          The programs are not code-signed. macOS (Gatekeeper) and Windows (SmartScreen) may warn the
+          first time; the INSTALL.txt in each archive and the README say what to do. Check a download
+          against `SHA256SUMS`.
+          NOTES
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "wt-unpack $GITHUB_REF_NAME" \
+              --notes-file notes.md --generate-notes "${flags[@]}"
+          fi

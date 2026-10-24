@@ -14,7 +14,8 @@
 //!
 //! `--leaves` also draws the leaf cards of trees and bushes, which a `Scene` cannot hold because they face
 //! the camera: they come from `WarThunder::load_level_with_leaves`, and each card is expanded for the
-//! view being drawn, the way the game does with the wind at rest (`LeafCard::corners_facing`).
+//! view being drawn, the way the game does with the wind at rest (`LeafCard::corners_facing`). The cards'
+//! uv are as stored and the wrap mode of their texture is not in the data: this demo assumes repeat.
 
 use std::path::PathBuf;
 use std::time::Instant;

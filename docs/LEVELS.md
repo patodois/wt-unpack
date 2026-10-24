@@ -41,8 +41,8 @@ Not in the scene, and why:
   its tilt in depth, its texture coordinates and its normal, and none of them has a place in the object's
   space: where the corners land depends on the viewer. The only public engine code that expands these
   vertices (`bvh_process_leaves_vertices.dshl`, and `LeavesWindEffect` for the matrices it uses) does
-  `centre + x * right + y * up + z * towards_viewer` with the wind matrices at rest. War Thunder's own
-  vertex shader for the class is not public.
+  `centre + x * right + y * up + z * towards_viewer`, where at rest the wind matrices are the camera's own
+  axes (the view inverse's columns, Z negated). War Thunder's own vertex shader for the class is not public.
 
   A `Scene` has no billboard primitive, and a fixed orientation (an axis, a view direction) would be one
   the game never uses, so the meshes of the scene keep only the trunks and branches, and models made only
@@ -53,10 +53,18 @@ Not in the scene, and why:
   with the wind at rest. `render_scene --leaves` does it for each picture it draws. The scene returned
   is identical with or without the leaves (a test checks it).
 
+  The card's two triangles are carried as the file has them, not run through the scene's winding fix: in
+  the camera's x/y frame about 80% of the game's triangles run clockwise and 20% counter-clockwise, so
+  cards must be drawn double-sided. The alpha cutout (`LeafSet::alpha`) is not read from the material,
+  because none of the 220 leaf elements states an `atest`: it is the repo's default for tree classes,
+  127/255. UVs are as stored; 406 cards, all of the `*_lowpoly_*` trees, leave 0..1 by more than 0.25, and
+  the texture's wrap mode is not in the data.
+
   What is not carried: the wind itself (the four groups' matrices are the game's runtime state), the
   cross-dissolve between the two LODs (its numbers are in `LeafSet::params`), the sun-facing variant of the
-  engine's BVH code, and the sign of z, which is the engine code's (it hands the shader
-  the camera's Z axis negated) and I could not tell apart by eye in renders of the game's trees.
+  engine's BVH code. The sign of z is carried (a positive z moves a corner towards the camera) but comes
+  from engine code, not from the data: the engine hands the shader the camera's Z axis negated, and no
+  render of the game's trees distinguishes the two signs.
   `RiModel::leaf_vertex` and `RiModel::leaf_cards` decode the vertices and the cards, and
   `cargo run --release --example check_rendinst_bounds` checks every placed-object model in the game: all
   220 leaf elements (6,404 cards over the two LODs) are cards, with one centre, normal and wind group each.

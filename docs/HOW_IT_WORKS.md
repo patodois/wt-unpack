@@ -17,7 +17,9 @@ Where the formats come from. Part of the [wt-unpack README](../README.md).
   `compressedHeightmap.cpp`, `landRayTracerSoA4.cpp`, `bvhIO.cpp` and `rendInstGen.cpp`; the ground's
   materials `lmeshLandClasses.cpp`, `lmeshWeightAtlas*.cpp`, `landClsExp.cpp` and `binDumpUtil.cpp`
   (the read-only data block of land classes); placed objects `rendInstRes.cpp`,
-  `rendInstRotationPalette.cpp` and `genObjUtil.h`. The `HM2`
+  `rendInstRotationPalette.cpp` and `genObjUtil.h`; the camera-facing leaf cards of trees
+  `rendInstResSrc.cpp` (what the builder records of them), `bvh_process_leaves_vertices.dshl` (the only
+  public code that reads their vertices) and `leavesWind.cpp` (the matrices it uses). The `HM2`
   heightmap covers the playable area (2 m per sample on tank maps); the landmesh's ray tracer
   covers the whole map at its own resolution and is rasterised into the same kind of grid.
 - The sound bank and FSB5 readers follow the layouts documented by the community in

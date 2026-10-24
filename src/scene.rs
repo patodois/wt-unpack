@@ -96,7 +96,7 @@ pub const NOT_APPLIED: &[&str] = &[
     "water appearance: the water shader is not public; the plane carries the level's own water_aces_color_and_density colour, flat, when the level has one (28 of the 160 levels do) and the bridge's default material otherwise",
     "sun, sky and fog: the level stores only its place and date (stars{}); the time of day and weather come from the mission, and the sky colour from the atmosphere shader",
     "object shaders: layered, perlin and decal blending, wind, interior mapping; objects use the first texture of each material",
-    "tree leaves (rendinst_facing_leaves) in the Scene: each leaf card is four vertices around one centre that the vertex shader moves to face the camera, so the data holds no corners in the object's space, and Scene has no camera-facing primitive; the Scene's trees are their trunks and branch meshes, and bushes made only of leaves are not in it. The cards themselves (centre, corner offsets in the camera's frame, uv, normal, wind group, texture) come from load_level_with_leaves as SceneLeaves",
+    "tree leaves (rendinst_facing_leaves) in the Scene: each leaf card is four vertices around one centre that the vertex shader moves to face the camera, so the data holds no corners in the object's space, and Scene has no camera-facing primitive; the Scene's trees are their trunks and branch meshes, and bushes made only of leaves are not in it. The cards themselves (centre, corner offsets in the camera's frame, uv, normal, wind group, texture) come from load_level_with_leaves as SceneLeaves; their alpha cutout is the repo's tree default (127/255), since none of the leaf materials states an atest, and their uv are as stored, whose wrap mode is not in the data",
     "impostor billboards (rendinst_baked_impostor): the far LOD of a tree that has its meshes in the scene, drawn by the shader from views baked into an atlas by the camera's direction; the mesh is one template shared by every tree, so the LOD is never chosen",
     "object normals and reflectance maps",
     "collision: Scene has no collision field, so the shapes of the placed objects come separately from WarThunder::load_level_collision (crate::level_collision); the ground's collision is the terrain model itself",
@@ -105,6 +105,7 @@ pub const NOT_APPLIED: &[&str] = &[
 
 /// What the conversion did
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct SceneReport {
     pub name: String,
     pub load_ms: u128,
@@ -149,8 +150,8 @@ pub struct SceneReport {
 pub struct LeafSet {
     /// The material's texture (`t0`), shrunk like the object textures; `None` when no pack has it
     pub base_color: Option<Arc<Image>>,
-    /// Pixels below the cutoff are discarded; `rendinst_facing_leaves` states none, so it is the 127 the
-    /// tree classes use
+    /// Pixels below the cutoff are discarded. None of the game's leaf materials states an `atest`, so this
+    /// is not read from the material: it is the repo's default for tree classes, `Mask(127/255)`.
     pub alpha: AlphaMode,
     /// The material's numeric parameters from `riDesc.bin`: `facing_leaves_translucency`,
     /// `facing_leaves_smoothness` and the cross-dissolve of the LOD change
@@ -387,7 +388,10 @@ impl ModelBuilder<'_> {
             return t.clone();
         }
         let t = match self.textures.decode(name, self.opts.object_texture_px) {
-            Ok(t) => t.map(|i| Arc::new(image(i))),
+            Ok(t) => t.map(|i| {
+                self.report.memory_bytes += i.rgba.len();
+                Arc::new(image(i))
+            }),
             Err(e) => {
                 self.report.warnings.push(format!("texture {name}: {e:#}"));
                 None
@@ -459,7 +463,7 @@ impl ModelBuilder<'_> {
                 let vd = &model.vdata[e.vdata];
                 let range = &vd.indices[e.first_index..e.first_index + e.triangles * 3];
                 for &raw in range {
-                    let v = raw as usize + e.base_vertex;
+                    let Some(v) = (raw as usize).checked_add(e.base_vertex) else { continue };
                     let idx = match remap.get(&(e.vdata, v as u32)) {
                         Some(&i) => i,
                         None => {
@@ -925,7 +929,8 @@ fn load_scene_inner(game: &Path, level_file: &Path, opts: &SceneOptions, sources
                     builder.report.leaf_models += 1;
                     builder.report.leaf_cards += cards;
                     builder.report.leaf_cards_drawn += cards as u64 * counts[&n] as u64;
-                    builder.report.memory_bytes += cards * std::mem::size_of::<LeafCard>() + sets.iter().filter_map(|s| s.base_color.as_ref()).map(|i| i.rgba.len()).sum::<usize>();
+                    // The leaf textures are counted once, when they are decoded (see `leaf_texture`)
+                    builder.report.memory_bytes += cards * std::mem::size_of::<LeafCard>();
                     leaf_of.insert(n.clone(), leaves.models.len());
                     leaves.models.push(LeafModel { name: n.clone(), sets });
                 }

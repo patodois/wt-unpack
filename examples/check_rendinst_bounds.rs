@@ -58,6 +58,11 @@ struct LeafStats {
     /// The largest depth offset (z) and the largest |x| or |y| offset of any corner, metres
     max_depth: f32,
     max_reach: f32,
+    /// Cards with a uv more than 0.25 outside 0..1, and the card triangles that run clockwise and
+    /// counter-clockwise in the camera's x/y frame
+    uv_far_cards: usize,
+    clockwise: usize,
+    counter_clockwise: usize,
     card_errors: Vec<String>,
 }
 
@@ -136,6 +141,16 @@ fn main() {
                                 leaf.cards += cards.len();
                                 for c in &cards {
                                     *leaf.wind_groups.entry(c.wind_group).or_default() += 1;
+                                    leaf.uv_far_cards += usize::from(c.corners.iter().any(|k| k.uv.iter().any(|&u| !(-0.25..=1.25).contains(&u))));
+                                    for t in &c.triangles {
+                                        let p = t.map(|i| c.corners[usize::from(i)].offset);
+                                        let area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+                                        if area < 0.0 {
+                                            leaf.clockwise += 1;
+                                        } else if area > 0.0 {
+                                            leaf.counter_clockwise += 1;
+                                        }
+                                    }
                                     for k in &c.corners {
                                         leaf.max_depth = leaf.max_depth.max(k.offset[2].abs());
                                         leaf.max_reach = leaf.max_reach.max(k.offset[0].abs().max(k.offset[1].abs()));
@@ -232,9 +247,12 @@ fn main() {
             leaf.models, leaf.elems, leaf.vertices, leaf.strides, leaf.uv_outside, leaf.normal_off, leaf.shadow_matched
         );
         println!(
-            "leaf cards: {} (all LODs), by wind group {:?}; corner offsets reach {:.2} m across the card and {:.2} m in depth at most; {} elements that are not cards: {:?}",
+            "leaf cards: {} (all LODs), by wind group {:?}; {} with a uv more than 0.25 outside 0..1; triangles {} clockwise and {} counter-clockwise in the camera's x/y frame; corner offsets reach {:.2} m across the card and {:.2} m in depth at most; {} elements that are not cards: {:?}",
             leaf.cards,
             leaf.wind_groups,
+            leaf.uv_far_cards,
+            leaf.clockwise,
+            leaf.counter_clockwise,
             leaf.max_reach,
             leaf.max_depth,
             leaf.card_errors.len(),

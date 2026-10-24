@@ -114,6 +114,7 @@ pub fn is_facing_leaves(class: &str) -> bool {
 /// faces the viewer). Nothing in the file gives a card a fixed place in the object's space beyond its
 /// centre.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct LeafVertex {
     /// The card's centre in the object's space, metres
     pub centre: [f32; 3],
@@ -154,7 +155,9 @@ pub struct LeafCard {
     /// The wind group (0 to 3) the corners move with, the same on all four corners in every card of the
     /// game's trees. The wind itself is the game's runtime state, not data.
     pub wind_group: u8,
-    /// The two triangles as the file draws them, indices into `corners`
+    /// The two triangles as the file draws them, indices into `corners`. They are not rewound: seen in
+    /// the camera's x/y frame about 80% of the game's triangles run clockwise and 20% counter-clockwise,
+    /// so the winding says nothing about a front, and a card has to be drawn double-sided.
     pub triangles: [[u8; 3]; 2],
 }
 
@@ -162,8 +165,10 @@ impl LeafCard {
     /// The corners' positions for a camera whose axes are `right`, `up` and `toward_viewer` (unit
     /// vectors in the same space as the centre, and the unit `toward_viewer` pointing from the scene
     /// to the camera): `centre + x * right + y * up + z * toward_viewer`. This is the expansion the
-    /// engine's own leaf code does (`bvh_process_leaves_vertices.dshl`) with the wind at rest, the
-    /// identity matrices `LeavesWindEffect::setNoAnimShaderVars` sets.
+    /// engine's own leaf code does (`bvh_process_leaves_vertices.dshl`) with the wind at rest. At rest
+    /// the engine's wind matrices are not identity but the camera's own axes (the columns of the view's
+    /// inverse, the Z one negated: `LeavesWindEffect::setNoAnimShaderVars`), which is what `right`, `up`
+    /// and `toward_viewer` are.
     pub fn corners_facing(&self, right: [f32; 3], up: [f32; 3], toward_viewer: [f32; 3]) -> [[f32; 3]; 4] {
         self.corners.map(|c| {
             let [x, y, z] = c.offset;
@@ -476,6 +481,8 @@ impl RiModel {
         let short = |o: usize| f32::from(i16::from_le_bytes([v[o], v[o + 1]]));
         // The engine's four wind groups, as the index of each group's first row (three rows per group)
         let wind = half(18);
+        let finite = [0, 2, 4, 12, 14, 16].iter().all(|&o| half(o).is_finite());
+        ensure!(finite, "vertex {index} has a centre or corner offset that is not a finite number");
         ensure!([0.0, 3.0, 6.0, 9.0].contains(&wind), "vertex {index} has wind index {wind}, not the first row of one of the four wind groups");
         Ok(LeafVertex {
             centre: [half(0), half(2), half(4)],
@@ -498,11 +505,17 @@ impl RiModel {
             elem.triangles.checked_mul(3).and_then(|n| n.checked_add(elem.first_index)).and_then(|end| vdata.indices.get(elem.first_index..end)).context("element index range is out of bounds")?;
         let mut cards = Vec::with_capacity(range.len() / 6);
         for pair in range.chunks(6) {
-            let ids: Vec<usize> = pair.iter().map(|&i| i as usize + elem.base_vertex).collect();
+            let ids = pair.iter().map(|&i| (i as usize).checked_add(elem.base_vertex).context("leaf vertex index overflows")).collect::<Result<Vec<usize>>>()?;
             let mut corners = ids.clone();
             corners.sort_unstable();
             corners.dedup();
             ensure!(corners.len() == 4, "a pair of leaf triangles over {} vertices, not 4", corners.len());
+            // Each triangle has three different corners and the two share exactly one edge
+            let shared = ids[..3].iter().filter(|v| ids[3..].contains(v)).count();
+            ensure!(
+                ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2] && ids[3] != ids[4] && ids[4] != ids[5] && ids[3] != ids[5] && shared == 2,
+                "a pair of leaf triangles that do not share exactly one edge"
+            );
             let verts = corners.iter().map(|&v| self.leaf_vertex(vdata, v)).collect::<Result<Vec<_>>>()?;
             ensure!(
                 verts.iter().all(|v| v.centre == verts[0].centre && v.normal == verts[0].normal && v.wind_group == verts[0].wind_group),
@@ -802,6 +815,27 @@ mod tests {
             };
             let (m, e) = leaf_model(v, vec![0, 1, 2, 0, 2, 3]);
             assert!(m.leaf_cards(&e).unwrap_err().to_string().contains("differ"), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_card_needs_two_whole_triangles_that_share_an_edge_and_finite_numbers() {
+        let good = card_vertices([1.0, 2.0, 3.0], 0.0);
+        // Four vertices but a degenerate second triangle
+        for indices in [vec![0, 1, 2, 0, 0, 3], vec![0, 1, 2, 3, 3, 3], vec![0, 0, 2, 1, 2, 3]] {
+            let (m, e) = leaf_model(good.clone(), indices);
+            assert!(m.leaf_cards(&e).unwrap_err().to_string().contains("share exactly one edge"));
+        }
+        // An index that overflows when the base vertex is added
+        let (m, mut e) = leaf_model(good.clone(), vec![0, 1, 2, 0, 2, 3]);
+        e.base_vertex = usize::MAX;
+        assert!(m.leaf_cards(&e).unwrap_err().to_string().contains("overflows"));
+        // A centre or an offset that is infinite or not a number
+        for (bad, at) in [(0x7C00u16, 0usize), (0x7E00, 2), (0xFC00, 12), (0x7E00, 16)] {
+            let mut v = good.clone();
+            v[1][at..at + 2].copy_from_slice(&bad.to_le_bytes());
+            let (m, e) = leaf_model(v, vec![0, 1, 2, 0, 2, 3]);
+            assert!(m.leaf_cards(&e).unwrap_err().to_string().contains("finite"), "{at}");
         }
     }
 

@@ -727,7 +727,7 @@ fn scene_stats_cmd(file: &Path, lod_distance: Option<f32>) -> Result<()> {
     }
     let wt = WarThunder::new(&game).with_scene_options(options);
     let start = std::time::Instant::now();
-    let (scene, r) = wt.load_level(&id)?;
+    let (scene, r, leaves) = wt.load_level_with_leaves(&id)?;
     let loaded = start.elapsed();
     let distinct = scene.models.len();
     println!();
@@ -738,6 +738,13 @@ fn scene_stats_cmd(file: &Path, lod_distance: Option<f32>) -> Result<()> {
         None => println!("  water: none (the level settings have no water_level)"),
     }
     println!("  objects: {} models resolved, {} placements, {} triangles in the models, {} drawn in all, {} textured materials", r.object_models, r.instances, r.object_triangles, r.drawn_triangles, r.object_textures);
+    println!(
+        "  leaf cards (WarThunder::load_level_with_leaves; camera-facing, so not in the scene's meshes): {} models with {} cards, {} placements ({} cards drawn in all)",
+        r.leaf_models,
+        r.leaf_cards,
+        leaves.instances.len(),
+        r.leaf_cards_drawn
+    );
     let mut heavy: Vec<(usize, usize, &str)> = Vec::new();
     for m in &scene.models {
         if let SceneModel::Inline(m) = m {

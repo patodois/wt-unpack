@@ -44,6 +44,9 @@ installed copy:
   the track gauge, the wheel radii and the track texture rate, and a small driving model. Only the skeleton and
   meshes are read, so it is quick. `wt_unpack::rig` documents every field with its source key and unit.
 - **Collision of level objects**, `WarThunder::load_level_collision(level_id)`, since `Scene` has no field for it.
+- **Leaf cards of level trees**, `WarThunder::load_level_with_leaves(level_id)`, since `Scene` has no camera-facing primitive: the
+  cards (centre, corner offsets in the camera's frame, uv, normal, wind group, texture) beside the same scene (see "Tree leaves" in
+  [LEVELS.md](LEVELS.md)).
 
 ```rust
 use rewrite_bridge::Provider;

@@ -20,7 +20,8 @@ a small crate of model, animation and scene types that rewrites share (see [Usin
 - **Levels:** the binary level dumps in `levels/` (`DBLD`): their blocks, the terrain (the `HM2`
   heightmap, or the landmesh's collision mesh), the ground's land classes and weights, and the placed
   objects (rendinst) with their transforms, rotations and real models. With the bridge feature a level
-  loads as a whole scene ([docs/LEVELS.md](docs/LEVELS.md)).
+  loads as a whole scene ([docs/LEVELS.md](docs/LEVELS.md)); the camera-facing leaf cards of its trees,
+  which a `Scene` cannot hold, come beside it (`WarThunder::load_level_with_leaves`).
 - **Rigs and collision:** the data a game rewrite needs to drive a tank (turret limits, drive train, wheels,
   track belts, named attachment points) as plain structs, and the collision shapes of placed objects
   ([docs/BRIDGE.md](docs/BRIDGE.md)).

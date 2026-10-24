@@ -11,12 +11,17 @@
 //!
 //! `--eye` and `--at` are in the game's world axes (x, height, z), `--fov` is vertical degrees. Several
 //! pictures from one load: `--view "out.png|x,y,z|x,y,z|fov"`, repeated.
+//!
+//! `--leaves` also draws the leaf cards of trees and bushes, which a `Scene` cannot hold because they face
+//! the camera: they come from `WarThunder::load_level_with_leaves`, and each card is expanded for the
+//! view being drawn, the way the game does with the wind at rest (`LeafCard::corners_facing`).
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use rewrite_bridge::{AlphaMode, Instance, Model, Provider, Scene, SceneModel};
 use wt_unpack::bridge::WarThunder;
+use wt_unpack::scene::SceneLeaves;
 
 type V3 = [f32; 3];
 
@@ -218,7 +223,7 @@ fn len(a: V3) -> f32 {
     dot(a, a).sqrt()
 }
 
-fn render(scene: &Scene, cam: &Camera, threads: usize, background: [u8; 3]) -> Vec<[u8; 3]> {
+fn render(scene: &Scene, leaves: Option<&SceneLeaves>, cam: &Camera, threads: usize, background: [u8; 3]) -> Vec<[u8; 3]> {
     let bounds: Vec<Option<(V3, f32)>> = scene.models.iter().map(|m| if let SceneModel::Inline(m) = m { Some(bounds(m)) } else { None }).collect();
     let rows = cam.h.div_ceil(threads);
     let mut bands: Vec<Band> = (0..threads)
@@ -229,12 +234,22 @@ fn render(scene: &Scene, cam: &Camera, threads: usize, background: [u8; 3]) -> V
         .collect();
     let half_tan = (cam.h as f32 * 0.5) / cam.focal;
     let half_tan_x = (cam.w as f32 * 0.5) / cam.focal;
+    // How far any corner of a model's leaf cards can be from the model's origin, for culling
+    let leaf_radius: Vec<f32> = leaves
+        .map(|l| l.models.iter().map(|m| m.sets.iter().flat_map(|s| &s.cards).map(|c| len(c.centre) + c.corners.iter().map(|k| len(k.offset)).fold(0.0, f32::max)).fold(0.0, f32::max)).collect())
+        .unwrap_or_default();
     std::thread::scope(|s| {
         for band in bands.iter_mut() {
             let bounds = &bounds;
+            let leaf_radius = &leaf_radius;
             s.spawn(move || {
                 for inst in &scene.instances {
                     draw_instance(band, scene, cam, inst, bounds[inst.model], half_tan, half_tan_x);
+                }
+                if let Some(leaves) = leaves {
+                    for inst in &leaves.instances {
+                        draw_leaves(band, leaves, cam, inst, leaf_radius[inst.model], half_tan, half_tan_x);
+                    }
                 }
             });
         }
@@ -297,6 +312,44 @@ fn draw_instance(band: &mut Band, scene: &Scene, cam: &Camera, inst: &Instance, 
     }
 }
 
+/// Draws the leaf cards of one placed object, each expanded for the camera: the corners' offsets are in the
+/// camera's frame (x right, y up, z towards the viewer), carried into the object's space by the inverse
+/// of the placement's rotation and then placed with the whole transform, as the engine's leaf code does
+fn draw_leaves(band: &mut Band, leaves: &SceneLeaves, cam: &Camera, inst: &Instance, radius: f32, half_tan: f32, half_tan_x: f32) {
+    let t = &inst.transform;
+    // The whole object is out of sight, or smaller than half a pixel
+    let reach = radius * t.scale[0].abs().max(t.scale[1].abs()).max(t.scale[2].abs());
+    let vo = cam.view(t.translation);
+    if vo[2] + reach < NEAR || vo[0].abs() > vo[2].max(0.0) * half_tan_x + reach || vo[1].abs() > vo[2].max(0.0) * half_tan + reach || vo[2] > 0.0 && reach / vo[2] * cam.focal < 0.5 {
+        return;
+    }
+    let back = [-cam.forward[0], -cam.forward[1], -cam.forward[2]];
+    let inverse = [-t.rotation[0], -t.rotation[1], -t.rotation[2], t.rotation[3]];
+    let place = |p: V3| {
+        let s = [p[0] * t.scale[0], p[1] * t.scale[1], p[2] * t.scale[2]];
+        let w = rotate(t.rotation, s);
+        [w[0] + t.translation[0], w[1] + t.translation[1], w[2] + t.translation[2]]
+    };
+    let (right, up, toward) = (rotate(inverse, cam.right), rotate(inverse, cam.up), rotate(inverse, back));
+    for set in &leaves.models[inst.model].sets {
+        let tex = set.base_color.as_ref().map(|i| Tex { w: i.width as usize, h: i.height as usize, rgba: &i.rgba, clamp: false });
+        let mask = if let AlphaMode::Mask(c) = set.alpha { Some(c) } else { None };
+        for card in &set.cards {
+            let nw = rotate(t.rotation, card.normal);
+            let n = [dot(nw, cam.right), dot(nw, cam.up), dot(nw, cam.forward)];
+            let corners = card.corners_facing(right, up, toward).map(place);
+            let v: Vec<Vtx> = corners.iter().zip(&card.corners).map(|(p, c)| Vtx { p: cam.view(*p), n, uv: c.uv }).collect();
+            for tri in card.triangles {
+                let tri = [v[tri[0] as usize], v[tri[1] as usize], v[tri[2] as usize]];
+                if tri.iter().all(|x| x.p[2] < NEAR) {
+                    continue;
+                }
+                draw_tri(band, cam, tri, tex.as_ref(), [1.0; 4], mask, true);
+            }
+        }
+    }
+}
+
 fn parse3(s: &str) -> V3 {
     let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().expect("number")).collect();
     [v[0], v[1], v[2]]
@@ -313,13 +366,14 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     anyhow::ensure!(
         args.len() >= 3,
-        "usage: render_scene <game> <levels/x.bin> [<out.png> --eye x,y,z --at x,y,z] [--view out.png|x,y,z|x,y,z|fov]... [--size WxH] [--fov deg] [--ssaa n] [--lod m] [--background r,g,b]"
+        "usage: render_scene <game> <levels/x.bin> [<out.png> --eye x,y,z --at x,y,z] [--view out.png|x,y,z|x,y,z|fov]... [--size WxH] [--fov deg] [--ssaa n] [--lod m] [--background r,g,b] [--leaves]"
     );
     let (game, id) = (PathBuf::from(&args[1]), args[2].clone());
     let mut views: Vec<View> = Vec::new();
     let mut single = (None::<PathBuf>, [2048.0, 600.0, 200.0], [2048.0, 40.0, 2048.0]);
     let (mut w, mut h, mut fov, mut ssaa) = (1280usize, 720usize, 60.0f32, 2usize);
     let mut lod = None;
+    let mut with_leaves = false;
     let mut background = [196u8, 204, 214];
     let mut i = 3;
     if args.get(3).is_some_and(|a| !a.starts_with("--")) {
@@ -327,6 +381,11 @@ fn main() -> anyhow::Result<()> {
         i = 4;
     }
     while i < args.len() {
+        if args[i] == "--leaves" {
+            with_leaves = true;
+            i += 1;
+            continue;
+        }
         let val = args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
             "--eye" => single.1 = parse3(&val),
@@ -361,15 +420,23 @@ fn main() -> anyhow::Result<()> {
     }
     let wt = WarThunder::new(&game).with_scene_options(options);
     let t0 = Instant::now();
-    let scene = wt.load_scene(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (scene, leaves) = if with_leaves {
+        let (scene, _, leaves) = wt.load_level_with_leaves(&id)?;
+        (scene, Some(leaves))
+    } else {
+        (wt.load_scene(&id).map_err(|e| anyhow::anyhow!("{e}"))?, None)
+    };
     eprintln!("scene {}: {} models, {} instances, loaded in {:.1} s", scene.name, scene.models.len(), scene.instances.len(), t0.elapsed().as_secs_f32());
+    if let Some(l) = &leaves {
+        eprintln!("leaf cards: {} models, {} cards, {} placements", l.models.len(), l.card_count(), l.instances.len());
+    }
     for v in &views {
-        render_view(&scene, v, w, h, ssaa, background)?;
+        render_view(&scene, leaves.as_ref(), v, w, h, ssaa, background)?;
     }
     Ok(())
 }
 
-fn render_view(scene: &Scene, view: &View, w: usize, h: usize, ssaa: usize, background: [u8; 3]) -> anyhow::Result<()> {
+fn render_view(scene: &Scene, leaves: Option<&SceneLeaves>, view: &View, w: usize, h: usize, ssaa: usize, background: [u8; 3]) -> anyhow::Result<()> {
     // The world axes of the game (x, height, z) become the bridge's (z, height, x)
     let to_bridge = |p: V3| [p[2], p[1], p[0]];
     let (eye_b, at_b) = (to_bridge(view.eye), to_bridge(view.at));
@@ -382,7 +449,7 @@ fn render_view(scene: &Scene, view: &View, w: usize, h: usize, ssaa: usize, back
     let cam = Camera { eye: eye_b, right, up, forward, focal, w: rw, h: rh };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
     let t1 = Instant::now();
-    let pixels = render(scene, &cam, threads, background);
+    let pixels = render(scene, leaves, &cam, threads, background);
     eprintln!("rendered {rw}x{rh} on {threads} threads in {:.1} s", t1.elapsed().as_secs_f32());
 
     // Downsample

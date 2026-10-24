@@ -6,7 +6,9 @@
 //! in the game's packs use: facing-leaves elements as [`LeafVertex`] and the rest with the buffer's
 //! declaration, as `scene` does. With `NAIVE=1` it decodes everything with the declaration, which is
 //! what the reader did before facing leaves were told apart. Prints each model with a vertex beyond the
-//! far distance, then a summary by material class.
+//! far distance, then a summary by material class. Every facing-leaves element is also read as leaf cards
+//! (two triangles over four corners with one centre, normal and wind group), and the cards and the
+//! wind groups are counted.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -50,6 +52,13 @@ struct LeafStats {
     shadow_matched: usize,
     shadow_mismatched: Vec<String>,
     no_shadow: Vec<String>,
+    /// Cards read from the elements, by wind group, and the elements that are not made of cards
+    cards: usize,
+    wind_groups: BTreeMap<u8, usize>,
+    /// The largest depth offset (z) and the largest |x| or |y| offset of any corner, metres
+    max_depth: f32,
+    max_reach: f32,
+    card_errors: Vec<String>,
 }
 
 fn near(a: f32, b: f32) -> bool {
@@ -122,6 +131,19 @@ fn main() {
                         had_leaves = true;
                         leaf.elems += 1;
                         *leaf.strides.entry(vd.stride).or_default() += 1;
+                        match m.leaf_cards(e) {
+                            Ok(cards) => {
+                                leaf.cards += cards.len();
+                                for c in &cards {
+                                    *leaf.wind_groups.entry(c.wind_group).or_default() += 1;
+                                    for k in &c.corners {
+                                        leaf.max_depth = leaf.max_depth.max(k.offset[2].abs());
+                                        leaf.max_reach = leaf.max_reach.max(k.offset[0].abs().max(k.offset[1].abs()));
+                                    }
+                                }
+                            }
+                            Err(err) => leaf.card_errors.push(format!("{} lod{l}: {err:#}", res.name)),
+                        }
                     }
                     let mut seen_v = HashSet::new();
                     let (mut far_n, mut out_n, mut worst) = (0usize, 0usize, 0.0f32);
@@ -208,6 +230,15 @@ fn main() {
         println!(
             "\nfacing leaves: {} models, {} elements, {} vertices; strides {:?}; {} uv outside 0..1, {} normals off unit length; LOD 0 equals the file's shadow points in {} models",
             leaf.models, leaf.elems, leaf.vertices, leaf.strides, leaf.uv_outside, leaf.normal_off, leaf.shadow_matched
+        );
+        println!(
+            "leaf cards: {} (all LODs), by wind group {:?}; corner offsets reach {:.2} m across the card and {:.2} m in depth at most; {} elements that are not cards: {:?}",
+            leaf.cards,
+            leaf.wind_groups,
+            leaf.max_reach,
+            leaf.max_depth,
+            leaf.card_errors.len(),
+            leaf.card_errors
         );
         println!("shadow mismatches: {:?}", leaf.shadow_mismatched);
         println!("no shadow points: {:?}", leaf.no_shadow);

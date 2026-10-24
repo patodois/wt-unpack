@@ -23,7 +23,8 @@
 //!
 //! Levels are scenes: `levels/avg_berlin.bin` is listed as [`AssetKind::Level`] and loaded with
 //! `load_scene` (see [`crate::scene`]); the collision of their objects comes from
-//! [`WarThunder::load_level_collision`] (see [`crate::level_collision`]).
+//! [`WarThunder::load_level_collision`] (see [`crate::level_collision`]); the camera-facing leaf cards of
+//! their trees, which a `Scene` cannot hold, from [`WarThunder::load_level_with_leaves`].
 //!
 //! The provider owns the indexes it builds (textures, packs, units), nothing is global, and
 //! [`WarThunder::clear_caches`] drops them and hands freed memory back.
@@ -44,7 +45,7 @@ use wt_blk::dxp_and_grp::grp_pack::{class_id, GrpPack};
 
 use crate::level_collision::{load_level_collision, load_object, LevelCollision, ObjectCollision};
 use crate::rig::{to_bridge_axes, VehicleRig};
-use crate::scene::{load_level_scene_with, LevelSources, SceneOptions, SceneReport};
+use crate::scene::{load_level_scene_with, load_level_scene_with_leaves, LevelSources, SceneLeaves, SceneOptions, SceneReport};
 use crate::tank::{self, UnitIndex};
 use crate::vehicle::{self, Library, TextureIndex, Vehicle};
 
@@ -190,6 +191,12 @@ impl WarThunder {
     /// Loads a level with the report of what went into it
     pub fn load_level(&self, id: &str) -> Result<(Scene, SceneReport)> {
         load_level_scene_with(&self.game, &self.level_file(id)?, &self.scene_options, &self.level_sources()?)
+    }
+
+    /// Like [`WarThunder::load_level`], with the leaf cards of the trees and bushes the scene leaves out: they
+    /// face the camera, which `Scene` cannot say (see [`crate::scene`]). The scene is the same.
+    pub fn load_level_with_leaves(&self, id: &str) -> Result<(Scene, SceneReport, SceneLeaves)> {
+        load_level_scene_with_leaves(&self.game, &self.level_file(id)?, &self.scene_options, &self.level_sources()?)
     }
 
     /// Every vehicle pack, as `folder/pack.grp` -> its file (patched copies replace the originals)

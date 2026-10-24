@@ -20,7 +20,7 @@
 //! Not every element's vertices follow the vertex declaration stored with the buffer: the declaration
 //! describes the buffer's first meshes, but the layout of an element's vertices is the one its shader
 //! asks for, and a buffer can hold several. `rendinst_facing_leaves` elements (camera-facing leaf cards of
-//! trees) are the case this reader knows: see [`LeafVertex`] and [`is_facing_leaves`].
+//! trees) are the case this reader knows: see [`LeafVertex`], [`LeafCard`] and [`is_facing_leaves`].
 //!
 //! A LOD's `range` is the distance up to which it is used. A model with an impostor has one more LOD
 //! at the end: a camera-facing billboard (material class `rendinst_baked_impostor`).
@@ -117,10 +117,59 @@ pub fn is_facing_leaves(class: &str) -> bool {
 pub struct LeafVertex {
     /// The card's centre in the object's space, metres
     pub centre: [f32; 3],
-    /// Offset of this corner from the centre (the third component is the depth offset), metres
+    /// Offset of this corner from the centre in the camera's frame, metres: x along the camera's right,
+    /// y along its up, and z the depth offset (see [`LeafCorner::offset`])
     pub corner: [f32; 3],
+    /// The wind group (0 to 3) whose matrix moves the corner. The file stores the index of the group's
+    /// first row in the shader's array of three rows per group, 0, 3, 6 or 9.
+    pub wind_group: u8,
     pub uv: [f32; 2],
     pub normal: [f32; 3],
+}
+
+/// One corner of a [`LeafCard`]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LeafCorner {
+    /// Offset from the card's centre in the camera's frame, in metres: x along the camera's right and
+    /// y along its up, as the file stores them, and z the depth offset along the camera's axis.
+    /// The engine's wind code hands the shader the camera's Z axis negated
+    /// (`LeavesWindEffect::setShaderVars`), so a positive z moves the corner towards the camera. The
+    /// frame is the camera's, not the object's, so the offset does not turn with the object's axes.
+    pub offset: [f32; 3],
+    pub uv: [f32; 2],
+}
+
+/// A camera-facing leaf card of a tree: two triangles over four corners that share one centre. What the
+/// file defines is the centre in the object's space, each corner's offset from it in the *camera's*
+/// frame, the texture coordinates, one normal and the wind group; where the corners land in the
+/// object's space depends on where the camera is, and the file has no orientation of its own to draw
+/// them in. [`LeafCard::corners_facing`] expands a card for a camera.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LeafCard {
+    /// The card's centre, metres, in the object's space (the container says which axes)
+    pub centre: [f32; 3],
+    pub corners: [LeafCorner; 4],
+    /// The vertices' normal, the same on all four corners in every card of the game's trees
+    pub normal: [f32; 3],
+    /// The wind group (0 to 3) the corners move with, the same on all four corners in every card of the
+    /// game's trees. The wind itself is the game's runtime state, not data.
+    pub wind_group: u8,
+    /// The two triangles as the file draws them, indices into `corners`
+    pub triangles: [[u8; 3]; 2],
+}
+
+impl LeafCard {
+    /// The corners' positions for a camera whose axes are `right`, `up` and `toward_viewer` (unit
+    /// vectors in the same space as the centre, and the unit `toward_viewer` pointing from the scene
+    /// to the camera): `centre + x * right + y * up + z * toward_viewer`. This is the expansion the
+    /// engine's own leaf code does (`bvh_process_leaves_vertices.dshl`) with the wind at rest, the
+    /// identity matrices `LeavesWindEffect::setNoAnimShaderVars` sets.
+    pub fn corners_facing(&self, right: [f32; 3], up: [f32; 3], toward_viewer: [f32; 3]) -> [[f32; 3]; 4] {
+        self.corners.map(|c| {
+            let [x, y, z] = c.offset;
+            [0, 1, 2].map(|k| self.centre[k] + x * right[k] + y * up[k] + z * toward_viewer[k])
+        })
+    }
 }
 
 /// Bytes per vertex of a facing-leaves element
@@ -413,8 +462,10 @@ impl RiModel {
     /// Decodes vertex `index` of vertex buffer `vdata` as the vertex of a `rendinst_facing_leaves`
     /// element. The layout is the shader's (the buffer's declaration describes the tree's other meshes),
     /// 24 bytes: `HALF4` centre (w is 1), `SHORT2` texture coordinates in 1/4096, `HALF4` corner offset
-    /// (z, then 0), `E3DCOLOR` normal. The file checks it: the model's `ImpostorData` lists the same
-    /// centres and corner offsets in single precision ([`ImpostorData::shadow_points`]).
+    /// (x, y, z, then the wind index), `E3DCOLOR` normal. The file checks it: the model's `ImpostorData`
+    /// lists the same centres and corner offsets in single precision ([`ImpostorData::shadow_points`]),
+    /// and the engine's own reader of these vertices (`bvh_process_leaves_vertices.dshl`) takes the same
+    /// fields, the last as `windNo`, an index into its array of three wind rows per group.
     pub fn leaf_vertex(&self, vdata: &VData, index: usize) -> Result<LeafVertex> {
         ensure!(vdata.stride == LEAF_STRIDE, "facing leaves have {LEAF_STRIDE}-byte vertices, the buffer has {}", vdata.stride);
         let v = index
@@ -423,12 +474,50 @@ impl RiModel {
             .with_context(|| format!("vertex {index} out of range"))?;
         let half = |o: usize| half_to_f32(u16::from_le_bytes([v[o], v[o + 1]]));
         let short = |o: usize| f32::from(i16::from_le_bytes([v[o], v[o + 1]]));
+        // The engine's four wind groups, as the index of each group's first row (three rows per group)
+        let wind = half(18);
+        ensure!([0.0, 3.0, 6.0, 9.0].contains(&wind), "vertex {index} has wind index {wind}, not the first row of one of the four wind groups");
         Ok(LeafVertex {
             centre: [half(0), half(2), half(4)],
             corner: [half(12), half(14), half(16)],
+            wind_group: (wind / 3.0) as u8,
             uv: [short(8), short(10)].map(|x| x * TEXCOORD_SCALE),
             normal: [v[22], v[21], v[20]].map(|x| f32::from(x) / 127.5 - 1.0),
         })
+    }
+}
+
+impl RiModel {
+    /// The leaf cards of one `rendinst_facing_leaves` element: its triangles go in pairs, each pair
+    /// over four vertices that share a centre, a normal and a wind group. A pair that is not that
+    /// (the game's own are all) is an error rather than a guess.
+    pub fn leaf_cards(&self, elem: &Elem) -> Result<Vec<LeafCard>> {
+        let vdata = self.vdata.get(elem.vdata).context("element refers to a vertex buffer the model does not have")?;
+        ensure!(elem.triangles & 1 == 0, "{} triangles do not make leaf cards of two", elem.triangles);
+        let range =
+            elem.triangles.checked_mul(3).and_then(|n| n.checked_add(elem.first_index)).and_then(|end| vdata.indices.get(elem.first_index..end)).context("element index range is out of bounds")?;
+        let mut cards = Vec::with_capacity(range.len() / 6);
+        for pair in range.chunks(6) {
+            let ids: Vec<usize> = pair.iter().map(|&i| i as usize + elem.base_vertex).collect();
+            let mut corners = ids.clone();
+            corners.sort_unstable();
+            corners.dedup();
+            ensure!(corners.len() == 4, "a pair of leaf triangles over {} vertices, not 4", corners.len());
+            let verts = corners.iter().map(|&v| self.leaf_vertex(vdata, v)).collect::<Result<Vec<_>>>()?;
+            ensure!(
+                verts.iter().all(|v| v.centre == verts[0].centre && v.normal == verts[0].normal && v.wind_group == verts[0].wind_group),
+                "the corners of a leaf card differ in centre, normal or wind group"
+            );
+            let local = |v: usize| corners.iter().position(|&c| c == v).unwrap_or(0) as u8;
+            cards.push(LeafCard {
+                centre: verts[0].centre,
+                corners: [0, 1, 2, 3].map(|k| LeafCorner { offset: verts[k].corner, uv: verts[k].uv }),
+                normal: verts[0].normal,
+                wind_group: verts[0].wind_group,
+                triangles: [[local(ids[0]), local(ids[1]), local(ids[2])], [local(ids[3]), local(ids[4]), local(ids[5])]],
+            });
+        }
+        Ok(cards)
     }
 }
 
@@ -598,6 +687,138 @@ mod tests {
         // Other strides are not leaves, and neither is a vertex that is not there
         assert!(m.leaf_vertex(&leaf_buffer(12), 0).is_err());
         assert!(m.leaf_vertex(&leaf_buffer(24), 1).is_err());
+    }
+
+    /// A half float of a value that is exactly representable (zero, or a normal number)
+    fn half_bits(x: f32) -> u16 {
+        if x == 0.0 {
+            return 0;
+        }
+        let b = x.to_bits();
+        let (sign, exp, frac) = ((b >> 16) & 0x8000, ((b >> 23) & 0xFF) as i32 - 127 + 15, (b >> 13) & 0x3FF);
+        assert!((1..31).contains(&exp) && b & 0x1FFF == 0, "{x} is not an exact half");
+        (sign | ((exp as u32) << 10) | frac) as u16
+    }
+
+    /// A 24-byte leaf vertex: centre, uv in 1/4096, corner and wind index, normal (b, g, r, a)
+    fn leaf_bytes(centre: [f32; 3], uv: [i16; 2], corner: [f32; 3], wind: f32, normal_bgra: [u8; 4]) -> [u8; 24] {
+        let mut v = Vec::new();
+        for x in [centre[0], centre[1], centre[2], 1.0] {
+            v.extend(half_bits(x).to_le_bytes());
+        }
+        v.extend(uv[0].to_le_bytes());
+        v.extend(uv[1].to_le_bytes());
+        for x in [corner[0], corner[1], corner[2], wind] {
+            v.extend(half_bits(x).to_le_bytes());
+        }
+        v.extend(normal_bgra);
+        v.try_into().unwrap()
+    }
+
+    fn leaf_model(vertices: Vec<[u8; 24]>, indices: Vec<u32>) -> (RiModel, Elem) {
+        let triangles = indices.len() / 3;
+        let vd = VData { stride: 24, vertices: vertices.concat(), indices, channels: Vec::new() };
+        let elem = Elem { vdata: 0, material: 0, first_index: 0, base_vertex: 0, triangles };
+        let mut m = model(&[10.0], false);
+        m.vdata = vec![vd];
+        (m, elem)
+    }
+
+    fn one_vertex(bytes: [u8; 24]) -> VData {
+        VData { stride: 24, vertices: bytes.to_vec(), indices: Vec::new(), channels: Vec::new() }
+    }
+
+    /// One card: corners at (+-0.5, +-0.25) from the centre, with depth offsets on two of them
+    fn card_vertices(centre: [f32; 3], wind: f32) -> Vec<[u8; 24]> {
+        [(0.5, 0.25, 0.125, [0, 4096]), (-0.5, 0.25, -0.125, [4096, 4096]), (-0.5, -0.25, 0.0, [4096, 0]), (0.5, -0.25, 0.0, [0, 0])]
+            .iter()
+            .map(|&(x, y, z, uv)| leaf_bytes(centre, uv, [x, y, z], wind, [255, 128, 128, 0]))
+            .collect()
+    }
+
+    #[test]
+    fn leaf_vertices_carry_their_wind_group() {
+        let m = model(&[10.0], false);
+        for (w, group) in [(0.0, 0), (3.0, 1), (6.0, 2), (9.0, 3)] {
+            let v = m.leaf_vertex(&one_vertex(leaf_bytes([1.0, 2.0, 3.0], [0, 0], [0.5, 0.25, 0.125], w, [0, 0, 0, 0])), 0).unwrap();
+            assert_eq!((v.wind_group, v.corner), (group, [0.5, 0.25, 0.125]), "{w}");
+        }
+        // Not the first row of a group (or not a number): refused, not rounded to a group
+        for w in [1.0, 2.0, 4.0, 12.0, -3.0] {
+            let err = m.leaf_vertex(&one_vertex(leaf_bytes([1.0, 2.0, 3.0], [0, 0], [0.5, 0.25, 0.125], w, [0, 0, 0, 0])), 0).unwrap_err().to_string();
+            assert!(err.contains("wind index"), "{w}: {err}");
+        }
+        let mut nan = leaf_bytes([1.0, 2.0, 3.0], [0, 0], [0.5, 0.25, 0.125], 0.0, [0, 0, 0, 0]);
+        nan[18..20].copy_from_slice(&0x7E00u16.to_le_bytes());
+        assert!(m.leaf_vertex(&one_vertex(nan), 0).is_err());
+    }
+
+    #[test]
+    fn two_triangles_over_four_vertices_are_a_card() {
+        // Two cards in one buffer; the second is drawn with its vertices in another order
+        let mut vertices = card_vertices([1.0, 2.0, 3.0], 0.0);
+        vertices.extend(card_vertices([-4.0, 8.0, 0.5], 6.0));
+        let (mut m, mut elem) = leaf_model(vertices, vec![0, 1, 2, 0, 2, 3, 5, 4, 7, 5, 7, 6]);
+        let cards = m.leaf_cards(&elem).unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].centre, [1.0, 2.0, 3.0]);
+        assert_eq!(cards[0].triangles, [[0, 1, 2], [0, 2, 3]]);
+        assert_eq!(cards[1].triangles, [[1, 0, 3], [1, 3, 2]]);
+        assert_eq!(cards[0].corners[1], LeafCorner { offset: [-0.5, 0.25, -0.125], uv: [1.0, 1.0] });
+        assert_eq!((cards[0].wind_group, cards[1].wind_group), (0, 2));
+        assert!(cards[0].normal.iter().all(|x| x.abs() <= 1.0));
+        // The second card alone, as an element that starts after the first (base vertex 4, indices 0..6)
+        m.vdata[0].indices = vec![0, 1, 2, 0, 2, 3];
+        elem.base_vertex = 4;
+        elem.triangles = 2;
+        let cards = m.leaf_cards(&elem).unwrap();
+        assert_eq!((cards.len(), cards[0].centre, cards[0].wind_group), (1, [-4.0, 8.0, 0.5], 2));
+    }
+
+    #[test]
+    fn what_is_not_a_card_is_refused() {
+        let good = card_vertices([1.0, 2.0, 3.0], 0.0);
+        // An odd triangle, a pair over five vertices, an index range or a buffer the model does not have
+        let (m, e) = leaf_model(good.clone(), vec![0, 1, 2]);
+        assert!(m.leaf_cards(&e).unwrap_err().to_string().contains("of two"));
+        let mut five = good.clone();
+        five.push(good[0]);
+        let (m, e) = leaf_model(five, vec![0, 1, 2, 3, 4, 0]);
+        assert!(m.leaf_cards(&e).unwrap_err().to_string().contains('5'));
+        let (m, e) = leaf_model(good.clone(), vec![0, 1, 2, 0, 2, 3]);
+        let mut bad = e;
+        bad.first_index = 3;
+        assert!(m.leaf_cards(&bad).is_err());
+        bad = e;
+        bad.vdata = 1;
+        assert!(m.leaf_cards(&bad).is_err());
+        // Corners with different centres, normals or wind groups
+        for field in 0..3 {
+            let mut v = good.clone();
+            v[2] = match field {
+                0 => leaf_bytes([1.0, 2.0, 3.5], [0, 0], [-0.5, -0.25, 0.0], 0.0, [255, 128, 128, 0]),
+                1 => leaf_bytes([1.0, 2.0, 3.0], [0, 0], [-0.5, -0.25, 0.0], 0.0, [255, 128, 0, 0]),
+                _ => leaf_bytes([1.0, 2.0, 3.0], [0, 0], [-0.5, -0.25, 0.0], 3.0, [255, 128, 128, 0]),
+            };
+            let (m, e) = leaf_model(v, vec![0, 1, 2, 0, 2, 3]);
+            assert!(m.leaf_cards(&e).unwrap_err().to_string().contains("differ"), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_card_expands_in_the_cameras_frame() {
+        let (m, e) = leaf_model(card_vertices([1.0, 2.0, 3.0], 0.0), vec![0, 1, 2, 0, 2, 3]);
+        let card = m.leaf_cards(&e).unwrap()[0];
+        // A camera looking down -Z (right +X, up +Y, towards the viewer +Z): a rectangle 1 wide and 0.5
+        // high round the centre, tilted by its depth offsets
+        let c = card.corners_facing([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        assert_eq!(c, [[1.5, 2.25, 3.125], [0.5, 2.25, 2.875], [0.5, 1.75, 3.0], [1.5, 1.75, 3.0]]);
+        // The camera turned a quarter about Y (right is now -Z, towards the viewer +X): the card turns
+        // with it and keeps its centre
+        let c = card.corners_facing([0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(c[0], [1.125, 2.25, 2.5]);
+        let mean = |k: usize| c.iter().map(|p| p[k]).sum::<f32>() / 4.0;
+        assert_eq!([mean(0), mean(1), mean(2)], [1.0, 2.0, 3.0]);
     }
 
     #[test]

@@ -555,6 +555,102 @@ fn facing_leaves_decode_to_the_centres_and_corners_the_file_lists() {
     assert!(oak.leaf_vertex(trunk, 0).is_err());
 }
 
+/// A leaf card is two triangles over four corners with one centre, one normal and one wind group; each
+/// corner is one of the (centre, offset) records the file lists, the offsets are real card shapes, and the
+/// wind group is one of the engine's four (the sixth half of each vertex, 0, 3, 6 or 9).
+#[test]
+fn leaf_cards_group_the_leaf_vertices_into_the_cards_of_the_file() {
+    let Some(game) = game() else { return };
+    let oak = load_rendinst(&game, "liveoak_01_rendinst");
+    let classes = material_classes(&game, "liveoak_01_rendinst");
+    let shadow = &oak.impostor_data.as_ref().unwrap().shadow_points;
+    let lod = &oak.lods[0];
+    let leaf_elems: Vec<_> = lod.elems.iter().filter(|e| is_facing_leaves(&classes[e.material])).collect();
+    assert_eq!(leaf_elems.len(), 1);
+    let cards = oak.leaf_cards(leaf_elems[0]).unwrap();
+    // 64 triangles, in pairs
+    assert_eq!((leaf_elems[0].triangles, cards.len()), (64, 32));
+    let near = |a: f32, b: f32| (a - b).abs() <= 0.0011 * b.abs() + 2e-4;
+    let mut left: Vec<_> = shadow.iter().collect();
+    for card in &cards {
+        assert!(card.wind_group <= 3);
+        assert!((0..3).all(|k| card.centre[k] >= oak.bbox[0][k] - 0.1 && card.centre[k] <= oak.bbox[1][k] + 0.1), "{card:?}");
+        // The two triangles cover all four corners, once each as a pair of edges
+        let mut used = [false; 4];
+        for &i in card.triangles.iter().flatten() {
+            used[usize::from(i)] = true;
+        }
+        assert_eq!(used, [true; 4]);
+        for c in &card.corners {
+            // The file's list has each (centre, corner) once, with the centre's Y clamped to 0 and above
+            let at = left
+                .iter()
+                .position(|b| near(card.centre[0], b[0][0]) && near(card.centre[1].max(0.0), b[0][1]) && near(card.centre[2], b[0][2]) && (0..3).all(|k| near(c.offset[k], b[1][k])))
+                .unwrap_or_else(|| panic!("corner {c:?} of {card:?} is not in the impostor data"));
+            left.swap_remove(at);
+        }
+    }
+    assert!(left.is_empty(), "{} impostor records are in no card", left.len());
+    // The reach of the cards is the file's own number
+    let reach = cards.iter().flat_map(|c| &c.corners).map(|c| c.offset[0].abs().max(c.offset[1].abs())).fold(0.0f32, f32::max);
+    assert!((reach - oak.impostor_data.as_ref().unwrap().max_facing_leaves_delta).abs() < 0.01, "{reach}");
+    // More than one wind group is in use somewhere in the game's leaves
+    let groups: std::collections::BTreeSet<u8> = ["liveoak_01_rendinst", "liveoak_03_rendinst", "norway_bush_01"]
+        .iter()
+        .flat_map(|name| {
+            let m = load_rendinst(&game, name);
+            let classes = material_classes(&game, name);
+            m.lods.iter().flat_map(|l| &l.elems).filter(|e| is_facing_leaves(&classes[e.material])).flat_map(|e| m.leaf_cards(e).unwrap()).map(|c| c.wind_group).collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(groups.len() >= 2, "{groups:?}");
+    // A trunk element is not made of cards
+    let trunk = lod.elems.iter().find(|e| !is_facing_leaves(&classes[e.material])).unwrap();
+    assert!(oak.leaf_cards(trunk).is_err());
+}
+
+/// The leaves are not in the scene's meshes (a card faces the camera and a `Scene` cannot say that), and are
+/// returned beside it: the scene is the same either way, the oaks keep their trunks, and a bush made only
+/// of leaf cards is no longer "nothing to draw"
+#[cfg(feature = "bridge")]
+#[test]
+fn norway_plain_leaf_cards_come_beside_an_unchanged_scene() {
+    use rewrite_bridge::SceneModel;
+    use wt_unpack::scene::{load_level_scene_with, load_level_scene_with_leaves, LevelSources, SceneOptions};
+    let Some(game) = game() else { return };
+    let file = game.join("levels/arcade_norway_plain.bin");
+    let sources = LevelSources::open(&game).unwrap();
+    let options = SceneOptions::default();
+    let (plain, plain_report) = load_level_scene_with(&game, &file, &options, &sources).unwrap();
+    let (scene, report, leaves) = load_level_scene_with_leaves(&game, &file, &options, &sources).unwrap();
+    scene.validate().unwrap();
+    assert_eq!(scene, plain, "asking for the leaves changes the scene");
+    assert_eq!((plain_report.leaf_models, plain_report.leaf_cards, plain.instances.len()), (0, 0, scene.instances.len()));
+    // Four tree and bush models with 32, 39, 54 and 47 cards at the LOD the scene uses, for 278 placements
+    let mut cards: Vec<(&str, usize)> = leaves.models.iter().map(|m| (m.name.as_str(), m.sets.iter().map(|s| s.cards.len()).sum())).collect();
+    cards.sort();
+    assert_eq!(cards, [("liveoak_01_rendinst", 32), ("liveoak_03_rendinst", 39), ("norway_bush_01", 54), ("norway_bush_02", 47)]);
+    assert_eq!((report.leaf_models, report.leaf_cards, leaves.card_count(), leaves.instances.len(), report.leaf_cards_drawn), (4, 172, 172, 278, 9794));
+    // Each leaf placement has the transform of a scene placement of the same object, and the oaks are also
+    // in the scene as trunks
+    let oak = leaves.models.iter().position(|m| m.name == "liveoak_01_rendinst").unwrap();
+    let in_scene = scene.models.iter().position(|m| matches!(m, SceneModel::Inline(m) if m.name == "liveoak_01_rendinst")).unwrap();
+    let scene_oaks: Vec<_> = scene.instances.iter().filter(|i| i.model == in_scene).map(|i| i.transform).collect();
+    let leaf_oaks: Vec<_> = leaves.instances.iter().filter(|i| i.model == oak).map(|i| i.transform).collect();
+    assert_eq!((scene_oaks.len(), leaf_oaks.len()), (202, 202));
+    assert_eq!(scene_oaks, leaf_oaks);
+    // The bushes have leaves and nothing else
+    assert!(!scene.models.iter().any(|m| matches!(m, SceneModel::Inline(m) if m.name.starts_with("norway_bush"))));
+    assert!(plain_report.failed.iter().any(|(n, _)| n == "norway_bush_01") && !report.failed.iter().any(|(n, _)| n.starts_with("norway_bush")));
+    // The material: the leaf texture with its alpha cutout, and the numbers the material states
+    let set = &leaves.models[oak].sets[0];
+    assert!(set.base_color.as_ref().is_some_and(|i| i.width <= 256 && i.height <= 256));
+    assert!(matches!(set.alpha, rewrite_bridge::AlphaMode::Mask(c) if (c - 127.0 / 255.0).abs() < 1e-3));
+    assert!(set.params.iter().any(|(k, v)| k == "facing_leaves_translucency" && (v - 0.3).abs() < 1e-6));
+    // Centres are in the bridge's axes: inside the model's box turned like a mesh, so the oak's crown is up
+    assert!(set.cards.iter().all(|c| c.centre[1] > -6.0 && c.centre[1] < 61.0 && c.normal.iter().map(|x| x * x).sum::<f32>() > 0.9));
+}
+
 /// A level's placed objects stay near their model's origin, so the level's extent is the level's: the
 /// leaf cards of trees used to put vertices 1e11 m out and its bounding box 2.4e11 m wide
 #[cfg(feature = "bridge")]

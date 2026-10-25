@@ -12,7 +12,7 @@
 //!   is measured from the wheel's mesh. A wheel that rolls without slipping on its track turns by
 //!   `travel / radius`.
 //! - **Track skin.** Tracks are skinned meshes (`track_l`, `track_r`) whose vertices are bound, by the
-//!   bone table `wt_blk` reads, to the `root` bone or to the suspension wheel bones
+//!   bone table `wt_formats` reads, to the `root` bone or to the suspension wheel bones
 //!   (`bone_wheel_<l|r>_<NN>`): the stretch of track around a road wheel follows that wheel's bone, the
 //!   rest of the loop stays with the hull. There are no bones along the links. Moving a bone moves the
 //!   track vertices bound to it ([`vehicle::Mesh::skinned_positions`]), which is how the game bends the

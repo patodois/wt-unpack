@@ -13,10 +13,10 @@ use std::sync::Arc;
 use anyhow::{ensure, Context, Result};
 use memmap2::Mmap;
 
-use wt_blk::dxp_and_grp::{
+use wt_formats::{
     dynmodel::{DynModel, Elem, Lod, Skin, VData},
     geom_node_tree::GeomNodeTree,
-    grp_pack::{class_id, GrpPack},
+    grp::{class_id, GrpPack},
 };
 
 use crate::{blk, bytes, camo};
@@ -237,7 +237,7 @@ impl TextureSource<'_> {
         if !self.packs.contains_key(&path) {
             self.packs.insert(path.clone(), map(&path)?);
         }
-        let pack = wt_blk::dxp_and_grp::dxp::DxpPack::parse(&self.packs[&path])?;
+        let pack = wt_formats::dxp::DxpPack::parse(&self.packs[&path])?;
         let i = pack
             .entries
             .iter()
@@ -723,7 +723,7 @@ fn load_from(library: &Library, pack: &Path, name: &str, lod: usize, with_textur
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wt_blk::dxp_and_grp::dynmodel::{channel, Bone, Channel, SkinMaterial};
+    use wt_formats::dynmodel::{channel, Bone, Channel, SkinMaterial};
 
     #[test]
     fn a_texture_pack_claiming_a_header_the_file_lacks_reserves_nothing() {
@@ -880,8 +880,8 @@ mod tests {
     /// A one-triangle model whose single part sits on the skeleton node "hull" (wtm `m`) with the
     /// vertex normal given as E3DCOLOR bytes; `skin_elem` adds a skinned part of material `skin_material`
     fn one_part(m: [f32; 16], normal: [u8; 3], rigid_material: usize, skin_material: Option<usize>) -> (DynModel, GeomNodeTree) {
-        use wt_blk::dxp_and_grp::dynmodel::{Lod, Rigid};
-        use wt_blk::dxp_and_grp::geom_node_tree::GeomNode;
+        use wt_formats::dynmodel::{Lod, Rigid};
+        use wt_formats::geom_node_tree::GeomNode;
         let mut bytes = Vec::new();
         for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
             bytes.extend(p.iter().flat_map(|v| v.to_le_bytes()));

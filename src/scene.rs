@@ -38,8 +38,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use rewrite_bridge::{AlphaMode, Image, Instance, Material, Mesh, Model, Node, Scene, SceneModel, Transform};
-use wt_blk::dxp_and_grp::dynmodel::Elem;
-use wt_blk::dxp_and_grp::grp_pack::GrpPack;
+use wt_formats::dynmodel::Elem;
+use wt_formats::grp::GrpPack;
 
 use crate::blk::{self, Block, Value};
 use crate::landclass::{decode_colormaps, GroundBaker, GroundMaterial};
@@ -1165,7 +1165,7 @@ mod tests {
     /// A tree made by hand: a trunk triangle (float3 positions, in a 12-byte buffer) and, in a 24-byte
     /// buffer, one leaf card of two triangles around (1, 2, 3)
     fn tree_with_leaves(leaf_triangles: usize) -> RiModel {
-        use wt_blk::dxp_and_grp::dynmodel::{Channel, VData};
+        use wt_formats::dynmodel::{Channel, VData};
         let floats = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let trunk = VData { stride: 12, vertices: floats(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), indices: vec![0, 1, 2], channels: vec![Channel { ty: 2, usage: 0, index: 0, offset: 0 }] };
         // Halves: 1 = 0x3C00, 2 = 0x4000, 3 = 0x4200, 0.5 = 0x3800, 0.25 = 0x3400, 0.125 = 0x3000; the

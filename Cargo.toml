@@ -12,11 +12,10 @@ clap = { version = "4", features = ["derive"] }
 md-5 = "0.10"
 serde_json = { version = "1", features = ["preserve_order"] }
 zstd = "0.13"
-# Texture and model readers from Warthunder-Open-Source-Foundation/wt_blk#28 and #29 (fork branch);
-# switch to crates.io once they are released
-wt_blk = { git = "https://github.com/patodois/wt_blk", rev = "498c996d30e95eac334d33bb7cdcc9ff88e16799", features = ["png"] }
+# GRP model packs, DXP texture packs, DDSx textures, DynModels and skeletons (path dependency until it is published)
+wt-formats = { path = "../wt-formats", features = ["png"] }
 png = "0.18.1"
-# Oodle streams inside level files (the same decoder wt_blk uses)
+# Oodle streams inside level files (the same decoder wt-formats uses)
 oozextract = "0.5.6"
 lewton = { version = "0.10.2", default-features = false }
 memmap2 = "0.9"

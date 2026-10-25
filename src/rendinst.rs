@@ -30,16 +30,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
-use wt_blk::dxp_and_grp::dynmodel::{Channel, Elem, VData};
-use wt_blk::dxp_and_grp::grp_pack::{class_id, GrpPack};
-use wt_blk::dxp_and_grp::meshopt::decode_index_sequence;
+use wt_formats::dynmodel::{Channel, Elem, VData};
+use wt_formats::grp::{class_id, GrpPack};
+use wt_formats::meshopt::decode_index_sequence;
 
 use crate::blk;
 use crate::bytes::Reader;
 use crate::level::{pptr, ptab, unpack};
 use crate::vehicle;
 
-// Vertex channel types and usages (`VSDT_*`, `SCUSAGE_*`), as in wt_blk's `dynmodel::channel`
+// Vertex channel types and usages (`VSDT_*`, `SCUSAGE_*`), as in `wt_formats::dynmodel::channel`
 const FLOAT2: u32 = 1;
 const FLOAT3: u32 = 2;
 const FLOAT4: u32 = 3;

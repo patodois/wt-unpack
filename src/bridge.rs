@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{bail, Context, Result};
 use rewrite_bridge::{AlphaMode, AnimatedModel, AssetInfo, AssetKind, BoxError, Image, Material, Mesh, Model, Node, Provider, Scene, Skin, Socket, Transform};
-use wt_blk::dxp_and_grp::grp_pack::{class_id, GrpPack};
+use wt_formats::grp::{class_id, GrpPack};
 
 use crate::level_collision::{load_level_collision, load_object, LevelCollision, ObjectCollision};
 use crate::rig::{to_bridge_axes, VehicleRig};

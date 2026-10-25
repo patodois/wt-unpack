@@ -30,8 +30,8 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Context, Result};
-use wt_blk::dxp_and_grp::ddsx::{DdsxHeader, Texture};
-use wt_blk::dxp_and_grp::grp_pack::GrpPack;
+use wt_formats::ddsx::{DdsxHeader, Texture};
+use wt_formats::grp::GrpPack;
 
 use crate::blk::{Block, Value};
 use crate::level::{DetailMap, DetailWeights, LegacyCell, LAND_WEIGHT_DET_NUM};

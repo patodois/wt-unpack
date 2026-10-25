@@ -6,10 +6,11 @@ Where the formats come from. Part of the [wt-unpack README](../README.md).
   [Dagor Engine](https://github.com/GaijinEntertainment/DagorEngine) (BSD-3-Clause), mainly
   `vromfsLoad.cpp`, `dag_zstdObfuscate.h` and `blk_serialize.cpp`. No code was copied; the module docs
   describe the layouts.
-- Texture (DDSx/DXP) and model (DynModel, GeomNodeTree, GRP) reading comes from
-  [wt_blk](https://github.com/Warthunder-Open-Source-Foundation/wt_blk). Those readers were contributed
-  there (Warthunder-Open-Source-Foundation/wt_blk#28 and #29), and this crate uses them from a fork
-  until they are merged.
+- Texture (DDSx/DXP) and model (DynModel, GeomNodeTree, GRP) reading is the `wt-formats` crate
+  ([patodois/wt-formats](https://github.com/patodois/wt-formats)). Its `docs/FORMATS.md` writes down the layouts with
+  the evidence for each, and its README credits
+  [wt_blk](https://github.com/Warthunder-Open-Source-Foundation/wt_blk), which documented these formats first;
+  the crate was checked against wt_blk on every GRP and DXP file of the game.
 - Oodle-compressed data is decoded by [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract), pure
   Rust with no proprietary library.
 - Materials and texture names come from `dynModelDesc.bin`.

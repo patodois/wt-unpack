@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use wt_blk::dxp_and_grp::dxp::DxpPack;
+use wt_formats::dxp::DxpPack;
 
 use crate::vehicle::{self, TextureIndex};
 

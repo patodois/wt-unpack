@@ -13,7 +13,7 @@ viewer and the bridge provider both use. All of it comes from the game files:
   `mechanics.driveGearRadius`), and from the wheel's mesh only when a unit does not give one. For the
   Sherman they agree with the meshes within 4 mm for road wheels and idlers; the sprocket's is its pitch
   radius, inside the tips of its teeth.
-- **Track skin.** The tracks are skinned meshes. `wt_blk` reads the bone table in front of each one, which
+- **Track skin.** The tracks are skinned meshes. `wt-formats` reads the bone table in front of each one, which
   binds every track vertex to the `root` node or to one suspension wheel node (`bone_wheel_<l|r>_<NN>`):
   the ring of track under a road wheel follows that wheel, the rest stays with the hull. There are no
   bones along the links. `vehicle::Mesh` carries them as `bones`, `joints` and `weights`, the bridge

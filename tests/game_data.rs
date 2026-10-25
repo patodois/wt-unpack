@@ -304,7 +304,7 @@ fn all_collision_resources_decode_and_stay_in_their_boxes() {
     let (mut resources, mut triangles, mut kinds) = (0usize, 0usize, std::collections::BTreeSet::new());
     for path in packs {
         let file = vehicle::map(&path).unwrap();
-        let Ok(grp) = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file) else { continue };
+        let Ok(grp) = wt_formats::grp::GrpPack::parse(&file) else { continue };
         for r in grp.resources.iter().filter(|r| r.class_id == COLLISION) {
             let c = Collision::parse(&r.name, grp.data(r)).unwrap_or_else(|e| panic!("{}: {e:#}", r.name));
             for n in &c.nodes {
@@ -332,7 +332,7 @@ fn berlin_objects_have_collision_resources() {
     let load = |name: &str| {
         let path = index.find(COLLISION, name).unwrap_or_else(|| panic!("no {name}")).to_path_buf();
         let file = vehicle::map(&path).unwrap();
-        let grp = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+        let grp = wt_formats::grp::GrpPack::parse(&file).unwrap();
         let r = grp.find(name, COLLISION).unwrap();
         Collision::parse(name, grp.data(r)).unwrap()
     };
@@ -413,7 +413,7 @@ fn berlin_ground_material_comes_from_the_level_and_its_land_classes() {
     // The game's own copy of a land class holds the same kind of data
     let path = index.find(LAND_CLASS, "berlin_detailed_biome").expect("the biome land class is in a pack");
     let file = fs::read(path).unwrap();
-    let pack = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+    let pack = wt_formats::grp::GrpPack::parse(&file).unwrap();
     let res = pack.find("berlin_detailed_biome", LAND_CLASS).unwrap();
     let from_pack = landclass::LandClassMaterial::from_block("berlin_detailed_biome", &landclass::resource_detail(pack.data(res)).unwrap());
     assert_eq!((from_pack.kind, from_pack.size, from_pack.colormap.as_deref()), (LandClassKind::Indexed, [4096.0, 4096.0], Some("berlin_detailed_biome_tex_d")));
@@ -438,7 +438,7 @@ fn berlin_objects_resolve_to_rendinst_models_and_trees_have_rotation() {
     let model = |name: &str| {
         let path = index.find(REND_INST, name).unwrap_or_else(|| panic!("{name} is in no pack"));
         let file = fs::read(path).unwrap();
-        let pack = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+        let pack = wt_formats::grp::GrpPack::parse(&file).unwrap();
         let res = pack.find(name, REND_INST).unwrap();
         RiModel::parse(pack.data(res)).unwrap()
     };
@@ -489,7 +489,7 @@ fn material_classes(game: &std::path::Path, name: &str) -> Vec<String> {
 fn load_rendinst(game: &std::path::Path, name: &str) -> RiModel {
     let index = ResourceIndex::build(game, &[REND_INST]).unwrap();
     let file = fs::read(index.find(REND_INST, name).unwrap_or_else(|| panic!("{name} is in no pack"))).unwrap();
-    let pack = wt_blk::dxp_and_grp::grp_pack::GrpPack::parse(&file).unwrap();
+    let pack = wt_formats::grp::GrpPack::parse(&file).unwrap();
     RiModel::parse(pack.data(pack.find(name, REND_INST).unwrap())).unwrap()
 }
 

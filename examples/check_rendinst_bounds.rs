@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use wt_blk::dxp_and_grp::grp_pack::GrpPack;
+use wt_formats::grp::GrpPack;
 use wt_unpack::blk::{self, Value};
 use wt_unpack::level::Level;
 use wt_unpack::rendinst::{is_facing_leaves, ResourceIndex, RiModel, REND_INST};

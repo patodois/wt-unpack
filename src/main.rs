@@ -7,11 +7,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use wt_unpack::blk::SharedContext;
 use wt_unpack::vromfs::Vromfs;
-use wt_blk::dxp_and_grp::{
+use wt_formats::{
     ddsx::{DdsxHeader, Texture},
     dynmodel::DynModel,
     geom_node_tree::GeomNodeTree,
-    grp_pack::{class_id, GrpPack},
+    grp::{class_id, GrpPack},
 };
 use wt_unpack::level::Level;
 use wt_unpack::terrain::{self, HeightGrid};

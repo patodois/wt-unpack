@@ -27,7 +27,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rewrite_bridge::{Material, Mesh, Model, Node};
-use wt_blk::dxp_and_grp::grp_pack::GrpPack;
+use wt_formats::grp::GrpPack;
 
 use crate::collision::{Collision, CollisionNode, NodeKind, COLLISION};
 use crate::level::Level;

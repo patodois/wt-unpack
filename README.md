@@ -358,6 +358,28 @@ Not affiliated with or endorsed by Gaijin Entertainment. War Thunder is a tradem
 Entertainment. Use these tools to read and study game data you own. Do not use them for cheating, and do
 not redistribute game assets.
 
+## Dependencies and credit
+
+Every dependency comes from [crates.io](https://crates.io): the build has no git dependency, and the format
+decoders are pure Rust.
+
+- [wt-formats](https://crates.io/crates/wt-formats) (ours) reads GRP packs, DXP and DDSx textures, DynModels and
+  skeletons. Its README credits [wt_blk](https://github.com/Warthunder-Open-Source-Foundation/wt_blk), which
+  documented these formats first.
+- The Oodle decoder is [lztans](https://crates.io/crates/lztans) (ours), written in a clean room: from a prose
+  specification of the format, by an implementer who read no existing decoder. The earlier build used
+  oozextract, which is no longer a dependency.
+- Block-compressed textures are decoded by [bcn-decode](https://crates.io/crates/bcn-decode) (ours), written from
+  the public specifications; the earlier build used texture2ddecoder, which is no longer a dependency.
+- zstd is decoded by [ruzstd](https://crates.io/crates/ruzstd); the C zstd library is used only by the tests, to
+  build test data.
+- The Vorbis setup table in `src/sound/vorbis_setups.bin.zst` comes from [vgmstream](https://github.com/vgmstream/vgmstream)
+  (ISC, `src/sound/LICENSE-vgmstream`). Optional features add [rewrite-bridge](https://crates.io/crates/rewrite-bridge)
+  (`bridge`) and [ureq](https://crates.io/crates/ureq) (`live`); the viewer is built on [Bevy](https://bevyengine.org).
+- The layouts follow the open-source [Dagor Engine](https://github.com/GaijinEntertainment/DagorEngine)
+  (BSD-3-Clause), the sound formats the community documentation of vgmstream and python-fsb5; no code was copied
+  (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
+
 ## License
 
 Licensed under either of MIT or Apache-2.0, at your option.

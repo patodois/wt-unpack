@@ -39,14 +39,12 @@
 //! | `Wire` `OCCL` `SCol` | cables, occlusion geometry, static collision                |
 //! | `wt3d` `lmct` `d2co` `WCol` | War Thunder specific, not decoded                    |
 
-use std::panic::{self, AssertUnwindSafe};
-
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::bytes::Reader;
 
 /// Largest unpacked nested block accepted (the biggest real ones are around 40 MB)
-const MAX_UNPACKED: usize = 1 << 30;
+pub(crate) const MAX_UNPACKED: usize = 1 << 30;
 
 pub struct Level<'a> {
     pub tex_count: u32,
@@ -217,12 +215,8 @@ pub(crate) fn unpack(codec: u8, packed: &[u8], size: Option<usize>) -> Result<Ve
     }
     let out = match codec {
         1 => {
-            use std::io::Read;
             let limit = size.unwrap_or(MAX_UNPACKED);
-            let mut out = Vec::with_capacity(size.unwrap_or(0));
-            zstd::stream::read::Decoder::new(packed)?.take(limit as u64 + 1).read_to_end(&mut out).context("zstd")?;
-            ensure!(out.len() <= limit, "zstd data unpacks to more than {limit} bytes");
-            out
+            crate::unzstd::decode(packed, None, limit).context("zstd")?
         }
         2 => oodle(packed, size.context("Oodle data needs its unpacked size")?)?,
         0 => bail!("LZMA-packed data is not supported"),
@@ -250,12 +244,10 @@ pub(crate) fn unpack_sized(codec: u8, packed: &[u8]) -> Result<Vec<u8>> {
 /// cannot reach before allocating the output
 fn oodle(packed: &[u8], size: usize) -> Result<Vec<u8>> {
     ensure!(size.div_ceil(0x4_0000) <= packed.len() / 6, "{} bytes of Oodle data cannot unpack to {size}", packed.len());
+    // lztans fills the whole buffer or fails, and does not panic on malformed input; what it returns is the
+    // number of input bytes it used, so the output length is the size of the buffer allocated here
     let mut out = vec![0u8; size];
-    // oozextract can panic on malformed streams; report that as an error
-    let written = panic::catch_unwind(AssertUnwindSafe(|| oozextract::Extractor::new().read_from_slice(packed, &mut out)))
-        .map_err(|_| anyhow::anyhow!("Oodle decoder panicked"))?
-        .map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
-    ensure!(written == size, "Oodle produced {written} bytes, expected {size}");
+    lztans::decode(packed, &mut out).map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
     Ok(out)
 }
 
@@ -1273,6 +1265,27 @@ mod tests {
         assert!(Level::parse(&raw).is_err());
         raw.truncate(20);
         assert!(Level::parse(&raw).is_err());
+    }
+
+    /// An Oodle stream of stored blocks: a two-byte block header, then 256 KiB as they are
+    fn oodle_stored(data: &[u8]) -> Vec<u8> {
+        data.chunks(0x4_0000).flat_map(|block| [&[0x4C, 0x06][..], block].concat()).collect()
+    }
+
+    #[test]
+    fn oodle_blocks_unpack_to_their_size_and_bad_ones_are_errors() {
+        let data: Vec<u8> = (0..0x4_0000 + 1000).map(|i| (i / 5) as u8).collect();
+        let packed = oodle_stored(&data);
+        assert_eq!(unpack(2, &packed, Some(data.len())).unwrap(), data);
+        // Sized by the u32 in front of the stream, as the level files do
+        let sized = [(data.len() as u32).to_le_bytes().to_vec(), packed.clone()].concat();
+        assert_eq!(unpack_sized(2, &sized).unwrap(), data);
+        // Cut short, a size the stream cannot reach, an unknown codec id: errors, not panics
+        assert!(unpack(2, &packed[..packed.len() - 1], Some(data.len())).is_err());
+        assert!(unpack(2, &packed, Some(10 * data.len())).is_err());
+        assert!(unpack(2, &[0x4C, 0x07, 1, 2, 3], Some(3)).is_err());
+        assert!(unpack(2, &[], Some(3)).is_err());
+        assert!(unpack(2, &packed, None).is_err());
     }
 
     #[test]

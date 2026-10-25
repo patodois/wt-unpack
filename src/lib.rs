@@ -26,6 +26,7 @@ pub mod sound;
 pub mod tank;
 pub mod terrain;
 pub mod texlib;
+mod unzstd;
 pub mod vehicle;
 pub mod vromfs;
 

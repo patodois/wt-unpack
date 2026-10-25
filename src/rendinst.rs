@@ -200,7 +200,7 @@ fn read_block<'a>(r: &mut Reader<'a>) -> Result<&'a [u8]> {
 /// A compressed vertex block: a zstd frame, or the u32 unpacked size followed by an Oodle stream
 fn unpack_block(block: &[u8]) -> Result<Vec<u8>> {
     if block.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        return Ok(zstd::stream::decode_all(block)?);
+        return crate::unzstd::decode(block, None, crate::level::MAX_UNPACKED);
     }
     ensure!(block.len() >= 4, "empty vertex block");
     let size = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;

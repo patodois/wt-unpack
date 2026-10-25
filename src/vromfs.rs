@@ -17,8 +17,6 @@
 //! with a fixed key. The unpacked body is a table of file names followed by a
 //! table of (offset, size) pairs pointing at the file data.
 
-use std::io::Read as _;
-
 use anyhow::{bail, ensure, Context, Result};
 use md5::{Digest, Md5};
 
@@ -74,13 +72,9 @@ impl Vromfs {
         } else if zstd_packed {
             let mut packed = body.to_vec();
             deobfuscate(&mut packed);
-            // The header's size is a claim: let the buffer grow with what the stream really holds, and stop a
-            // stream that holds more than it said
-            let mut out = Vec::with_capacity(full_size.min(packed.len().saturating_mul(64)));
-            zstd::stream::read::Decoder::new(&packed[..])
-                .and_then(|d| d.take(full_size as u64 + 1).read_to_end(&mut out))
-                .context("zstd decompression of vromfs body failed")?;
-            out
+            // The header's size is a claim: the output grows with what the stream really holds, and a stream
+            // that holds more than it said is refused
+            crate::unzstd::decode(&packed, None, full_size).context("zstd decompression of vromfs body failed")?
         } else {
             bail!("zlib-packed vromfs bodies are not supported yet");
         };

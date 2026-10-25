@@ -18,7 +18,6 @@
 //! finally varint-packed block descriptors in breadth-first order.
 
 use std::fmt::Write as _;
-use std::io::Read as _;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{Map, Value as Json};
@@ -62,6 +61,9 @@ pub struct Block {
     pub blocks: Vec<Block>,
 }
 
+/// The most a zstd-packed BLK may unpack to (the largest in the game's files is far below this)
+const MAX_BLK: usize = 1 << 30;
+
 /// What kind of content a BLK file holds, judged from its first byte.
 pub fn is_binary(data: &[u8]) -> bool {
     matches!(data.first(), Some(1..=6))
@@ -80,7 +82,7 @@ impl SharedContext {
     pub fn from_namemap(nm: &[u8]) -> Result<(Self, String)> {
         ensure!(nm.len() >= 40, "shared name map is too short");
         let dict_name = format!("{}.dict", hex(&nm[8..40]));
-        let raw = zstd::stream::decode_all(&nm[40..]).context("shared name map is not valid zstd")?;
+        let raw = crate::unzstd::decode(&nm[40..], None, MAX_BLK).context("shared name map is not valid zstd")?;
         let names = read_names(&mut Reader::new(&raw))?;
         Ok((SharedContext { names, dict: None }, dict_name))
     }
@@ -96,22 +98,21 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
         2 => {
             let size = r.bytes(3)?;
             let size = usize::from(size[0]) | usize::from(size[1]) << 8 | usize::from(size[2]) << 16;
-            let raw = zstd::stream::decode_all(r.bytes(size)?)?;
+            let raw = crate::unzstd::decode(r.bytes(size)?, None, MAX_BLK)?;
             // The unpacked stream repeats the format byte of a plain full BLK
             ensure!(raw.first() == Some(&1), "packed BLK does not unpack to format 1");
             parse_dump(&mut Reader::new(&raw[1..]), &[], false)
         }
         3 => parse_dump(&mut r, &need_shared()?.names, false),
         4 => {
-            let raw = zstd::stream::decode_all(r.rest())?;
+            let raw = crate::unzstd::decode(r.rest(), None, MAX_BLK)?;
             parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false)
         }
         5 => {
             let ctx = need_shared()?;
             let dict = ctx.dict.as_deref().context("this BLK needs the archive's zstd dictionary")?;
-            // Stream it: the unpacked size is not stored and the ratio has no upper bound
-            let mut raw = Vec::new();
-            zstd::stream::read::Decoder::with_dictionary(r.rest(), dict)?.read_to_end(&mut raw)?;
+            // The unpacked size is not stored and the ratio has no upper bound: the output grows with the stream
+            let raw = crate::unzstd::decode(r.rest(), Some(dict), MAX_BLK)?;
             parse_dump(&mut Reader::new(&raw), &ctx.names, false)
         }
         other => bail!("not a binary BLK (format byte {other:#04x})"),
@@ -576,7 +577,9 @@ mod tests {
         dump.extend_from_slice(&0u32.to_le_bytes()); // offset 0 in complex data
         dump.extend_from_slice(&[0, 1, 0]); // root: 1 param, no blocks
 
-        let dict = b"a dictionary made of plain bytes, used as raw content".repeat(4);
+        // A trained dictionary, like the archives' (the decoder does not read raw-content ones)
+        let samples: Vec<Vec<u8>> = (0..300).map(|i| format!("{{\"name\":\"entry{i}\",\"kind\":\"sample\",\"v\":[{i},{}]}}", i * 5).into_bytes()).collect();
+        let dict = zstd::dict::from_samples(&samples, 4096).unwrap();
         let packed = zstd::bulk::Compressor::with_dictionary(19, &dict).unwrap().compress(&dump).unwrap();
         assert!(packed.len() * 64 < dump.len());
         let mut file = vec![5u8];

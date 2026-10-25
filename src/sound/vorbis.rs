@@ -51,7 +51,7 @@ type SetupIndex = HashMap<u32, (usize, usize)>;
 pub fn setup_packet(crc: u32) -> Option<&'static [u8]> {
     static TABLE: OnceLock<(Vec<u8>, SetupIndex)> = OnceLock::new();
     let (raw, index) = TABLE.get_or_init(|| {
-        let raw = zstd::bulk::decompress(SETUPS, 1 << 20).expect("embedded setup table is valid zstd");
+        let raw = crate::unzstd::decode(SETUPS, None, 1 << 20).expect("embedded setup table is valid zstd");
         let index = parse_table(&raw).expect("embedded setup table is well formed");
         (raw, index)
     });
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn every_setup_packet_matches_its_crc_and_parses() {
-        let raw = zstd::bulk::decompress(SETUPS, 1 << 20).unwrap();
+        let raw = crate::unzstd::decode(SETUPS, None, 1 << 20).unwrap();
         let index = parse_table(&raw).unwrap();
         assert_eq!(index.len(), 161);
         for (&crc, &(start, len)) in &index {

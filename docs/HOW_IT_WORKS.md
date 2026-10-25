@@ -11,8 +11,15 @@ Where the formats come from. Part of the [wt-unpack README](../README.md).
   the evidence for each, and its README credits
   [wt_blk](https://github.com/Warthunder-Open-Source-Foundation/wt_blk), which documented these formats first;
   the crate was checked against wt_blk on every GRP and DXP file of the game.
-- Oodle-compressed data is decoded by [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract), pure
-  Rust with no proprietary library.
+- Oodle-compressed data (the Kraken, Mermaid and Leviathan streams of level files, and of textures and models
+  through `wt-formats`) is decoded by [lztans](https://github.com/patodois/lztans), pure Rust with no
+  proprietary library. It was written in a clean room: from a prose specification of the format, by someone who
+  read no existing decoder, and checked against real streams of War Thunder and Warframe.
+- Block-compressed textures (BC1 to BC7) are decoded by [bcn-decode](https://github.com/patodois/bcn-decode),
+  written from the public format specifications, through `wt-formats`.
+- zstd data (archives, packed BLKs, level blocks) is decoded by [ruzstd](https://crates.io/crates/ruzstd), pure
+  Rust. Its output was compared byte for byte with the C library's on all 35,563 files of the game's eight
+  archives. It reads trained dictionaries, which the archives use; zstd's raw-content dictionaries are refused.
 - Materials and texture names come from `dynModelDesc.bin`.
 - Level files follow Dagor's `loadLevel.cpp`, `lmeshManager.cpp`, `heightmapPhysHandler.cpp`,
   `compressedHeightmap.cpp`, `landRayTracerSoA4.cpp`, `bvhIO.cpp` and `rendInstGen.cpp`; the ground's

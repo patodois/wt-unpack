@@ -1,22 +1,26 @@
 [package]
 name = "wt-unpack"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Reader for Dagor Engine vromfs archives and binary BLK files (War Thunder game data)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/patodois/wt-unpack"
+keywords = ["war-thunder", "dagor", "gamedev", "assets", "gltf"]
+categories = ["game-development", "parser-implementations"]
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 md-5 = "0.10"
 serde_json = { version = "1", features = ["preserve_order"] }
-zstd = "0.13"
-# GRP model packs, DXP texture packs, DDSx textures, DynModels and skeletons (path dependency until it is published)
-wt-formats = { path = "../wt-formats", features = ["png"] }
+# zstd frames of the archives, BLKs and level blocks (pure Rust)
+ruzstd = "0.8"
+# GRP model packs, DXP texture packs, DDSx textures, DynModels and skeletons
+wt-formats = { version = "0.1.0", features = ["png"] }
 png = "0.18.1"
-# Oodle streams inside level files (the same decoder wt-formats uses)
-oozextract = "0.5.6"
+# Oodle streams inside level files, clean-room (the same decoder wt-formats uses; github.com/patodois/lztans)
+lztans = "0.1.0"
 lewton = { version = "0.10.2", default-features = false }
 memmap2 = "0.9"
 # Blocking HTTP client for the live telemetry poller (plain HTTP to localhost only, so no TLS)
@@ -24,6 +28,10 @@ ureq = { version = "3.5", default-features = false, optional = true }
 # The bridge to other game rewrites (see src/bridge.rs, github.com/patodois/rewrite-bridge), and the
 # peak memory report of `check-bridge`
 rewrite-bridge = { version = "0.2.1", optional = true }
+
+[dev-dependencies]
+# to build zstd frames, with and without a dictionary, in the tests
+zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }

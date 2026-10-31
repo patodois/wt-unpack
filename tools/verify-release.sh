@@ -25,10 +25,15 @@ key='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA8MKbcbjNbRSBQPWhWHtT8YYexfkRFDM0PCpfjDxLAaE=
 -----END PUBLIC KEY-----'
 
-# The key and the signed message reach OpenSSL through file descriptors; nothing is written to disk
-{ printf 'osp release patodois/%s %s\n' "$repo" "$tag"; cat "$folder/SHA256SUMS"; } |
-    "$openssl" pkeyutl -verify -rawin -pubin -inkey /dev/fd/3 -in /dev/stdin \
-        -sigfile "$folder/SHA256SUMS.sig" 3<<KEY
+# OpenSSL 3.0 (Ubuntu 22.04 and 24.04, Debian 12) refuses to verify an Ed25519 signature from a pipe: "Could not
+# allocate 0 bytes for oneshot sign/verify buffer". The oneshot mode wants a file of known size, so the signed
+# message goes through a private temporary file, removed on exit. The key still reaches OpenSSL through a file
+# descriptor.
+tmp=$(mktemp -d)
+trap 'rm -f "$tmp/message"; rmdir "$tmp"' EXIT
+{ printf 'osp release patodois/%s %s\n' "$repo" "$tag"; cat "$folder/SHA256SUMS"; } > "$tmp/message"
+"$openssl" pkeyutl -verify -rawin -pubin -inkey /dev/fd/3 -in "$tmp/message" \
+    -sigfile "$folder/SHA256SUMS.sig" 3<<KEY
 $key
 KEY
 

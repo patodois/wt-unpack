@@ -51,14 +51,25 @@ Programs built for each release are on the [Releases page](https://github.com/pa
 | Windows, x86_64 | `wt-unpack-<tag>-windows-x86_64.zip` |
 
 Each archive holds the program, this README, both license files and an `INSTALL.txt`. `SHA256SUMS` on the release page has
-the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256sum -c SHA256SUMS` on Linux,
-`Get-FileHash` on Windows). They are built with the `live` and `bridge` features, so `wt-unpack live` and the rewrite-bridge commands are included. The 3D viewer (`wt-viewer`) is not in the archives: it needs extra system libraries to build on Linux, so build it from source (see [Build](#build)).
+the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256sum -c --ignore-missing SHA256SUMS` on Linux,
+`Get-FileHash` on Windows). `SHA256SUMS` lists all four archives; `--ignore-missing` skips the ones you did not download (without
+it `sha256sum` reports them as `FAILED open or read` and exits 1). The programs are built with the `live` and `bridge` features, so
+`wt-unpack live` and the rewrite-bridge commands are included. The 3D viewer (`wt-viewer`) is not in the archives: it needs extra system libraries to build on Linux, so build it from source (see [Build](#build)).
 
-`SHA256SUMS.sig` on the same release signs `SHA256SUMS` with the project's Ed25519 release key, so you can also check
-that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
+On Linux and macOS, extract and run it (the archive unpacks into a folder of its own; the commands below are written as
+`wt-unpack ...`, so use `./wt-unpack ...` in that folder, or put the program on your `PATH` as `INSTALL.txt` says):
 
 ```sh
-sh tools/verify-release.sh wt-unpack v0.3.0 path/to/folder
+tar -xzf wt-unpack-v0.3.0-linux-x86_64.tar.gz && cd wt-unpack-v0.3.0-linux-x86_64 && ./wt-unpack --help
+```
+
+`SHA256SUMS.sig` on the same release signs `SHA256SUMS` with the project's Ed25519 release key, so you can also check
+that the list itself came from here. The check is `tools/verify-release.sh` of this repository (the release archives do not contain it:
+clone the repository, or save the file from GitHub). It needs OpenSSL 3 (`openssl version`; on macOS `brew install openssl@3`) and a folder
+with `SHA256SUMS`, `SHA256SUMS.sig` and the archive(s) you downloaded, and prints `OK: ...` when both the signature and the checksums match:
+
+```sh
+sh tools/verify-release.sh wt-unpack v0.3.0 path/to/folder   # repository name, release tag, folder
 ```
 
 The signed text is `osp release patodois/wt-unpack <tag>`, a newline, then `SHA256SUMS`, so a signature from another release
@@ -80,7 +91,11 @@ To build it yourself instead, see [Build](#build).
 
 ## Prerequisites
 
-- **Rust 1.90 or newer** ([rustup.rs](https://rustup.rs)); the code is written and tested with 1.99.
+- **To build from source:** Rust 1.90 or newer for `wt-unpack` ([rustup.rs](https://rustup.rs)), plus `git` and a C
+  linker (on Debian and Ubuntu `sudo apt install build-essential git`). The viewer (`wt-viewer`) is built on Bevy 0.20
+  and needs **Rust 1.97.1 or newer**; with an older compiler Cargo stops with "rustc ... is not supported by the
+  following packages". `rustup update` fixes it. On Linux the viewer also needs system libraries (see [Build](#build)).
+  The release archives need none of this.
 - **War Thunder, installed.** The tools read the game's own folder, the one that holds `aces.vromfs.bin`,
   `levels/`, `content/` and `sound/`. Call it `$GAME`:
   - **macOS** (the launcher's app bundle): `/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game`.
@@ -88,6 +103,10 @@ To build it yourself instead, see [Build](#build).
   - **Windows**: the install folder; with Steam usually `C:\Program Files (x86)\Steam\steamapps\common\War Thunder`.
   - **Linux**: with Steam usually `~/.steam/steam/steamapps/common/War Thunder`.
   - Any other place works too; give it to commands that take `--game`, or write it into the paths you pass.
+  - The default of `--game` is the macOS path above. On Linux and Windows always pass `--game "$GAME"` to the
+    commands that take it (`model`, `rig`, `check-bridge`, `check-conformance` and the viewer): with the default they find no game
+    folder, and `check-bridge` and `check-conformance` then report 0 vehicles instead of an error.
+  - Folder names contain spaces (`War Thunder`), so keep the quotes around `"$GAME"` in the commands below.
 - **Memory and disk.** Most commands need well under 1 GB of RAM; the exceptions are said next to the command
   below. Output is small except for glTF exports of whole terrains.
 
@@ -96,9 +115,17 @@ To build it yourself instead, see [Build](#build).
 ```sh
 git clone https://github.com/patodois/wt-unpack && cd wt-unpack
 cargo build --release              # wt-unpack CLI and library: about a minute on a recent machine, plus fetching the dependencies
-cargo build --release -p wt-viewer # the 3D viewer: several minutes the first time (Bevy)
+cargo build --release -p wt-viewer # the 3D viewer: several minutes the first time (Bevy); needs Rust 1.97.1 or newer
 export PATH=$PWD/target/release:$PATH   # so that `wt-unpack ...` below finds the program
 ```
+
+The viewer needs a few system libraries on Linux. On Debian and Ubuntu (24.04 checked):
+
+```sh
+sudo apt install pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+```
+
+Without them the build stops in a build script (`wayland-sys` first) with "The system library ... was not found". The `wt-unpack` program itself needs only a C linker.
 
 Without the `export` line, write `cargo run --release -- list ...` or `target/release/wt-unpack list ...`
 instead of `wt-unpack list ...`.
@@ -115,16 +142,20 @@ cargo build --release --features bridge        # or: --features live,bridge
 A first look takes a few seconds:
 
 ```sh
-GAME="/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game"   # your game folder
+GAME="/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game"   # your game folder (macOS)
+# on Linux with Steam, for example: GAME="$HOME/.steam/steam/steamapps/common/War Thunder"
 
-wt-unpack list $GAME/char.vromfs.bin | head
-wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp
-wt-unpack model $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman -o out/sherman
+wt-unpack list "$GAME/char.vromfs.bin" | head
+wt-unpack grp "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp"
+wt-unpack model "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" m4a1_76w_sherman --game "$GAME" -o out/sherman
 ```
 
 `-o` is a **folder**: `out/sherman` is created and gets the glTF, its `.bin` and the PNG textures (about 40
 files). The same holds for `extract -o` and `sound extract -o`. Open `out/sherman/*.gltf` in Blender, three.js or
 Godot. (`level --heightmap` takes a file name, `level --gltf` a folder.)
+
+When you pipe a long listing into `head`, `wt-unpack` may print `failed printing to stdout: Broken pipe` and exit with status 101 once `head`
+has closed the pipe. The lines you asked for are complete; the message is harmless.
 
 ## Usage
 
@@ -133,49 +164,49 @@ from a Mac with an SSD and 16 GB, on War Thunder 2.59.0.80.
 
 ```sh
 # Archives and BLKs
-wt-unpack list $GAME/char.vromfs.bin
-wt-unpack extract $GAME/aces.vromfs.bin -o out/aces --blk json --filter tankmodels
-wt-unpack cat $GAME/char.vromfs.bin:config/wpcost.blk | head   # it is 1.16 million lines: pipe it
+wt-unpack list "$GAME/char.vromfs.bin"
+wt-unpack extract "$GAME/aces.vromfs.bin" -o out/aces --blk json --filter tankmodels
+wt-unpack cat "$GAME/char.vromfs.bin:config/wpcost.blk" | head   # it is 1.16 million lines: pipe it
 
 # What a .grp pack holds, and the LODs, vertex layouts and skeleton of one model
-wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp
-wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp --model m4a1_76w_sherman
+wt-unpack grp "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp"
+wt-unpack grp "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" --model m4a1_76w_sherman
 
 # Export a vehicle to glTF with its textures, into the folder given with -o
-wt-unpack model $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman -o out/sherman
+wt-unpack model "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" m4a1_76w_sherman --game "$GAME" -o out/sherman
 
 # HEAVY: parse every model in a folder and summarise failures (a regression check): the tanks take 40 s and 0.14 GB
-wt-unpack check $GAME/content/base/res/tanks
+wt-unpack check "$GAME/content/base/res/tanks"
 
 # The blocks of a level, its terrain as a 16-bit PNG (plus a JSON with its world placement) and as glTF,
 # and its placed objects
-wt-unpack level $GAME/levels/avg_berlin.bin
-wt-unpack level $GAME/levels/arcade_alps.bin --heightmap out/alps.png --gltf out/alps
-wt-unpack level $GAME/levels/avg_berlin.bin --terrain landmesh --heightmap out/berlin_wide.png
-wt-unpack level $GAME/levels/avg_berlin.bin --objects
+wt-unpack level "$GAME/levels/avg_berlin.bin"
+wt-unpack level "$GAME/levels/arcade_alps.bin" --heightmap out/alps.png --gltf out/alps
+wt-unpack level "$GAME/levels/avg_berlin.bin" --terrain landmesh --heightmap out/berlin_wide.png
+wt-unpack level "$GAME/levels/avg_berlin.bin" --objects
 
 # The level as a rewrite-bridge scene (needs --features bridge): the models, the instances, the memory
 # estimate, and what is not in the scene. Berlin takes about 7 s and 1.3 GB.
-wt-unpack level $GAME/levels/avg_berlin.bin --scene-stats
+wt-unpack level "$GAME/levels/avg_berlin.bin" --scene-stats
 
 # HEAVY: parse every level and summarise what decodes: 10 s, 0.4 GB
-wt-unpack check-levels $GAME/levels
+wt-unpack check-levels "$GAME/levels"
 
 # Sound banks: list the samples, then extract some (Vorbis to .ogg, FADPCM to .wav; --format wav decodes all)
-wt-unpack sound list $GAME/sound/tanks_engines.assets.bank
-wt-unpack sound extract $GAME/sound/tanks_weapons.assets.bank --filter dshk_close -o out/dshk
-wt-unpack sound check $GAME/sound            # headers of every bank: under a second
-wt-unpack sound check $GAME/sound --decode   # HEAVY: decodes all 156,223 samples: 10 to 12 minutes, about 0.7 GB
+wt-unpack sound list "$GAME/sound/tanks_engines.assets.bank"
+wt-unpack sound extract "$GAME/sound/tanks_weapons.assets.bank" --filter dshk_close -o out/dshk
+wt-unpack sound check "$GAME/sound"            # headers of every bank: under a second
+wt-unpack sound check "$GAME/sound" --decode   # HEAVY: decodes all 156,223 samples: 10 to 12 minutes, about 0.7 GB
 
 # Open a vehicle in 3D: drag to orbit, scroll to zoom, Q/E turn the turret, R/F elevate the gun
-wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V_ausf_g_panther --game $GAME
+wt-viewer "$GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp" pzkpfw_V_ausf_g_panther --game "$GAME"
 
 # Drive it on flat ground with WASD; the camera follows and the speed shows in a corner
-wt-viewer $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman --drive
+wt-viewer "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" m4a1_76w_sherman --game "$GAME" --drive
 
 # Save a picture and close: turret 60 degrees left, gun 10 degrees up; or after a scripted drive
-wt-viewer --turret 60 --gun 10 --screenshot sherman.png
-wt-viewer --drive --auto W:30,WA:3 --turret 90 --screenshot drive.png
+wt-viewer --game "$GAME" --turret 60 --gun 10 --screenshot sherman.png
+wt-viewer --game "$GAME" --drive --auto W:30,WA:3 --turret 90 --screenshot drive.png
 ```
 
 `wt-viewer --help` prints the options; a mistyped option is refused with the same text, and nothing opens. They are:
@@ -211,7 +242,7 @@ pivoting with one track in first gear at a standstill. How wheels, tracks and ma
 | Command | Expected |
 |---|---|
 | `check <folder>/tanks` | 3,656 of 3,656 models parse (aircraft 1,695 of 1,695, ships 1,925 of 1,925, with every skeleton) |
-| `check-levels $GAME/levels` | 160 of 160 levels parse fully; terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
+| `check-levels "$GAME/levels"` | 160 of 160 levels parse fully; terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
 | `sound check --decode` | 156,223 samples decode (148,743 Vorbis, 7,480 FADPCM) |
 
 If your numbers are far from these, the game has been updated; open an issue with the version.
@@ -242,11 +273,11 @@ for what a provider is and how the pieces fit.
 The commands that exercise the provider (build with `--features bridge`):
 
 ```sh
-wt-unpack rig tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman   # print a tank's rig
-wt-unpack check-bridge --list --filter tanks/germ_       # only print the ids of the vehicles that match
-wt-unpack check-bridge --filter tanks/germ_ --limit 20   # load and validate those
-wt-unpack check-bridge                                   # HEAVY: every tank, aircraft and ship
-wt-unpack check-conformance --filter germ_he_115 -v      # rewrite-bridge's conformance checker
+wt-unpack rig tanks/usa_m4a1_76w_sherman.grp:m4a1_76w_sherman --game "$GAME"   # print a tank's rig
+wt-unpack check-bridge --game "$GAME" --list --filter tanks/germ_       # only print the ids of the vehicles that match
+wt-unpack check-bridge --game "$GAME" --filter tanks/germ_ --limit 20   # load and validate those
+wt-unpack check-bridge --game "$GAME"                         # HEAVY: every tank, aircraft and ship
+wt-unpack check-conformance --game "$GAME" --filter germ_he_115 -v   # rewrite-bridge's conformance checker
 ```
 
 ### check-bridge
@@ -288,7 +319,7 @@ winding, skins, materials. `--help` lists the checker's options: `--id` (repeata
 (`--game` and `--no-textures` also work anywhere). `--no-textures` skips texture baking, which is much faster.
 
 ```sh
-wt-unpack check-conformance --filter usa_m4a1_76w_sherman
+wt-unpack check-conformance --game "$GAME" --filter usa_m4a1_76w_sherman
 ```
 
 checks the Sherman and its `cn_` variant and prints two warnings per model,
@@ -308,8 +339,8 @@ Details and the JSON log are in [docs/LIVE.md](docs/LIVE.md).
 ```sh
 cargo test                                     # unit tests; no game files needed
 cargo test --features live,bridge              # also the live telemetry client (against a mock server) and the bridge
-WT_GAME_DIR=$GAME cargo test --release         # also runs the tests that read your installed game
-WT_GAME_DIR=$GAME cargo test --release --features live,bridge   # all of it: the Sherman's rig and sockets, every
+WT_GAME_DIR="$GAME" cargo test --release         # also runs the tests that read your installed game
+WT_GAME_DIR="$GAME" cargo test --release --features live,bridge   # all of it: the Sherman's rig and sockets, every
                                                # collision resource, Berlin's scene and collision, and the
                                                # memory check (tests/memory.rs)
 ```

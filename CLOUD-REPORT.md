@@ -5,8 +5,7 @@ the README top to bottom. Commands that need game files were run against my own 
 build (a hand-made `.vromfs.bin`, a loose text BLK, missing and empty folders); the rest I only compared with `--help`
 and the source. No game file or game data was downloaded, built or committed.
 
-**Branch.** The task text names `cloud/readme-wt-unpack`; this session's instructions allow pushes only to
-`claude/readme-wt-unpack-n6cdtx`, so the work is on that branch. Nothing was pushed anywhere else, no PR, no tags, no release.
+**Branch.** The task text names `cloud/readme-wt-unpack`; this session may push only `claude/readme-wt-unpack-n6cdtx`. The owner's local session confirmed that this branch replaces the `cloud/...` one. Nothing was pushed anywhere else; no PR, merge, tag, release or publishing.
 
 ## What I did
 

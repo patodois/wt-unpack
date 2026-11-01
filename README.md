@@ -378,8 +378,11 @@ decoders are pure Rust.
   skeletons. Its README credits [wt_blk](https://github.com/Warthunder-Open-Source-Foundation/wt_blk), which
   documented these formats first.
 - The Oodle decoder is [lztans](https://crates.io/crates/lztans) (ours), written in a clean room: from a prose
-  specification of the format, by an implementer who read no existing decoder. The earlier build used
-  oozextract, which is no longer a dependency.
+  specification of the format, by an implementer who read no existing decoder.
+- Releases v0.1.0 and v0.2.0 (source and binaries) used [oozextract](https://crates.io/crates/oozextract) 0.5
+  for Oodle. Its license field says MIT, but its code appears to be a port of [ooz](https://github.com/powzix/ooz),
+  which is GPL-3.0, so those two releases may carry GPL-3.0 obligations. v0.3.0 and later contain none of that
+  code: use them.
 - Block-compressed textures are decoded by [bcn-decode](https://crates.io/crates/bcn-decode) (ours), written from
   the public specifications; the earlier build used texture2ddecoder, which is no longer a dependency.
 - zstd is decoded by [ruzstd](https://crates.io/crates/ruzstd); the C zstd library is used only by the tests, to

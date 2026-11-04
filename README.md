@@ -11,6 +11,8 @@ rewrite**: a new engine for an old game that loads the original's assets, possib
 (a mash-up). For the second kind, wt-unpack is a *provider* for [rewrite-bridge](https://github.com/patodois/rewrite-bridge),
 a small crate of model, animation and scene types that rewrites share (see [Using it from another game](#using-it-from-another-game)).
 
+**Adding this to a game.** Read the [guide to adding a game](https://github.com/patodois/rewrite-bridge/blob/main/docs/INTEGRATING.md) first. Here: build with the `bridge` feature and open the provider with `wt_unpack::bridge::WarThunder::new(game_folder)`; you pass the War Thunder folder, nothing searches for it.
+
 - **Archives and configs:** `.vromfs.bin` archives (`VRFs`/`VRFx`, stored or zstd-packed) and binary BLK
   files in all six formats, including slim BLKs that rely on the archive's shared name map and zstd
   dictionary. BLKs convert to Dagor's text syntax or to JSON.

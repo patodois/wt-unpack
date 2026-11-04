@@ -1,0 +1,153 @@
+[package]
+name = "wt-unpack-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for the readers of wt-unpack (nightly only; not part of the stable build)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+# the bytes of a few seed inputs and the table of Vorbis setup CRCs
+zstd = "0.13"
+
+[dependencies.wt-unpack]
+path = ".."
+
+# Its own workspace: the fuzz crate stays out of the stable workspace build (and its lock file stays here)
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "make_seeds"
+path = "src/make_seeds.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vromfs"
+path = "fuzz_targets/vromfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blk"
+path = "fuzz_targets/blk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blk_namemap"
+path = "fuzz_targets/blk_namemap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rodb"
+path = "fuzz_targets/rodb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "landclass_resource"
+path = "fuzz_targets/landclass_resource.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "collision"
+path = "fuzz_targets/collision.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rendinst_model"
+path = "fuzz_targets/rendinst_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "level"
+path = "fuzz_targets/level.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "level_block"
+path = "fuzz_targets/level_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "level_landmesh"
+path = "fuzz_targets/level_landmesh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "level_heightmap"
+path = "fuzz_targets/level_heightmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "level_rendinst_layers"
+path = "fuzz_targets/level_rendinst_layers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fsb5"
+path = "fuzz_targets/fsb5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fsb5_bank"
+path = "fuzz_targets/fsb5_bank.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vorbis_sample"
+path = "fuzz_targets/vorbis_sample.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live_json"
+path = "fuzz_targets/live_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drive_script"
+path = "fuzz_targets/drive_script.rs"
+test = false
+doc = false
+bench = false
+
+[lib]
+name = "wt_unpack_fuzz"
+path = "src/lib.rs"

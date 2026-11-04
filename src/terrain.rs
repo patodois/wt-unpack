@@ -52,7 +52,13 @@ impl HeightGrid {
         let (w, h) = (cells(lo[0], hi[0]).floor() + 1.0, cells(lo[1], hi[1]).floor() + 1.0);
         ensure!(w <= 16384.0 && h <= 16384.0, "{w}x{h} grid is too large; use a bigger cell size");
         let (width, height) = (w as usize, h as usize);
-        let mut heights = vec![f32::NAN; width * height];
+        // Up to 16384 x 16384 samples (1 GiB) on a mesh that really spans that much: ask for the memory without
+        // aborting when it is not there
+        let mut heights = Vec::new();
+        heights
+            .try_reserve_exact(width * height)
+            .with_context(|| format!("not enough memory for a {width}x{height} grid ({} bytes); use a bigger cell size", width * height * 4))?;
+        heights.resize(width * height, f32::NAN);
         for tri in mesh.indices.chunks_exact(3) {
             let [a, b, c] = [0, 1, 2].map(|k| mesh.positions[tri[k] as usize]);
             // Grid coordinates of the corners
@@ -135,6 +141,11 @@ impl HeightGrid {
     /// height (the rasterised landmesh stops at its last vertex, short of the world box's edge)
     pub fn height_near(&self, x: f32, z: f32) -> f32 {
         let (w, h) = ((self.width - 1) as f32 * self.cell_size, (self.height - 1) as f32 * self.cell_size);
+        // A grid built by hand can carry any cell size. Where an extent is negative, NaN or infinite there is no edge to
+        // snap to, and `clamp` panics when its bounds are out of order or NaN
+        if !(w >= 0.0 && h >= 0.0 && w.is_finite() && h.is_finite()) {
+            return f32::NAN;
+        }
         let (dx, dz) = (x - self.origin[0], z - self.origin[1]);
         if dx < -self.cell_size || dz < -self.cell_size || dx > w + self.cell_size || dz > h + self.cell_size {
             return f32::NAN;
@@ -289,6 +300,120 @@ mod tests {
             positions: vec![[0.0, 5.0, 0.0], [10.0, 5.0, 0.0], [0.0, 5.0, 10.0], [10.0, 5.0, 10.0]],
             indices: vec![0, 2, 1, 1, 2, 3],
         }
+    }
+
+    fn grid_of(width: usize, height: usize, cell_size: f32) -> HeightGrid {
+        HeightGrid { width, height, cell_size, origin: [0.0, 0.0], heights: vec![1.0; width * height], source: "HM2" }
+    }
+
+    #[test]
+    fn a_grid_with_a_cell_size_that_is_no_length_has_no_height_near_anything() {
+        // `clamp` panics when its bounds (the extents, 0 .. (n - 1) * cell size) are out of order or NaN. A finite
+        // query only gets past the range check when an extent is NaN or infinite; a NaN query gets past it whatever
+        // the extents are, so each bad cell size is tried with both.
+        for cell_size in [-2.0, f32::NEG_INFINITY, f32::NAN, f32::INFINITY] {
+            for (width, height) in [(2, 2), (1, 2), (2, 1)] {
+                let grid = grid_of(width, height, cell_size);
+                assert!(grid.height_near(f32::NAN, f32::NAN).is_nan(), "{width}x{height} at {cell_size}, NaN query");
+                assert!(grid.height_near(1.0, 1.0).is_nan(), "{width}x{height} at {cell_size}, finite query");
+            }
+        }
+        // The extent in x is fine (0 x -2 = -0) and only the extent in z is negative: dropping the check of z shows here
+        assert!(grid_of(1, 2, -2.0).height_near(f32::NAN, f32::NAN).is_nan());
+        // A 2x1 grid with an infinite cell size: the extent in x is infinite and the one in z is 0 x inf = NaN, so a
+        // finite query gets past the range check and `h >= 0.0` is what stops it. It says nothing about `is_finite`:
+        // the cases of one infinite extent next to a fine one are in the test of the infinite extent
+        assert!(grid_of(2, 1, f32::INFINITY).height_near(1.0, 1.0).is_nan());
+    }
+
+    #[test]
+    fn a_grid_one_sample_thick_still_answers() {
+        // A level that rasterises to 4 x 1 samples has an extent of 0 in z: that is a length, not "no length"
+        let mut grid = grid_of(4, 1, 2.0);
+        grid.heights = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(grid.height_near(3.0, 0.0), 2.5);
+        // Up to one sample beyond the edge in z (2 m) takes the edge's height, farther out there is none
+        assert_eq!(grid.height_near(3.0, 1.5), 2.5);
+        assert_eq!(grid.height_near(3.0, -2.0), 2.5);
+        assert!(grid.height_near(3.0, 2.5).is_nan());
+        // Likewise a column
+        let mut grid = grid_of(1, 4, 2.0);
+        grid.heights = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(grid.height_near(0.5, 3.0), 2.5);
+    }
+
+    #[test]
+    fn a_grid_with_an_infinite_extent_has_no_height_near_anything() {
+        // A finite cell size can still overflow f32 over the grid (3 x 3e38); an extent that is not a position has no
+        // edge to snap to, and answering with the first sample everywhere would be a made-up height
+        for cell_size in [f32::INFINITY, 3.0e38] {
+            let grid = grid_of(4, 4, cell_size);
+            assert!(grid.height_near(5.0, 5.0).is_nan(), "{cell_size}");
+        }
+        // One infinite extent next to a fine one (3 x 3e38 overflows, 0 x 3e38 is 0): a finite query gets past the
+        // range check and `clamp(0, inf)` does not panic, so only `is_finite` of the infinite one stops it. Each
+        // `is_finite` is the only thing between its extent and a made-up height
+        assert!(grid_of(4, 1, 3.0e38).height_near(5.0, 0.0).is_nan());
+        assert!(grid_of(1, 4, 3.0e38).height_near(0.0, 5.0).is_nan());
+        // A grid of one sample per side has no extent whatever the cell size, and answers; so does an extent that is
+        // large but still finite (one cell of 3e38)
+        assert_eq!(grid_of(1, 1, 3.0e38).height_near(0.0, 0.0), 1.0);
+        assert_eq!(grid_of(2, 2, 3.0e38).height_near(1.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn a_mesh_that_spans_more_than_the_old_sample_limit_is_rasterised() {
+        // 4097 x 4097 samples are more than 2^24, the limit this crate once had: a mesh of three vertices spanning
+        // 4096 m at 1 m asks for the whole grid (67 MB of heights, one allocation of exactly that size)
+        let mesh = TriMesh { positions: vec![[0.0, 0.0, 0.0], [4096.0, 0.0, 4096.0], [0.0, 0.0, 4096.0]], indices: vec![0, 1, 2] };
+        let (grid, largest) = crate::alloc_probe::largest_allocation(|| HeightGrid::rasterize(&mesh, 1.0));
+        let grid = grid.unwrap();
+        assert_eq!((grid.width, grid.height, grid.heights.len()), (4097, 4097, 4097 * 4097));
+        assert!(grid.heights.len() > 1 << 24);
+        assert_eq!(largest, 4097 * 4097 * 4);
+        // The triangle covers the lower half of the square
+        assert_eq!(grid.heights[0], 0.0);
+        assert!(grid.heights[4096].is_nan());
+    }
+
+    #[test]
+    fn a_grid_side_is_limited_to_16384_samples() {
+        // A strip along x, then along z: each side has its own limit
+        let strip = |span: f32, along_z: bool| {
+            let end = if along_z { [0.0, 0.0, span] } else { [span, 0.0, 0.0] };
+            TriMesh { positions: vec![[0.0, 0.0, 0.0], end, [0.0, 0.0, 0.0]], indices: vec![0, 1, 2] }
+        };
+        for along_z in [false, true] {
+            let (grid, largest) = crate::alloc_probe::largest_allocation(|| HeightGrid::rasterize(&strip(16383.0, along_z), 1.0));
+            let grid = grid.unwrap();
+            assert_eq!((grid.width.max(grid.height), grid.width.min(grid.height), largest), (16384, 1, 16384 * 4), "along z: {along_z}");
+            let (res, largest) = crate::alloc_probe::largest_allocation(|| HeightGrid::rasterize(&strip(16384.0, along_z), 1.0));
+            assert!(res.err().is_some_and(|e| e.to_string().contains("too large")), "along z: {along_z}");
+            assert!(largest < 16384 * 4, "asked for {largest} bytes");
+        }
+    }
+
+    #[test]
+    fn a_grid_that_does_not_fit_in_memory_is_an_error_not_an_abort() {
+        // The system allocator is told to refuse any single allocation of 32 MB or more, as it would when the
+        // memory is not there; a 4097 x 4097 grid is 67 MB
+        let mesh = TriMesh { positions: vec![[0.0, 0.0, 0.0], [4096.0, 0.0, 4096.0], [0.0, 0.0, 4096.0]], indices: vec![0, 1, 2] };
+        let res = crate::alloc_probe::refusing_from(32 << 20, || HeightGrid::rasterize(&mesh, 1.0));
+        let msg = res.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(msg.contains("not enough memory for a 4097x4097 grid"), "{msg}");
+        // A grid under the threshold goes through
+        assert!(crate::alloc_probe::refusing_from(32 << 20, || HeightGrid::rasterize(&mesh, 2.0)).is_ok());
+    }
+
+    #[test]
+    fn the_largest_grid_is_asked_for_and_not_refused_by_a_limit() {
+        // 16383 m at 1 m is 16384 x 16384 samples, the largest the per-side limit lets through: 1 GiB of heights. The
+        // allocator is told to refuse anything from 512 MiB, so nothing is touched, and the error must be the
+        // allocation's: a limit of any kind on the samples (below 16384 x 16384) would answer first with its own
+        let mesh = TriMesh { positions: vec![[0.0, 0.0, 0.0], [16_383.0, 0.0, 16_383.0], [0.0, 0.0, 16_383.0]], indices: vec![0, 1, 2] };
+        let res = crate::alloc_probe::refusing_from(1 << 29, || HeightGrid::rasterize(&mesh, 1.0));
+        let msg = res.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(msg.contains("not enough memory for a 16384x16384 grid"), "{msg}");
     }
 
     #[test]

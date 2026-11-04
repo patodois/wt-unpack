@@ -841,6 +841,7 @@ impl Heightmap {
         let (height, mirrored) = (hm & 0x7FFF_FFFF, hm >> 31 != 0);
         r.skip(16)?;
         ensure!((1..=16384).contains(&width) && (1..=16384).contains(&height), "bad heightmap size {width}x{height}");
+        ensure!(cell_size.is_finite() && cell_size > 0.0, "bad heightmap cell size {cell_size}");
         let (w, h) = (width as usize, height as usize);
         let data = match version {
             2 => {
@@ -1361,6 +1362,49 @@ mod tests {
             chunked.extend(nested(1, &zstd::bulk::compress(chunk, 3).unwrap()));
         }
         assert_eq!(Heightmap::parse(&chunked).unwrap().data, data);
+    }
+
+    /// An 8 x 8 heightmap of the given version (0, 1 or 2) and cell size, with or without the block of heights after
+    /// its header
+    fn hm_with(version: u32, cell_size: f32, payload: bool) -> Vec<u8> {
+        let mut out = hm2_header(8, 8, 3);
+        out[..4].copy_from_slice(&cell_size.to_le_bytes());
+        // The version is the top byte of the width word; versions 0 and 1 have no chunk info after the header
+        out[23] = version as u8;
+        if version < 2 {
+            out.truncate(out.len() - 4);
+        }
+        if payload {
+            let packed = if version < 2 {
+                zstd::bulk::compress(&[0u8; 8 * 8 * 2], 3).unwrap()
+            } else {
+                let (headers, variance) = encode_cblock(&[0; 64], 8, 8, 3);
+                zstd::bulk::compress(&[headers, variance].concat(), 3).unwrap()
+            };
+            out.extend(nested(1, &packed));
+        }
+        out
+    }
+
+    #[test]
+    fn heightmap_rejects_a_cell_size_that_is_no_length() {
+        for version in [0, 1, 2] {
+            // The cell size is the first float of the header; everything else is valid. With the block of heights
+            // missing too: the cell size is refused before anything is decoded, so it is the error that is reported
+            for cell_size in [0.0, -0.0, -2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                for payload in [true, false] {
+                    let err = Heightmap::parse(&hm_with(version, cell_size, payload)).err().map(|e| e.to_string()).unwrap_or_default();
+                    assert!(err.contains("cell size"), "v{version} {cell_size} payload {payload}: {err}");
+                }
+            }
+            // The same bytes with a real cell size parse, so the cell size is what was refused. Any positive finite
+            // length is kept, however small (a subnormal, the smallest normal number, 1e-10) or large (3e38, the
+            // largest f32): no other bound is made up
+            for cell_size in [2.0, f32::from_bits(1), f32::MIN_POSITIVE, 1.0e-10, 1.0e-3, 3.0e38, f32::MAX] {
+                let hm = Heightmap::parse(&hm_with(version, cell_size, true)).unwrap_or_else(|e| panic!("v{version} {cell_size:e}: {e}"));
+                assert_eq!((hm.version, hm.cell_size), (version, cell_size));
+            }
+        }
     }
 
     #[test]

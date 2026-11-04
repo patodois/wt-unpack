@@ -8,6 +8,8 @@ readme = "README.md"
 repository = "https://github.com/patodois/wt-unpack"
 keywords = ["war-thunder", "dagor", "gamedev", "assets", "gltf"]
 categories = ["game-development", "parser-implementations"]
+# the fuzz crate is nightly-only and not part of the published package, and neither are process notes or reviews
+exclude = ["/fuzz", "/CLOUD-REPORT.md", "/docs/reviews"]
 
 [dependencies]
 anyhow = "1"

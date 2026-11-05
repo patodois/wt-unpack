@@ -172,16 +172,34 @@ fn read_file_table(body: &[u8]) -> Result<Vec<VromFile>> {
         names_count <= names.remaining() / 8 && names_count <= entries.remaining() / 16,
         "the file tables claim {names_count} files but hold fewer"
     );
+    // Bound repeated ranges as well as the physical archive body.
+    let copy_limit = body.len().saturating_mul(16).min(1 << 30);
+    let mut copied = 0usize;
     let mut files = Vec::with_capacity(names_count);
     for _ in 0..names_count {
         let name_ofs = names.u64()? as usize;
-        let name = Reader::at(body, name_ofs)?.cstr()?;
+        let bytes = Reader::at(body, name_ofs)?.rest();
+        let end = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .context("unterminated file name")?;
+        let name = String::from_utf8_lossy(&bytes[..end]);
         let (ofs, size) = read_tab(&mut entries)?;
         let data = body
             .get(ofs..ofs + size)
-            .with_context(|| format!("file {name:?} points outside the archive"))?
-            .to_vec();
-        files.push(VromFile { name, data });
+            .with_context(|| format!("file {name:?} points outside the archive"))?;
+        copied = copied
+            .checked_add(name.len())
+            .and_then(|n| n.checked_add(data.len()))
+            .context("archive copy size overflow")?;
+        ensure!(
+            copied <= copy_limit,
+            "archive ranges expand beyond the {copy_limit}-byte copy budget"
+        );
+        files.push(VromFile {
+            name: name.into_owned(),
+            data: data.to_vec(),
+        });
     }
     Ok(files)
 }
@@ -267,5 +285,29 @@ mod tests {
         assert_ne!(data, original);
         deobfuscate(&mut data);
         assert_eq!(data, original);
+    }
+}
+
+#[cfg(test)]
+mod copy_budget_regression {
+    use super::*;
+    #[test]
+    fn repeated_archive_spans_have_a_copy_budget() {
+        let n = 128usize;
+        let name = 32 + n * 24;
+        let data = name + 2;
+        let mut b = vec![0u8; data + 16384];
+        b[0..4].copy_from_slice(&32u32.to_le_bytes());
+        b[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        b[16..20].copy_from_slice(&((32 + n * 8) as u32).to_le_bytes());
+        b[20..24].copy_from_slice(&(n as u32).to_le_bytes());
+        b[name] = b'x';
+        for i in 0..n {
+            b[32 + i * 8..40 + i * 8].copy_from_slice(&(name as u64).to_le_bytes());
+            let at = 32 + n * 8 + i * 16;
+            b[at..at + 4].copy_from_slice(&(data as u32).to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&16384u32.to_le_bytes());
+        }
+        assert!(read_file_table(&b).is_err());
     }
 }

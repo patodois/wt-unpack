@@ -36,7 +36,7 @@ fn decode_frames(mut input: &[u8], dict: Option<&[u8]>, limit: usize) -> Result<
     while !input.is_empty() {
         // Inspect each header before init/reset can reserve its window.
         if let Some(window) = zstd_window(input) {
-            let window_limit = limit.saturating_sub(out.len()).max(128 << 10);
+            let window_limit = limit.saturating_sub(out.len()).saturating_mul(2).max(8 << 20);
             ensure!(window <= window_limit as u64, "zstd window {window} exceeds the {window_limit}-byte budget");
         }
         match decoder.init(&mut input) {
@@ -186,12 +186,28 @@ mod output_window_regression {
     fn small_output_budget_does_not_fill_a_large_window() {
         use std::io::Write;
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
-        encoder.window_log(20).unwrap();
+        encoder.window_log(25).unwrap();
         encoder.include_contentsize(false).unwrap();
         for _ in 0..1024 { encoder.write_all(&[0;1024]).unwrap(); }
         let packed=encoder.finish().unwrap();
         let (result, largest)=crate::alloc_probe::largest_allocation(||decode(&packed,None,32));
         assert!(result.is_err());
         assert!(largest<1<<18,"reserved {largest} bytes for a 32-byte output limit");
+    }
+}
+
+#[cfg(test)]
+mod streaming_window_compatibility {
+    use super::*;
+    #[test]
+    fn standard_streaming_frame_can_use_a_window_larger_than_its_output() {
+        use std::io::Write;
+        let data=vec![42;300_000];
+        let mut encoder=zstd::stream::Encoder::new(Vec::new(),3).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&data).unwrap();
+        let packed=encoder.finish().unwrap();
+        assert_eq!(decode(&packed,None,data.len()).unwrap(),data);
+        assert!(decode(&packed,None,data.len()-1).is_err());
     }
 }

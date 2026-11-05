@@ -32,10 +32,12 @@ const MAX_DEPTH: usize = 32;
 struct Budget {
     blocks: usize,
     params: usize,
+    text: usize,
 }
 
 /// Parses a dump that starts with its root block
 pub fn parse(dump: &[u8]) -> Result<Block> {
+    let mut text = dump.len().saturating_mul(16).min(256 << 20);
     let names = {
         let mut r = Reader::at(dump, 32)?;
         let map = pptr(&mut r)?.context("data block has no name map")?;
@@ -45,12 +47,12 @@ pub fn parse(dump: &[u8]) -> Result<Block> {
         let names = (0..count)
             .map(|_| {
                 let p = pptr(&mut ptrs)?.context("null name")?;
-                Reader::at(dump, p)?.cstr()
+                crate::blk::copy_cstr(Reader::at(dump, p)?.rest(), &mut text)
             })
             .collect::<Result<Vec<_>>>()?;
         (map, names)
     };
-    let mut budget = Budget { blocks: dump.len() / BLOCK_SIZE, params: dump.len() / PARAM_SIZE };
+    let mut budget = Budget { blocks: dump.len() / BLOCK_SIZE, params: dump.len() / PARAM_SIZE, text };
     read_block(dump, 0, &names.1, names.0, 0, &mut budget)
 }
 
@@ -62,11 +64,11 @@ fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize
     let (blocks_ofs, blocks_count) = ptab(&mut r)?;
     r.skip(8)?;
     let name_id = r.i32()?;
-    let name = usize::try_from(name_id).ok().and_then(|i| names.get(i)).cloned().unwrap_or_default();
+    let name = crate::blk::copy_text(usize::try_from(name_id).ok().and_then(|i| names.get(i)).map_or("", String::as_str), &mut budget.text)?;
     ensure!(params_count <= dump.len() / PARAM_SIZE && blocks_count <= dump.len() / BLOCK_SIZE, "block claims too many entries");
     budget.params = budget.params.checked_sub(params_count).context("the dump's blocks list more parameters than it stores")?;
 
-    let name_of = |id: u16| names.get(usize::from(id)).cloned().with_context(|| format!("name id {id} out of range"));
+    let name_of = |id: u16| names.get(usize::from(id)).with_context(|| format!("name id {id} out of range"));
     let mut params = Vec::with_capacity(params_count);
     for i in 0..params_count {
         let mut p = Reader::at(dump, params_ofs + i * PARAM_SIZE)?;
@@ -82,7 +84,7 @@ fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize
             (0..n).map(|_| d.i32()).collect()
         };
         let value = match ty {
-            1 => Value::Str(Reader::at(dump, at())?.cstr()?),
+            1 => Value::Str(crate::blk::copy_cstr(Reader::at(dump, at())?.rest(), &mut budget.text)?),
             2 => Value::Int(raw as i32),
             3 => Value::Real(f32::from_bits(raw)),
             4 => Value::Point2(reals(2)?.try_into().unwrap()),
@@ -104,7 +106,7 @@ fn read_block(dump: &[u8], at: usize, names: &[String], map: usize, depth: usize
             13 => Value::IPoint4(ints(4)?.try_into().unwrap()),
             other => bail!("data block parameter of unknown type {other}"),
         };
-        params.push((name_of(id)?, value));
+        params.push((crate::blk::copy_text(name_of(id)?, &mut budget.text)?, value));
     }
     let blocks = (0..blocks_count)
         .map(|i| read_block(dump, blocks_ofs + i * BLOCK_SIZE, names, map, depth + 1, budget))
@@ -223,5 +225,31 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse(&[0; 8]).is_err());
         assert!(parse(&[0xFF; 100]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod string_budget_regression {
+    use super::*;
+    #[test]
+    fn repeated_rodb_strings_have_a_byte_budget() {
+        let start = 74usize;
+        let params = start + 8193;
+        let mut d = vec![0u8; params + 128 * 8];
+        d[..4].copy_from_slice(&(params as u32).to_le_bytes());
+        d[4..8].copy_from_slice(&128u32.to_le_bytes());
+        d[32..40].copy_from_slice(&48u64.to_le_bytes());
+        d[40..44].copy_from_slice(&(-1i32).to_le_bytes());
+        d[48..52].copy_from_slice(&64u32.to_le_bytes());
+        d[52..56].copy_from_slice(&1u32.to_le_bytes());
+        d[64..72].copy_from_slice(&72u64.to_le_bytes());
+        d[72] = b'x';
+        d[start..start + 8192].fill(b'A');
+        for i in 0..128 {
+            let at = params + i * 8;
+            d[at..at + 4].copy_from_slice(&((start - 48) as u32).to_le_bytes());
+            d[at + 6..at + 8].copy_from_slice(&1u16.to_le_bytes());
+        }
+        assert!(parse(&d).is_err());
     }
 }

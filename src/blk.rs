@@ -149,6 +149,8 @@ struct BlockInfo {
 }
 
 fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Block> {
+    let shared_text = shared_names.iter().fold(0usize, |n, s| n.saturating_add(s.len()));
+    let mut text_budget = r.remaining().saturating_add(shared_text).saturating_mul(16).min(256 << 20);
     let own_names = read_names(r)?;
     let name = |id: u32| -> Result<&str> {
         let id = id as usize;
@@ -178,7 +180,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
         let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
         let v = u32::from_le_bytes(raw[4..].try_into().unwrap());
         let (name_id, ty) = (head & 0x00FF_FFFF, (head >> 24) as u8);
-        params.push((name(name_id)?.to_string(), decode_value(ty, v, complex, shared_names, &own_names)?));
+        params.push((copy_text(name(name_id)?, &mut text_budget)?, decode_value(ty, v, complex, shared_names, &own_names, &mut text_budget)?));
     }
 
     let mut infos = Vec::with_capacity(blocks_count);
@@ -204,6 +206,9 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
         copied += slice.len();
         ensure!(copied <= copy_budget, "the blocks' shared parameter ranges expand to more than {copy_budget} parameters");
         ensure!(bc == 0 || first_block.checked_add(bc).is_some_and(|end| end <= blocks_count), "block children out of range");
+        for (key, value) in slice {
+            charge_text(key.len() + if let Value::Str(s) = value { s.len() } else { 0 }, &mut text_budget)?;
+        }
         infos.push(BlockInfo { name_id, params: slice.to_vec(), blocks_count: bc, first_block });
     }
 
@@ -211,8 +216,8 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
     let mut built: Vec<Option<Block>> = vec![None; blocks_count];
     let mut depth = vec![1usize; blocks_count];
     for i in (0..blocks_count).rev() {
-        let info = &infos[i];
-        let block_name = if info.name_id == 0 { String::new() } else { name(info.name_id - 1)?.to_string() };
+        let info = &mut infos[i];
+        let block_name = if info.name_id == 0 { String::new() } else { copy_text(name(info.name_id - 1)?, &mut text_budget)? };
         let mut children = Vec::with_capacity(info.blocks_count);
         for c in info.first_block..info.first_block + info.blocks_count {
             ensure!(c > i, "block {i} references earlier block {c}");
@@ -220,12 +225,12 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Bl
             ensure!(depth[i] <= MAX_DEPTH, "blocks nest deeper than {MAX_DEPTH} levels");
             children.push(built[c].take().context("block used twice")?);
         }
-        built[i] = Some(Block { name: block_name, params: info.params.clone(), blocks: children });
+        built[i] = Some(Block { name: block_name, params: std::mem::take(&mut info.params), blocks: children });
     }
     Ok(built[0].take().unwrap())
 }
 
-fn decode_value(ty: u8, v: u32, complex: &[u8], shared: &[String], own: &[String]) -> Result<Value> {
+fn decode_value(ty: u8, v: u32, complex: &[u8], shared: &[String], own: &[String], text_budget: &mut usize) -> Result<Value> {
     let size = type_size(ty).with_context(|| format!("unknown param type {ty}"))?;
     let at = |n: usize| -> Result<&[u8]> {
         complex.get(v as usize..v as usize + n).context("param value outside complex data")
@@ -240,9 +245,9 @@ fn decode_value(ty: u8, v: u32, complex: &[u8], shared: &[String], own: &[String
             if v & IS_NAMEMAP_ID != 0 {
                 let id = (v & !IS_NAMEMAP_ID) as usize;
                 let s = shared.get(id).or_else(|| own.get(id.wrapping_sub(shared.len())));
-                Value::Str(s.context("string name id out of range")?.clone())
+                Value::Str(copy_text(s.context("string name id out of range")?, text_budget)?)
             } else {
-                Value::Str(Reader::at(complex, v as usize)?.cstr()?)
+                Value::Str(copy_cstr(Reader::at(complex, v as usize)?.rest(), text_budget)?)
             }
         }
         2 => Value::Int(v as i32),
@@ -436,6 +441,24 @@ fn quote_string(s: &str) -> String {
     out
 }
 
+
+fn charge_text(size: usize, remaining: &mut usize) -> Result<()> {
+    *remaining = remaining.checked_sub(size).context("copied text exceeds the byte budget")?;
+    Ok(())
+}
+pub(crate) fn copy_text(s: &str, remaining: &mut usize) -> Result<String> {
+    charge_text(s.len(), remaining)?;
+    Ok(s.to_string())
+}
+pub(crate) fn copy_cstr(bytes: &[u8], remaining: &mut usize) -> Result<String> {
+    let end = bytes.iter().position(|&b| b == 0).context("unterminated string")?;
+    let raw = &bytes[..end];
+    if let Ok(text) = std::str::from_utf8(raw) { return copy_text(text, remaining); }
+    let size = raw.utf8_chunks().fold(0usize, |n, c| n.saturating_add(c.valid().len()).saturating_add(if c.invalid().is_empty() { 0 } else { 3 }));
+    charge_text(size, remaining)?;
+    Ok(String::from_utf8_lossy(raw).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +570,45 @@ mod tests {
         // 1.2 million copies out of 2 stored params, in a 2.4 MB file
         let err = parse(&shared_params(600_000), None).unwrap_err().to_string();
         assert!(err.contains("expand"), "{err}");
+    }
+
+    #[test]
+    fn invalid_utf8_is_budgeted_before_materialization() {
+        let mut raw=[0xff;65]; raw[64]=0;
+        let mut remaining=128;
+        let (result,largest)=crate::alloc_probe::largest_allocation(||copy_cstr(&raw,&mut remaining));
+        assert!(result.is_err());
+        assert!(largest<192,"requested {largest} bytes before rejecting 192 bytes of text");
+    }
+
+    #[test]
+    fn shared_name_text_is_part_of_the_copy_budget_input() {
+        let mut data=vec![3,0,1,1,0];
+        data.extend_from_slice(&(1u32<<24).to_le_bytes());
+        data.extend_from_slice(&IS_NAMEMAP_ID.to_le_bytes());
+        data.extend_from_slice(&[0,1,0]);
+        let ctx=SharedContext {names:vec!["x".repeat(8192)],dict:None};
+        let block=parse(&data,Some(&ctx)).unwrap();
+        assert_eq!(block.params[0].0.len(),8192);
+        assert_eq!(block.params[0].1,Value::Str("x".repeat(8192)));
+    }
+
+    #[test]
+    fn repeated_string_parameters_have_a_byte_budget() {
+        let mut b = vec![1, 1, 2, b'x', 0];
+        varint(1, &mut b);
+        varint(128, &mut b);
+        varint(8193, &mut b);
+        b.extend_from_slice(&[b'A'; 8192]);
+        b.push(0);
+        for _ in 0..128 {
+            b.extend_from_slice(&(1u32 << 24).to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+        }
+        b.push(0);
+        varint(128, &mut b);
+        b.push(0);
+        assert!(parse(&b, None).is_err());
     }
 
     #[test]

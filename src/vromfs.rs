@@ -48,7 +48,10 @@ impl Vromfs {
     pub fn parse(raw: &[u8]) -> Result<Self> {
         let mut r = Reader::new(raw);
         let label = r.u32()?;
-        ensure!(label == LABEL_VRFS || label == LABEL_VRFX, "not a vromfs file (bad label)");
+        ensure!(
+            label == LABEL_VRFS || label == LABEL_VRFX,
+            "not a vromfs file (bad label)"
+        );
         let target_raw = r.bytes(4)?;
         let full_size = r.u32()? as usize;
         let hw32 = r.u32()?;
@@ -61,11 +64,21 @@ impl Vromfs {
             let _flags = r.u16()?;
             ensure!(ext_size >= 8, "VRFx extension header too small");
             let v = r.u32()?;
-            version = Some(format!("{}.{}.{}.{}", v >> 24, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF));
+            version = Some(format!(
+                "{}.{}.{}.{}",
+                v >> 24,
+                (v >> 16) & 0xFF,
+                (v >> 8) & 0xFF,
+                v & 0xFF
+            ));
             r.skip(ext_size - 8)?;
         }
 
-        let body_size = if packed_size > 0 { packed_size } else { full_size };
+        let body_size = if packed_size > 0 {
+            packed_size
+        } else {
+            full_size
+        };
         let body = r.bytes(body_size)?;
         let body = if packed_size == 0 {
             body.to_vec()
@@ -74,11 +87,17 @@ impl Vromfs {
             deobfuscate(&mut packed);
             // The header's size is a claim: the output grows with what the stream really holds, and a stream
             // that holds more than it said is refused
-            crate::unzstd::decode(&packed, None, full_size).context("zstd decompression of vromfs body failed")?
+            crate::unzstd::decode(&packed, None, full_size)
+                .context("zstd decompression of vromfs body failed")?
         } else {
             bail!("zlib-packed vromfs bodies are not supported yet");
         };
-        ensure!(body.len() == full_size, "unpacked size {} != header size {}", body.len(), full_size);
+        ensure!(
+            body.len() == full_size,
+            "unpacked size {} != header size {}",
+            body.len(),
+            full_size
+        );
 
         let md5_ok = match r.bytes(16) {
             Ok(expected) => Md5::digest(&body).as_slice() == expected,
@@ -86,7 +105,9 @@ impl Vromfs {
         };
 
         Ok(Vromfs {
-            target: String::from_utf8_lossy(&target_raw).trim_matches('\0').to_string(),
+            target: String::from_utf8_lossy(&target_raw)
+                .trim_matches('\0')
+                .to_string(),
             version,
             md5_ok,
             files: read_file_table(&body)?,
@@ -100,7 +121,9 @@ impl Vromfs {
 
 /// Loads the shared name map and zstd dictionary that slim BLK files in an archive depend on
 pub fn shared_context(vfs: &Vromfs) -> Result<Option<crate::blk::SharedContext>> {
-    let Some(nm) = vfs.get(SHARED_NAMEMAP_NAME) else { return Ok(None) };
+    let Some(nm) = vfs.get(SHARED_NAMEMAP_NAME) else {
+        return Ok(None);
+    };
     let (mut ctx, dict_name) = crate::blk::SharedContext::from_namemap(&nm.data)?;
     ctx.dict = vfs.get(&dict_name).map(|f| f.data.clone());
     Ok(Some(ctx))
@@ -198,23 +221,33 @@ mod tests {
 
     #[test]
     fn a_file_table_count_the_body_cannot_hold_reserves_nothing() {
-        let (res, largest) = crate::alloc_probe::largest_allocation(|| Vromfs::parse(&vromfs(&tables(0x1000_0000), 32, false)));
+        let (res, largest) = crate::alloc_probe::largest_allocation(|| {
+            Vromfs::parse(&vromfs(&tables(0x1000_0000), 32, false))
+        });
         let err = res.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("claim"), "{err}");
         assert!(largest < 1 << 20, "asked for {largest} bytes");
         // The same file with an empty table is a valid, empty archive
-        assert!(Vromfs::parse(&vromfs(&tables(0), 32, false)).unwrap().files.is_empty());
+        assert!(Vromfs::parse(&vromfs(&tables(0), 32, false))
+            .unwrap()
+            .files
+            .is_empty());
     }
 
     #[test]
     fn a_claimed_unpacked_size_does_not_size_the_buffer() {
         // 32 bytes of zstd-packed table, in a header that says 4 GB
-        let (res, largest) = crate::alloc_probe::largest_allocation(|| Vromfs::parse(&vromfs(&tables(0), 0xF000_0000, true)));
+        let (res, largest) = crate::alloc_probe::largest_allocation(|| {
+            Vromfs::parse(&vromfs(&tables(0), 0xF000_0000, true))
+        });
         let err = res.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("unpacked size"), "{err}");
         assert!(largest < 1 << 24, "asked for {largest} bytes");
         // The truthful header still unpacks
-        assert!(Vromfs::parse(&vromfs(&tables(0), 32, true)).unwrap().files.is_empty());
+        assert!(Vromfs::parse(&vromfs(&tables(0), 32, true))
+            .unwrap()
+            .files
+            .is_empty());
     }
 
     #[test]

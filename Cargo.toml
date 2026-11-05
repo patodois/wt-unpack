@@ -29,7 +29,7 @@ memmap2 = "0.9"
 ureq = { version = "3.5", default-features = false, optional = true }
 # The bridge to other game rewrites (see src/bridge.rs, github.com/patodois/rewrite-bridge), and the
 # peak memory report of `check-bridge`
-rewrite-bridge = { version = "0.2.1", optional = true }
+rewrite-bridge = { version = "0.3.1", optional = true }
 
 [dev-dependencies]
 # to build zstd frames, with and without a dictionary, in the tests

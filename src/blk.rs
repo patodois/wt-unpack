@@ -72,11 +72,21 @@ pub fn is_binary(data: &[u8]) -> bool {
 /// Shared names and zstd dictionary needed by slim BLK files (formats 3-5).
 #[derive(Default)]
 pub struct SharedContext {
-    pub names: Vec<String>,
+    names: Vec<String>,
+    name_bytes: usize,
     pub dict: Option<Vec<u8>>,
 }
 
 impl SharedContext {
+    /// Prepares immutable shared names and their byte budget once for a batch of BLKs.
+    pub fn new(names: Vec<String>, dict: Option<Vec<u8>>) -> Self {
+        let name_bytes=names.iter().fold(0usize,|n,s|n.saturating_add(s.len()));
+        Self {names,name_bytes,dict}
+    }
+
+    /// The archive's immutable shared name map.
+    pub fn names(&self)->&[String] {&self.names}
+
     /// Parses the `\xff?nm` file: u64 names hash, 32-byte dictionary hash,
     /// then a zstd stream holding a name map.
     pub fn from_namemap(nm: &[u8]) -> Result<(Self, String)> {
@@ -84,7 +94,7 @@ impl SharedContext {
         let dict_name = format!("{}.dict", hex(&nm[8..40]));
         let raw = crate::unzstd::decode(&nm[40..], None, MAX_BLK).context("shared name map is not valid zstd")?;
         let names = read_names(&mut Reader::new(&raw))?;
-        Ok((SharedContext { names, dict: None }, dict_name))
+        Ok((SharedContext::new(names,None), dict_name))
     }
 }
 
@@ -93,27 +103,27 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
     let format = r.u8()?;
     let need_shared = || shared.context("this BLK uses a shared name map; read it from inside its vromfs");
     match format {
-        1 => parse_dump(&mut r, &[], false),
-        6 => parse_dump(&mut r, &[], true),
+        1 => parse_dump(&mut r, &[], false,0),
+        6 => parse_dump(&mut r, &[], true,0),
         2 => {
             let size = r.bytes(3)?;
             let size = usize::from(size[0]) | usize::from(size[1]) << 8 | usize::from(size[2]) << 16;
             let raw = crate::unzstd::decode(r.bytes(size)?, None, MAX_BLK)?;
             // The unpacked stream repeats the format byte of a plain full BLK
             ensure!(raw.first() == Some(&1), "packed BLK does not unpack to format 1");
-            parse_dump(&mut Reader::new(&raw[1..]), &[], false)
+            parse_dump(&mut Reader::new(&raw[1..]), &[], false,0)
         }
-        3 => parse_dump(&mut r, &need_shared()?.names, false),
+        3 => parse_dump(&mut r, &need_shared()?.names, false,need_shared()?.name_bytes),
         4 => {
             let raw = crate::unzstd::decode(r.rest(), None, MAX_BLK)?;
-            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false)
+            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false,need_shared()?.name_bytes)
         }
         5 => {
             let ctx = need_shared()?;
             let dict = ctx.dict.as_deref().context("this BLK needs the archive's zstd dictionary")?;
             // The unpacked size is not stored and the ratio has no upper bound: the output grows with the stream
             let raw = crate::unzstd::decode(r.rest(), Some(dict), MAX_BLK)?;
-            parse_dump(&mut Reader::new(&raw), &ctx.names, false)
+            parse_dump(&mut Reader::new(&raw), &ctx.names, false,ctx.name_bytes)
         }
         other => bail!("not a binary BLK (format byte {other:#04x})"),
     }
@@ -148,8 +158,7 @@ struct BlockInfo {
     first_block: usize,
 }
 
-fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool) -> Result<Block> {
-    let shared_text = shared_names.iter().fold(0usize, |n, s| n.saturating_add(s.len()));
+fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
     let mut text_budget = r.remaining().saturating_add(shared_text).saturating_mul(16).min(256 << 20);
     let own_names = read_names(r)?;
     let name = |id: u32| -> Result<&str> {
@@ -587,7 +596,7 @@ mod tests {
         data.extend_from_slice(&(1u32<<24).to_le_bytes());
         data.extend_from_slice(&IS_NAMEMAP_ID.to_le_bytes());
         data.extend_from_slice(&[0,1,0]);
-        let ctx=SharedContext {names:vec!["x".repeat(8192)],dict:None};
+        let ctx=SharedContext::new(vec!["x".repeat(8192)],None);
         let block=parse(&data,Some(&ctx)).unwrap();
         assert_eq!(block.params[0].0.len(),8192);
         assert_eq!(block.params[0].1,Value::Str("x".repeat(8192)));
@@ -647,7 +656,7 @@ mod tests {
         let mut file = vec![5u8];
         file.extend_from_slice(&packed);
 
-        let ctx = SharedContext { names: Vec::new(), dict: Some(dict) };
+        let ctx = SharedContext::new(Vec::new(),Some(dict));
         let root = parse(&file, Some(&ctx)).unwrap();
         assert_eq!(root.params, vec![("v".into(), Value::Str("a".repeat(5 << 20)))]);
     }

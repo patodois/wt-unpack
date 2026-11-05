@@ -399,3 +399,5 @@ decoders are pure Rust.
 ## License
 
 Licensed under either of MIT or Apache-2.0, at your option.
+
+Shared BLK name maps are prepared once: construct `blk::SharedContext::new(names, dict)` and inspect names through `names()`. The name vector is private so its cached byte budget cannot become stale after mutation.

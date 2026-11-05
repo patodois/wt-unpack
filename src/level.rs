@@ -240,15 +240,15 @@ pub(crate) fn unpack_sized(codec: u8, packed: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// Oodle unpacks in 256 KiB blocks and spends at least 6 bytes on each: reject sizes the stream
-/// cannot reach before allocating the output
+/// Decode in growing, block-aligned buffers so a claimed size never reserves the full output first.
 fn oodle(packed: &[u8], size: usize) -> Result<Vec<u8>> {
-    ensure!(size.div_ceil(0x4_0000) <= packed.len() / 6, "{} bytes of Oodle data cannot unpack to {size}", packed.len());
-    // lztans fills the whole buffer or fails, and does not panic on malformed input; what it returns is the
-    // number of input bytes it used, so the output length is the size of the buffer allocated here
-    let mut out = vec![0u8; size];
-    lztans::decode(packed, &mut out).map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
-    Ok(out)
+    let mut room = size.min(4 << 20);
+    loop {
+        let mut out = vec![0u8; room];
+        lztans::decode(packed, &mut out).map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
+        if room == size { return Ok(out); }
+        room = size.min(room * 2);
+    }
 }
 
 /// Reads a patchable table header: offset into the dump and element count
@@ -1719,5 +1719,14 @@ mod tests {
         assert_eq!(mesh.positions[1], [101.0, 1.0, 10.0]);
         assert_eq!(mesh.positions[4], [204.0, 4.0, 10.0]);
         assert_eq!(mesh.indices, [0, 1, 2, 5, 4, 3]);
+    }
+}
+
+#[cfg(test)]
+mod stored_oodle_regression {
+    use super::*;
+    #[test]
+    fn stored_partial_oodle_block_can_be_three_bytes() {
+        assert_eq!(oodle(&[0x4c, 0x06, b'A'], 1).unwrap(), b"A");
     }
 }

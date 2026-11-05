@@ -80,14 +80,15 @@ impl TextureLibrary {
 
 /// Halves an image (2 x 2 box filter) until neither side exceeds `max_side`
 pub fn shrink(mut img: Rgba, max_side: u32) -> Rgba {
-    while img.width.max(img.height) > max_side.max(1) && img.width >= 2 && img.height >= 2 {
-        let (w, h) = ((img.width / 2) as usize, (img.height / 2) as usize);
+    if img.width == 0 || img.height == 0 { return img; }
+    while img.width.max(img.height) > max_side.max(1) {
+        let (w, h) = ((img.width / 2).max(1) as usize, (img.height / 2).max(1) as usize);
         let src_w = img.width as usize;
         let mut out = vec![0u8; w * h * 4];
         for y in 0..h {
             for x in 0..w {
                 for c in 0..4 {
-                    let at = |dx: usize, dy: usize| u32::from(img.rgba[((2 * y + dy) * src_w + 2 * x + dx) * 4 + c]);
+                    let at = |dx: usize, dy: usize| u32::from(img.rgba[(((2 * y + dy).min(img.height as usize - 1)) * src_w + (2 * x + dx).min(src_w - 1)) * 4 + c]);
                     out[(y * w + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
                 }
             }
@@ -116,5 +117,36 @@ mod tests {
         // The left 2 x 2 block holds reds 0, 10, 40, 50 (row-major pixels 0, 1, 4, 5)
         assert_eq!(s.rgba[0], 25);
         assert_eq!(s.rgba[4], 45);
+    }
+}
+
+#[cfg(test)]
+mod thin_texture_regression {
+    use super::*;
+    #[test]
+    fn single_pixel_dimensions_still_obey_max_side() {
+        for (width, height) in [(8, 1), (1, 8), (16, 2), (2, 16)] {
+            let image = Rgba {
+                width,
+                height,
+                rgba: vec![100; (width * height * 4) as usize],
+            };
+            let small = shrink(image, 2);
+            assert!(small.width.max(small.height) <= 2);
+            assert!(small.rgba.iter().all(|&b| b == 100));
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_texture_compatibility {
+    use super::*;
+    #[test]
+    fn empty_images_keep_their_dimensions() {
+        for (width,height) in [(0,8),(8,0),(0,0)] {
+            let out=shrink(Rgba {width,height,rgba:vec![]},2);
+            assert_eq!((out.width,out.height),(width,height));
+            assert!(out.rgba.is_empty());
+        }
     }
 }

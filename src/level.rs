@@ -240,15 +240,13 @@ pub(crate) fn unpack_sized(codec: u8, packed: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// Decode in growing, block-aligned buffers so a claimed size never reserves the full output first.
+/// Decode once into the declared output size, already validated by `unpack`.
 fn oodle(packed: &[u8], size: usize) -> Result<Vec<u8>> {
-    let mut room = size.min(4 << 20);
-    loop {
-        let mut out = vec![0u8; room];
-        lztans::decode(packed, &mut out).map_err(|e| anyhow::anyhow!("Oodle: {e:?}"))?;
-        if room == size { return Ok(out); }
-        room = size.min(room * 2);
-    }
+    let mut out=Vec::new();
+    out.try_reserve_exact(size).context("reserving Oodle output")?;
+    out.resize(size,0);
+    lztans::decode(packed,&mut out).map_err(|e|anyhow::anyhow!("Oodle: {e:?}"))?;
+    Ok(out)
 }
 
 /// Reads a patchable table header: offset into the dump and element count
@@ -1728,5 +1726,25 @@ mod stored_oodle_regression {
     #[test]
     fn stored_partial_oodle_block_can_be_three_bytes() {
         assert_eq!(oodle(&[0x4c, 0x06, b'A'], 1).unwrap(), b"A");
+    }
+}
+
+#[cfg(test)]
+mod single_pass_oodle {
+    use super::*;
+    #[test]
+    fn stored_blocks_are_decoded_without_restarting() {
+        let size=(4<<20)+1;
+        let mut packed=Vec::new();
+        let mut remaining=size;
+        while remaining>0 {
+            let n=remaining.min(256<<10);
+            packed.extend_from_slice(&[0x4c,0x06]);
+            packed.resize(packed.len()+n,42);
+            remaining-=n;
+        }
+        let (result,allocated)=crate::alloc_probe::total_allocation(||oodle(&packed,size));
+        assert_eq!(result.unwrap(),vec![42;size]);
+        assert!(allocated<size+(128<<10), "allocated {allocated} bytes for {size} bytes of output");
     }
 }

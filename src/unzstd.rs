@@ -211,3 +211,22 @@ mod streaming_window_compatibility {
         assert!(decode(&packed,None,data.len()-1).is_err());
     }
 }
+
+#[cfg(test)]
+mod output_allocation_coverage {
+    use super::*;
+    #[test]
+    fn output_guard_precedes_collect_allocation(){
+        let data=vec![0;64<<10];let packed=zstd::bulk::compress(&data,3).unwrap();
+        let (result,count)=crate::alloc_probe::count_allocations(data.len(),||decode(&packed,None,32));
+        assert!(result.is_err());assert_eq!(count,0,"allocated the oversized collected output");
+    }
+    #[test]
+    fn block_strategy_stops_before_accumulating_many_blocks(){
+        use std::io::Write;
+        let mut encoder=zstd::stream::Encoder::new(Vec::new(),3).unwrap();encoder.window_log(17).unwrap();encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&vec![0;1<<20]).unwrap();let packed=encoder.finish().unwrap();
+        let (result,largest)=crate::alloc_probe::largest_allocation(||decode(&packed,None,32));
+        assert!(result.is_err());assert!(largest<512<<10,"decoder accumulated {largest} bytes before checking output");
+    }
+}

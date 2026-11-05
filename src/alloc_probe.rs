@@ -5,6 +5,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 thread_local! {
+    static WATCH: Cell<usize> = const { Cell::new(usize::MAX) };
+    static COUNT: Cell<usize> = const { Cell::new(0) };
     static TOTAL: Cell<usize> = const { Cell::new(0) };
     static LARGEST: Cell<usize> = const { Cell::new(0) };
     static REFUSE_FROM: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -13,6 +15,7 @@ thread_local! {
 pub struct Probe;
 
 fn note(size: usize) {
+    let _=WATCH.try_with(|watch|if watch.get()==size {let _=COUNT.try_with(|count|count.set(count.get()+1));});
     let _ = TOTAL.try_with(|total| total.set(total.get().saturating_add(size)));
     let _ = LARGEST.try_with(|largest| largest.set(largest.get().max(size)));
 }
@@ -81,4 +84,10 @@ pub fn total_allocation<R>(f: impl FnOnce() -> R) -> (R, usize) {
     TOTAL.with(|n| n.set(0));
     let out=f();
     (out,TOTAL.with(Cell::get))
+}
+
+pub fn count_allocations<R>(size:usize,f:impl FnOnce()->R)->(R,usize){
+    WATCH.with(|v|v.set(size));COUNT.with(|v|v.set(0));
+    let out=f();WATCH.with(|v|v.set(usize::MAX));
+    (out,COUNT.with(Cell::get))
 }

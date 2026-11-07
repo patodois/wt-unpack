@@ -181,6 +181,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         r.remaining()
     );
 
+    ensure!(params_count <= copy_budget, "stored parameters exceed the {copy_budget}-parameter copy budget");
     let mut params = Vec::with_capacity(params_count);
     for raw in param_table.chunks_exact(8) {
         let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
@@ -765,4 +766,13 @@ mod numeric_copy_budget {
         assert!(total<file.len()*128,"allocated {total} bytes before rejecting copies");
         let small=numeric(2,8);let block=parse(&small,None).unwrap();assert_eq!(block.blocks.len(),8);
     }
+    #[test]
+    fn stored_parameter_storage_is_bounded_before_reserving_the_table() {
+        let count=(256<<20)/std::mem::size_of::<(String,Value)>()+1;
+        let file=numeric(count,0);
+        let (result,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));
+        assert!(result.is_err());
+        assert!(largest<256<<20,"reserved {largest} bytes beyond the aggregate quota");
+    }
+
 }

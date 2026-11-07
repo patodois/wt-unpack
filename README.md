@@ -60,7 +60,7 @@ the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256su
 that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
 
 ```sh
-sh tools/verify-release.sh wt-unpack v0.4.0 path/to/folder
+sh tools/verify-release.sh wt-unpack v0.5.0 path/to/folder
 ```
 
 The signed text is `osp release patodois/wt-unpack <tag>`, a newline, then `SHA256SUMS`, so a signature from another release
@@ -227,14 +227,14 @@ tanks into its scenes without knowing Dagor's formats.
 ```toml
 [dependencies]
 wt-unpack = { git = "https://github.com/patodois/wt-unpack", features = ["bridge"] }
-# crates.io gives every crate in the build the same rewrite-bridge: all 0.3.x requirements share one copy
-rewrite-bridge = "0.3"
+# crates.io gives every crate in the build the same rewrite-bridge: all 0.4.x requirements share one copy
+rewrite-bridge = "0.4"
 ```
 
 Every crate in one build has to share one copy of rewrite-bridge, or `WarThunder` implements a `Provider` that
 your code's `Provider` is not ("multiple different versions of crate `rewrite_bridge`"). From crates.io Cargo does
-that for you: this crate asks for `0.3.1`, your `"0.3"` accepts it, and both resolve to one 0.3.x release. Another
-minor line (`"0.2"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
+that for you: this crate asks for `0.4`, your `"0.4"` accepts it, and both resolve to one 0.4.x release. Another
+minor line (`"0.3"`) would be a second copy. `cargo tree -i rewrite-bridge` must show a single copy.
 
 See [docs/BRIDGE.md](docs/BRIDGE.md) for the ids, axes, sockets, the rig and level collision,
 [docs/LEVELS.md](docs/LEVELS.md) for scenes, [docs/MEMORY.md](docs/MEMORY.md) for what a consumer should do about
@@ -396,8 +396,20 @@ decoders are pure Rust.
   (BSD-3-Clause), the sound formats the community documentation of vgmstream and python-fsb5; no code was copied
   (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
 
+## Changes in 0.5.0
+
+- The `bridge` feature now uses rewrite-bridge 0.4. Nothing in the provider changed; a program that also depends on
+  rewrite-bridge has to ask for `"0.4"` so the build holds one copy.
+- `blk::SharedContext` is built with `SharedContext::new(names, dict)`, and its name list is read through `names()`.
+  The `names` field is no longer public: the context adds up the bytes of the names once, and that total would be wrong
+  if the list could change afterwards.
+- Archives and BLK files are read with total limits: the names and file ranges copied out of a VROMFS table, the text
+  copied out of a BLK, and the window of a zstd stream (at most the greater of 8 MiB or twice the output) are checked
+  before they are allocated, so a damaged file fails with an error instead of exhausting memory.
+- Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
+  256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six
+  bytes is accepted when its declared sizes are right.
+
 ## License
 
 Licensed under either of MIT or Apache-2.0, at your option.
-
-Shared BLK name maps are prepared once: construct `blk::SharedContext::new(names, dict)` and inspect names through `names()`. The name vector is private so its cached byte budget cannot become stale after mutation.

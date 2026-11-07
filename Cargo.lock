@@ -4813,9 +4813,9 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rewrite-bridge"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a296e290e63610ff1c5a4ae012666464d3697ac5dfd04acff5681f46c4f37b6"
+checksum = "73b1e463fa808a2b4c25d48c214f0cdc66ff09db3c283009f031534e331b3587"
 
 [[package]]
 name = "rodio"
@@ -6507,7 +6507,7 @@ dependencies = [
 
 [[package]]
 name = "wt-unpack"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",

@@ -268,7 +268,7 @@ fn check_oodle_blocks(packed:&[u8],size:usize)->Result<()> {
             let q=r.bytes(3)?;
             let v=(usize::from(q[0])<<16)|(usize::from(q[1])<<8)|usize::from(q[2]);
             let length=v&0x3ffff;
-            if length!=0x3ffff {r.skip(length+1)?;} else {
+            if length!=0x3ffff {ensure!(length>=3,"Oodle: quantum payload is shorter than four bytes");r.skip(length+1)?;} else {
                 ensure!(v>>18==1,"Oodle: bad quantum header");
                 r.skip(1)?;
             }
@@ -1840,3 +1840,20 @@ mod minimum_block_encoding {
     }
 
 }
+
+#[cfg(test)]
+mod sized_quantum_contract {
+    use super::*;
+    #[test]
+    fn undersized_quantum_payloads_are_rejected_before_reserving_output() {
+        let packed=[0x0c,6,0,0,0,0x41].repeat(1024);
+        let (result,largest)=crate::alloc_probe::largest_allocation(||unpack(2,&packed,Some(256<<20)));
+        assert!(result.is_err());assert!(largest<1<<20,"reserved {largest} bytes for impossible quantum payloads");
+    }
+    #[test]
+    fn valid_memset_still_generates_the_declared_output() {
+        let packed=[0x0c,6,7,255,255,0x41].repeat(1024);
+        let out=unpack(2,&packed,Some(256<<20)).unwrap();assert_eq!(out.len(),256<<20);assert!(out.iter().all(|&b|b==0x41));
+    }
+}
+

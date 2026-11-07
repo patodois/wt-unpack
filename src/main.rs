@@ -304,6 +304,7 @@ fn extract(path: &Path, out: &Path, format: BlkFormat, filter: Option<&str>) -> 
     let vfs = open(path)?;
     let shared = shared_context(&vfs)?;
     let (mut written, mut failed) = (0, 0);
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
     for f in &vfs.files {
         if filter.is_some_and(|needle| !f.name.contains(needle)) {
             continue;
@@ -326,6 +327,7 @@ fn extract(path: &Path, out: &Path, format: BlkFormat, filter: Option<&str>) -> 
                 Err(e) => {
                     eprintln!("{}: {e:#} (kept raw)", f.name);
                     failed += 1;
+                    *reasons.entry(format!("{e:#}")).or_default() += 1;
                     None
                 }
             }
@@ -343,6 +345,10 @@ fn extract(path: &Path, out: &Path, format: BlkFormat, filter: Option<&str>) -> 
         written += 1;
     }
     eprintln!("wrote {written} files to {} ({failed} BLK files could not be converted)", out.display());
+    eprintln!("kept raw: {failed} BLK files");
+    for (reason, count) in reasons {
+        eprintln!("  {count} x {reason}");
+    }
     Ok(())
 }
 

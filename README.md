@@ -431,6 +431,16 @@ decoders are pure Rust.
   `to_text()` and `to_json()` APIs still allocate their entire result, without an extra conversion quota;
   callers needing bounded output buffering should use the writer methods. Manually constructed
   `Block` trees are not subject to the parser's depth or storage limits.
+- `extract` retains its existing success status (0) when all selected safe files have been written,
+  including binary BLKs that could not be converted and were saved unchanged under their original names.
+  This preserves the raw-fallback behavior of existing extraction scripts. Besides each file's diagnostic,
+  stderr ends with `kept raw: N BLK files` and counts grouped by refusal reason, including the requested
+  count and applicable limit for quota errors. Scripts requiring conversion of every BLK should check
+  that summary for zero. Unsafe paths are skipped, as before. Archive/read/write failures exit nonzero;
+  streamed write failures can leave a partial output file. `cat` exits nonzero on a refused binary BLK
+  and does not substitute raw data. An invalid shared name map continues to abort either command before
+  extraction starts, even with `extract --blk raw` or a filter: the archive-wide context is validated once,
+  rather than silently hiding a damaged shared map in some modes.
 - Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
   256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six
   bytes is accepted when its declared sizes are right.

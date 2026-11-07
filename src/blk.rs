@@ -132,9 +132,9 @@ fn read_names(r: &mut Reader, storage_budget:&mut usize) -> Result<Vec<String>> 
     if count == 0 {return Ok(Vec::new());}
     let size=r.varint()? as usize;
     let raw=r.bytes(size)?;
-    ensure!(count<=size,"name count cannot fit in its byte area");
+    ensure!(count<=size,"name count cannot fit in its byte area: count={count}, limit={size} bytes");
     let slots=count.checked_mul(std::mem::size_of::<String>()).context("name table storage overflow")?;
-    ensure!(slots<=MAX_NAME_TABLE_STORAGE,"name table exceeds the storage ceiling");
+    ensure!(slots<=MAX_NAME_TABLE_STORAGE,"name table exceeds the storage ceiling: count={count}, limit={} names ({MAX_NAME_TABLE_STORAGE} bytes)",MAX_NAME_TABLE_STORAGE/std::mem::size_of::<String>());
     charge_storage(slots,storage_budget)?;
     let mut names=Vec::with_capacity(count);let mut area=Reader::new(raw);
     for _ in 0..count {
@@ -166,7 +166,8 @@ struct BlockInfo {
 fn text_copy_budget(bytes:usize)->usize {bytes.saturating_mul(16).clamp(64 << 10,256 << 20)}
 fn parameter_storage_budget(bytes:usize)->usize {bytes.saturating_mul(32).clamp(64 << 10,1 << 30)}
 fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
-    *remaining=remaining.checked_sub(bytes).context("parameter copies expand beyond the storage byte budget")?;
+    ensure!(bytes<=*remaining,"parameter copies expand beyond the storage byte budget: requested={bytes} bytes, remaining limit={} bytes",*remaining);
+    *remaining-=bytes;
     #[cfg(test)] crate::alloc_probe::record_storage_charge(bytes);
     Ok(())
 }
@@ -174,7 +175,7 @@ fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
 const MAX_BLOCK_TABLE_STORAGE:usize=256<<20;
 fn block_storage_bytes()->usize {std::mem::size_of::<BlockInfo>()+std::mem::size_of::<Option<Block>>()+std::mem::size_of::<usize>()+std::mem::size_of::<Block>()}
 fn check_block_storage(count:usize)->Result<()> {
-    ensure!(count<=MAX_BLOCK_TABLE_STORAGE/block_storage_bytes(),"block tables expand beyond the storage ceiling");Ok(())
+    ensure!(count<=MAX_BLOCK_TABLE_STORAGE/block_storage_bytes(),"block tables expand beyond the storage ceiling: count={count}, limit={} blocks ({MAX_BLOCK_TABLE_STORAGE} bytes)",MAX_BLOCK_TABLE_STORAGE/block_storage_bytes());Ok(())
 }
 
 fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
@@ -207,7 +208,8 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
 
     check_block_storage(blocks_count)?;
     let parameter_bytes=params_count.checked_mul(std::mem::size_of::<Option<(String,Value)>>() + std::mem::size_of::<usize>()).context("parameter storage overflow")?;
-    charge_storage(parameter_bytes,&mut storage_budget)?;
+    let parameter_limit=storage_budget/(std::mem::size_of::<Option<(String,Value)>>() + std::mem::size_of::<usize>());
+    charge_storage(parameter_bytes,&mut storage_budget).with_context(||format!("parameter copies expand beyond the storage byte budget: count={params_count}, limit={parameter_limit} parameter templates"))?;
     let mut params = Vec::with_capacity(params_count);
     for raw in param_table.chunks_exact(8) {
         let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
@@ -235,7 +237,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         let end=start.checked_add(pc).filter(|&end|end<=params_count).context("block params out of range")?;
         ensure!(bc == 0 || first_block.checked_add(bc).is_some_and(|end| end <= blocks_count), "block children out of range");
         output_bytes=pc.checked_mul(std::mem::size_of::<(String,Value)>()).and_then(|bytes|output_bytes.checked_add(bytes)).context("parameter copy storage overflow")?;
-        ensure!(output_bytes<=storage_budget,"parameter copies expand beyond the storage byte budget");
+        ensure!(output_bytes<=storage_budget,"parameter copies expand beyond the storage byte budget: count={} output fields, limit={} fields (remaining {storage_budget} bytes)",output_bytes/std::mem::size_of::<(String,Value)>(),storage_budget/std::mem::size_of::<(String,Value)>());
         #[cfg(test)] crate::alloc_probe::record_parameter_visits(pc);
         for count in &mut uses[start..end] { *count+=1; }
         infos.push(BlockInfo { name_id, params: start..end, blocks_count: bc, first_block });
@@ -486,7 +488,8 @@ fn quote_string(s: &str) -> String {
 
 
 fn charge_text(size: usize, remaining: &mut usize) -> Result<()> {
-    *remaining = remaining.checked_sub(size).context("copied text exceeds the byte budget")?;
+    ensure!(size<=*remaining,"copied text exceeds the byte budget: requested={size} bytes, remaining limit={} bytes",*remaining);
+    *remaining-=size;
     Ok(())
 }
 pub(crate) fn copy_text(s: &str, remaining: &mut usize) -> Result<String> {

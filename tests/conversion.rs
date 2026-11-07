@@ -77,3 +77,17 @@ fn write_errors_are_fatal() {
     fs::write(temp.0.join("out"),b"file in place of directory").unwrap();
     assert!(!temp.run(&["extract","test.vromfs.bin","--out","out"]).status.success());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_write_failing_midway_names_the_file_and_is_fatal() {
+    let temp=Scratch::new();
+    fs::write(temp.0.join("test.vromfs.bin"),archive(&[(b"a",&vec![7u8;1<<20])])).unwrap();
+    // A file-size limit makes the write fail after the file was created.
+    let out=Command::new("sh").current_dir(&temp.0).arg("-c")
+        .arg(format!("trap '' XFSZ; ulimit -f 8; exec '{}' extract test.vromfs.bin --out out",env!("CARGO_BIN_EXE_wt-unpack")))
+        .output().unwrap();
+    assert!(!out.status.success());
+    let err=String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("writing out"),"{err}");
+}

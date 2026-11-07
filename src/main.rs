@@ -337,9 +337,9 @@ fn extract(path: &Path, out: &Path, format: BlkFormat, filter: Option<&str>) -> 
         }
         let mut writer = BufWriter::new(fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?);
         if let Some(root) = root {
-            render(&root, &f.data, format, &mut writer)?;
+            render(&root, &f.data, format, &mut writer).with_context(|| format!("writing {}", dest.display()))?;
         } else {
-            writer.write_all(&f.data)?;
+            writer.write_all(&f.data).with_context(|| format!("writing {}", dest.display()))?;
         }
         writer.flush().with_context(|| format!("writing {}", dest.display()))?;
         written += 1;

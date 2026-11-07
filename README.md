@@ -60,7 +60,7 @@ the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256su
 that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
 
 ```sh
-sh tools/verify-release.sh wt-unpack v0.5.0 path/to/folder
+sh tools/verify-release.sh wt-unpack v0.5.1 path/to/folder
 ```
 
 The signed text is `osp release patodois/wt-unpack <tag>`, a newline, then `SHA256SUMS`, so a signature from another release
@@ -396,13 +396,8 @@ decoders are pure Rust.
   (BSD-3-Clause), the sound formats the community documentation of vgmstream and python-fsb5; no code was copied
   (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
 
-## Changes in 0.5.0
+## Changes in 0.5.1
 
-- The `bridge` feature now uses rewrite-bridge 0.4. Nothing in the provider changed; a program that also depends on
-  rewrite-bridge has to ask for `"0.4"` so the build holds one copy.
-- `blk::SharedContext` is built with `SharedContext::new(names, dict)`, and its name list is read through `names()`.
-  The `names` field is no longer public: the context adds up the bytes of the names once, and that total would be wrong
-  if the list could change afterwards.
 - Archives and BLK files have accounting limits for parsing: names and file ranges copied out of a
   VROMFS table, BLK parameter storage, block tables and copied text are checked before reservation.
   A zstd window is limited to the greater of 8 MiB or twice the remaining decoded-output limit.
@@ -414,13 +409,15 @@ decoders are pure Rust.
   Parameter templates, use counters, name storage and all output fields share a quota of 32 times
   the decoded dump size, with a 64 KiB floor and a 1 GiB ceiling. Copied strings have a separate
   16-times quota, with a 64 KiB floor and 256 MiB ceiling. A compressed dump can reach 1 GiB before
-  its counts can be checked. zstd output now drains directly into its destination without an
+  its counts can be checked. zstd output drains directly into its destination without an
   intermediate full-output vector.
   On macOS arm64, a synthetic 32,865-byte BLK with a 1 GiB zstd window and 1,073,741,815 decoded
   bytes used 3,810,164,736 bytes peak RSS before direct draining and 1,818,935,296 after it for
   decompression alone. Parsing that accepted dump (6,381,900 parameters, 349,525 block records)
   peaked at 3,780,804,608 bytes; a related dump refused at 12,183,668 parameter templates still
-  peaked at 3,223,437,312 bytes. These are measurements of those cases, not universal maxima.
+  peaked at 3,223,437,312 bytes. These are measurements of those cases, not universal maxima. Other synthetic inputs exceeded 4 GB RSS
+  before the measurement was stopped, including a 101,514-byte stream with a 2 GiB window that reached
+  at least 4.6 GB before being refused.
 - `cat` and `extract` stream converted BLK text and pretty JSON through a buffered writer. They keep
   the parsed BLK but no complete encoded document or JSON value tree. The additive library methods
   `Block::write_text_to` and `Block::write_json_to` expose the same behavior. JSON still groups borrowed
@@ -441,6 +438,18 @@ decoders are pure Rust.
   and does not substitute raw data. An invalid shared name map continues to abort either command before
   extraction starts, even with `extract --blk raw` or a filter: the archive-wide context is validated once,
   rather than silently hiding a damaged shared map in some modes.
+- The BLK and level readers refuse damaged counts earlier, and lztans 0.1.1 is the minimum accepted version.
+
+## Changes in 0.5.0
+
+- The `bridge` feature now uses rewrite-bridge 0.4. Nothing in the provider changed; a program that also depends on
+  rewrite-bridge has to ask for `"0.4"` so the build holds one copy.
+- `blk::SharedContext` is built with `SharedContext::new(names, dict)`, and its name list is read through `names()`.
+  The `names` field is no longer public: the context adds up the bytes of the names once, and that total would be wrong
+  if the list could change afterwards.
+- Archives and BLK files are read with total limits: the names and file ranges copied out of a VROMFS table, the text
+  copied out of a BLK, and the window of a zstd stream (at most the greater of 8 MiB or twice the output) are checked
+  before they are allocated, so a damaged file fails with an error instead of exhausting memory.
 - Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
   256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six
   bytes is accepted when its declared sizes are right.

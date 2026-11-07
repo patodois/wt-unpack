@@ -154,9 +154,16 @@ struct BlockInfo {
     first_block: usize,
 }
 
+fn text_copy_budget(bytes:usize)->usize {bytes.saturating_mul(16).clamp(64 << 10,256 << 20)}
+fn parameter_storage_budget(bytes:usize)->usize {bytes.saturating_mul(16).clamp(64 << 10,1 << 30)}
+fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
+    *remaining=remaining.checked_sub(bytes).context("parameter copies expand beyond the storage byte budget")?;Ok(())
+}
+
 fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
-    let mut text_budget = r.remaining().saturating_add(shared_text).saturating_mul(16).clamp(64 << 10,256 << 20);
-    let copy_budget = text_budget / std::mem::size_of::<(String, Value)>();
+    let input_bytes=r.remaining();
+    let mut text_budget = text_copy_budget(input_bytes.saturating_add(shared_text));
+    let mut storage_budget=parameter_storage_budget(input_bytes);
     let own_names = read_names(r)?;
     let name = |id: u32| -> Result<&str> {
         let id = id as usize;
@@ -181,20 +188,19 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         r.remaining()
     );
 
-    ensure!(params_count <= copy_budget, "stored parameters exceed the {copy_budget}-parameter copy budget");
+    let parameter_bytes=params_count.checked_mul(std::mem::size_of::<(String,Value)>()).context("parameter storage overflow")?;
+    charge_storage(parameter_bytes,&mut storage_budget)?;
     let mut params = Vec::with_capacity(params_count);
     for raw in param_table.chunks_exact(8) {
         let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
         let v = u32::from_le_bytes(raw[4..].try_into().unwrap());
         let (name_id, ty) = (head & 0x00FF_FFFF, (head >> 24) as u8);
-        charge_text(std::mem::size_of::<(String,Value)>(),&mut text_budget)?;
         params.push(Some((copy_text(name(name_id)?, &mut text_budget)?, decode_value(ty, v, complex, shared_names, &own_names, &mut text_budget)?)));
     }
 
     let mut uses=vec![0usize;params_count];
     let mut infos = Vec::with_capacity(blocks_count);
     let mut next_param = 0usize;
-    let mut copied = 0usize;
     for _ in 0..blocks_count {
         let name_id = r.varint()?;
         let pc = r.varint()? as usize;
@@ -208,8 +214,6 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
             s
         };
         let end=start.checked_add(pc).filter(|&end|end<=params_count).context("block params out of range")?;
-        copied += pc;
-        ensure!(copied <= copy_budget, "the blocks' shared parameter ranges expand to more than {copy_budget} parameters");
         ensure!(bc == 0 || first_block.checked_add(bc).is_some_and(|end| end <= blocks_count), "block children out of range");
         for count in &mut uses[start..end] { *count+=1; }
         infos.push(BlockInfo { name_id, params: start..end, blocks_count: bc, first_block });
@@ -221,6 +225,8 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
     for i in (0..blocks_count).rev() {
         let info = &mut infos[i];
         let block_name = if info.name_id == 0 { String::new() } else { copy_text(name(info.name_id - 1)?, &mut text_budget)? };
+        let extra_copies=info.params.clone().filter(|&index|uses[index]>1).count();
+        charge_storage(extra_copies*std::mem::size_of::<(String,Value)>(),&mut storage_budget)?;
         let mut fields=Vec::with_capacity(info.params.len());
         for index in info.params.clone() {
             uses[index]-=1;
@@ -229,7 +235,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
                 params[index].take().context("parameter already moved")?
             } else {
                 let (key,value)=params[index].as_ref().context("parameter already moved")?;
-                charge_text(std::mem::size_of::<(String,Value)>()+key.len()+if let Value::Str(s)=value{s.len()}else{0},&mut text_budget)?;
+                charge_text(key.len()+if let Value::Str(s)=value{s.len()}else{0},&mut text_budget)?;
                 (key.clone(),value.clone())
             };
             fields.push(field);
@@ -743,7 +749,7 @@ mod text_copy_contract {
     }
     #[test]
     fn copied_text_stops_at_the_small_input_floor() {
-        let cost=1001+std::mem::size_of::<(String,Value)>();let count=(64<<10)/cost;
+        let cost=1001;let count=(64<<10)/cost;
         assert!(parse(&repeated_plain_string(1000,count),None).is_ok());
         assert!(parse(&repeated_plain_string(1000,count+1),None).is_err());
     }
@@ -778,12 +784,33 @@ mod numeric_copy_budget {
         let small=numeric(2,8);let block=parse(&small,None).unwrap();assert_eq!(block.blocks.len(),8);
     }
     #[test]
-    fn stored_parameter_storage_is_bounded_before_reserving_the_table() {
-        let count=(256<<20)/std::mem::size_of::<(String,Value)>()+1;
-        let file=numeric(count,0);
-        let (result,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));
-        assert!(result.is_err());
-        assert!(largest<256<<20,"reserved {largest} bytes beyond the aggregate quota");
+    fn stored_parameter_tables_above_the_text_ceiling_remain_valid() {
+        let file=numeric(4_000_000,1);let root=parse(&file,None).unwrap();assert_eq!(root.blocks[0].params.len(),4_000_000);
+    }
+
+}
+
+#[cfg(test)]
+mod dense_parameter_storage {
+    use super::*;
+    fn var(mut n:usize,out:&mut Vec<u8>) {loop {let mut b=(n&127) as u8;n>>=7;if n>0{b|=128;}out.push(b);if n==0{break;}}}
+    // Format 1: `params` stored once each, one own name of name_len bytes, optional one string of str_len bytes aliased by all.
+    fn file(params:usize,name_len:usize,str_len:usize)->Vec<u8>{
+        let mut f=vec![1u8];
+        var(1,&mut f);var(name_len+1,&mut f);f.extend(std::iter::repeat_n(b'n',name_len));f.push(0);
+        var(1,&mut f);var(params,&mut f);
+        let complex=if str_len>0 {str_len+1} else {0};var(complex,&mut f);
+        if str_len>0 {f.extend(std::iter::repeat_n(b'A',str_len));f.push(0);}
+        let ty:u32=if str_len>0 {1} else {2};
+        for _ in 0..params {f.extend_from_slice(&(ty<<24).to_le_bytes());f.extend_from_slice(&0u32.to_le_bytes());}
+        f.push(0);var(params,&mut f);f.push(0);f
+    }
+
+    #[test]
+    fn dense_valid_tables_keep_their_independent_text_allowance() {
+        for (params,name,string) in [(500,64,0),(1000,10,60),(100000,30,20),(4_000_000,1,0)] {
+            let f=file(params,name,string);let root=parse(&f,None).unwrap();assert_eq!(root.params.len(),params);
+        }
     }
 
 }

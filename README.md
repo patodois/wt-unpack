@@ -403,15 +403,24 @@ decoders are pure Rust.
 - `blk::SharedContext` is built with `SharedContext::new(names, dict)`, and its name list is read through `names()`.
   The `names` field is no longer public: the context adds up the bytes of the names once, and that total would be wrong
   if the list could change afterwards.
-- Archives and BLK files are read with total limits: the names and file ranges copied out of a VROMFS table, parameter storage, block tables and text
-  copied out of a BLK, and the window of a zstd stream (at most the greater of 8 MiB or twice the remaining output limit) are checked
-  before they are allocated, so a damaged file fails with an error instead of exhausting memory.
+- Archives and BLK files have accounting limits for parsing: names and file ranges copied out of a
+  VROMFS table, BLK parameter storage, block tables and copied text are checked before reservation.
+  A zstd window is limited to the greater of 8 MiB or twice the remaining decoded-output limit.
+  These are allocation accounting limits, not a bound on process RSS or a guarantee against running
+  out of memory. Decoder buffers, the decoded dump, templates and the result can overlap in memory;
+  allocator overhead and the caller's input are additional costs.
   BLK text and storage have separate quotas. Name-table slots and block-table storage each have
   a 64 MiB ceiling checked before reservation; compressing a block tree better does not lower its limit.
   Parameter templates, use counters, name storage and all output fields share a quota of 32 times
-  the decoded dump size, with a 64 KiB floor and a 1 GiB ceiling. Compressed input still has to be
-  decoded before these counts can be checked: that buffer may grow to the separate 1 GiB decoded-size
-  limit, and allocator overhead and the caller's input also contribute to RSS.
+  the decoded dump size, with a 64 KiB floor and a 1 GiB ceiling. Copied strings have a separate
+  16-times quota, with a 64 KiB floor and 256 MiB ceiling. A compressed dump can reach 1 GiB before
+  its counts can be checked. zstd output now drains directly into its destination without an
+  intermediate full-output vector.
+  On macOS arm64, a synthetic 32,865-byte BLK with a 1 GiB zstd window and 1,073,741,815 decoded
+  bytes used 3,810,164,736 bytes peak RSS before direct draining and 1,818,935,296 after it for
+  decompression alone. Parsing that accepted dump (6,381,900 parameters, 349,525 block records)
+  peaked at 3,780,804,608 bytes; a related dump refused at 12,183,668 parameter templates still
+  peaked at 3,223,437,312 bytes. These are measurements of those cases, not universal maxima.
 - Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
   256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six
   bytes is accepted when its declared sizes are right.

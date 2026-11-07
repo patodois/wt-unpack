@@ -71,14 +71,10 @@ fn decode_frames(mut input: &[u8], dict: Option<&[u8]>, limit: usize) -> Result<
                 .decode_blocks(&mut input, BlockDecodingStrategy::UptoBlocks(1))
                 .map_err(|e| anyhow!("zstd: {e}"))?;
             ensure!(decoder.can_collect() <= limit.saturating_sub(out.len()), "zstd data unpacks to more than {limit} bytes");
-            // Drain what can be collected: the window stays in the decoder until more comes out
-            if let Some(bytes) = decoder.collect() {
-                ensure!(
-                    out.len() + bytes.len() <= limit,
-                    "zstd data unpacks to more than {limit} bytes"
-                );
-                out.extend_from_slice(&bytes);
-            }
+            // Drain directly into the output instead of materializing another full-sized Vec.
+            let available=decoder.can_collect();
+            out.try_reserve(available).map_err(|e|anyhow!("reserving {available} zstd output bytes: {e}"))?;
+            decoder.collect_to_writer(&mut out).map_err(|e|anyhow!("collecting zstd output: {e}"))?;
             if decoder.is_finished() && decoder.can_collect() == 0 {
                 break;
             }
@@ -241,5 +237,18 @@ mod doubled_window_contract {
         encoder.write_all(&[42;1024]).unwrap();let packed=encoder.finish().unwrap();
         assert_eq!(zstd_window(&packed),Some(16<<20));
         assert_eq!(decode(&packed,None,8<<20).unwrap(),[42;1024]);
+    }
+}
+
+#[cfg(test)]
+mod direct_drain_memory {
+    use super::*;
+    #[test]
+    fn a_large_window_does_not_need_a_third_output_sized_allocation(){
+        let size=32<<20;let mut frame=vec![0x28,0xb5,0x2f,0xfd,0,(25-10)<<3];
+        for block in 0..256 {let header=((128u32<<10)<<3)|2|u32::from(block==255);frame.extend_from_slice(&header.to_le_bytes()[..3]);frame.push(17);}
+        let (result,count)=crate::alloc_probe::count_allocations(size,||decode(&frame,None,size));
+        assert_eq!(result.unwrap(),vec![17;size]);println!("output_sized_allocations={count}");
+        assert!(count<=1,"requested {count} output-sized allocations");
     }
 }

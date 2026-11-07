@@ -230,3 +230,16 @@ mod output_allocation_coverage {
         assert!(result.is_err());assert!(largest<512<<10,"decoder accumulated {largest} bytes before checking output");
     }
 }
+
+#[cfg(test)]
+mod doubled_window_contract {
+    use super::*;
+    #[test]
+    fn a_window_above_the_floor_can_use_twice_the_output_limit() {
+        use std::io::Write;
+        let mut encoder=zstd::stream::Encoder::new(Vec::new(),3).unwrap();encoder.window_log(24).unwrap();encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&[42;1024]).unwrap();let packed=encoder.finish().unwrap();
+        assert_eq!(zstd_window(&packed),Some(16<<20));
+        assert_eq!(decode(&packed,None,8<<20).unwrap(),[42;1024]);
+    }
+}

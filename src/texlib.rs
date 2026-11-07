@@ -150,3 +150,28 @@ mod empty_texture_compatibility {
         }
     }
 }
+
+#[cfg(test)]
+mod minimum_extent_contract {
+    use super::*;
+    #[test]
+    fn a_single_pixel_axis_survives_every_reduction() {
+        for (width,height) in [(1,8),(8,1)] {
+            let image=Rgba{width,height,rgba:vec![17;32]};let small=shrink(image,1);
+            assert_eq!((small.width,small.height),(1,1));assert_eq!(small.rgba,[17;4]);
+        }
+    }
+    #[test]
+    fn a_zero_limit_is_a_no_op_for_a_single_pixel() {
+        const CHILD:&str="SINGLE_PIXEL_LIMIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","texlib::minimum_extent_contract::a_zero_limit_is_a_no_op_for_a_single_pixel","--nocapture"]).env(CHILD,"1").output().unwrap();
+            assert!(result.status.success(),"child status {}: {}",result.status,String::from_utf8_lossy(&result.stderr));return;
+        }
+        // A missing clamp must fail in bounded time rather than hang the test process.
+        std::thread::spawn(||{std::thread::sleep(std::time::Duration::from_secs(3));std::process::exit(124);});
+        let image=Rgba{width:1,height:1,rgba:vec![17;4]};let result=shrink(image,0);
+        assert_eq!((result.width,result.height),(1,1));assert_eq!(result.rgba,[17;4]);
+    }
+
+}

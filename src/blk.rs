@@ -738,4 +738,13 @@ mod text_copy_contract {
             assert!(root.params.iter().all(|(name,value)|name=="x" && *value==Value::Str("A".repeat(length))));
         }
     }
+    #[test]
+    fn repeated_parameter_slices_charge_each_additional_text_copy() {
+        let mut file=vec![6,1,2,b'x',0];var(129,&mut file);var(1,&mut file);var(8193,&mut file);
+        file.resize(file.len()+8192,b'A');file.push(0);file.extend_from_slice(&(1u32<<24).to_le_bytes());file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&[0,0,128,1,1]);
+        for _ in 0..128 {file.extend_from_slice(&[1,1,0,0]);}
+        assert!(parse(&file,None).is_err());
+    }
+
 }

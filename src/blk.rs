@@ -754,6 +754,11 @@ mod text_copy_contract {
         assert!(parse(&repeated_plain_string(1000,count+1),None).is_err());
     }
     #[test]
+    fn copied_text_obeys_the_exact_sixteen_times_boundary() {
+        assert!(parse(&repeated_plain_string(100000,16),None).is_ok());
+        assert!(parse(&repeated_plain_string(100000,17),None).is_err());
+    }
+    #[test]
     fn repeated_parameter_slices_charge_each_additional_text_copy() {
         let mut file=vec![6,1,2,b'x',0];var(129,&mut file);var(1,&mut file);var(8193,&mut file);
         file.resize(file.len()+8192,b'A');file.push(0);file.extend_from_slice(&(1u32<<24).to_le_bytes());file.extend_from_slice(&0u32.to_le_bytes());
@@ -780,6 +785,7 @@ mod numeric_copy_budget {
         let file=numeric(64,64);
         let (result,total)=crate::alloc_probe::total_allocation(||parse(&file,None));
         assert!(result.is_err(),"accepted {} bytes with {total} allocated bytes",file.len());
+        assert!(result.as_ref().unwrap_err().to_string().contains("storage byte budget"));
         assert!(total<file.len()*128,"allocated {total} bytes before rejecting copies");
         let small=numeric(2,8);let block=parse(&small,None).unwrap();assert_eq!(block.blocks.len(),8);
     }
@@ -813,4 +819,14 @@ mod dense_parameter_storage {
         }
     }
 
+}
+
+#[cfg(test)]
+mod independent_budget_boundaries {
+    use super::*;
+    #[test]
+    fn the_text_ceiling_still_allows_more_than_128_mebibytes() {
+        let mut budget=text_copy_budget(16<<20);charge_text((128<<20)+1,&mut budget).unwrap();
+        assert_eq!(budget,(128<<20)-1);
+    }
 }

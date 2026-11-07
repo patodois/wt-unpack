@@ -1848,7 +1848,7 @@ mod sized_quantum_contract {
     fn undersized_quantum_payloads_are_rejected_before_reserving_output() {
         let packed=[0x0c,6,0,0,0,0x41].repeat(1024);
         let (result,largest)=crate::alloc_probe::largest_allocation(||unpack(2,&packed,Some(256<<20)));
-        assert!(result.is_err());assert!(largest<1<<20,"reserved {largest} bytes for impossible quantum payloads");
+        assert!(format!("{:#}",result.as_ref().unwrap_err()).contains("quantum payload is shorter than four bytes"));assert!(largest<1<<20,"reserved {largest} bytes for impossible quantum payloads");
     }
     #[test]
     fn valid_memset_still_generates_the_declared_output() {

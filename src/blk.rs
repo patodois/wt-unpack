@@ -128,6 +128,7 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
 
 const MAX_NAME_TABLE_STORAGE:usize=64<<20;
 fn read_names(r: &mut Reader, storage_budget:&mut usize) -> Result<Vec<String>> {
+    #[cfg(test)] crate::alloc_probe::record_name_budget(*storage_budget);
     let count = r.varint()? as usize;
     if count == 0 {return Ok(Vec::new());}
     let size=r.varint()? as usize;
@@ -831,7 +832,7 @@ mod numeric_copy_budget {
     fn alias_reference_work_is_rejected_before_visiting_over_budget_ranges() {
         let file=numeric(1024,1024);
         let (result,visits)=crate::alloc_probe::parameter_visits(||parse(&file,None));
-        assert!(result.is_err());let bound=parameter_storage_budget(file.len())/std::mem::size_of::<(String,Value)>();
+        assert!(result.as_ref().unwrap_err().to_string().contains("parameter copies expand beyond the storage byte budget"));let bound=parameter_storage_budget(file.len())/std::mem::size_of::<(String,Value)>();
         println!("input_bytes={} visited_parameters={visits} permitted_visits={bound}",file.len());
         assert!(visits<=bound,"visited {visits} parameters before enforcing a {bound}-copy bound");
     }
@@ -865,7 +866,7 @@ mod dense_parameter_storage {
         let blocks=1_500_000;let mut raw=vec![1,0];var(blocks,&mut raw);var(0,&mut raw);var(0,&mut raw);raw.resize(raw.len()+3*blocks,0);
         let packed=zstd::bulk::compress(&raw,19).unwrap();let n=packed.len();let mut f=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];f.extend_from_slice(&packed);
         let (result,largest)=crate::alloc_probe::largest_allocation(||parse(&f,None));
-        assert!(result.is_err(),"accepted {} bytes declaring {blocks} block records",f.len());assert!(largest<16<<20,"reserved {largest} bytes before checking block tables");
+        assert!(result.as_ref().unwrap_err().to_string().contains("block tables expand beyond the storage ceiling"));assert!(largest<16<<20,"reserved {largest} bytes before checking block tables");
     }
 }
 
@@ -886,11 +887,11 @@ mod name_table_storage {
     fn names()->Vec<u8>{let n=(64<<20)/std::mem::size_of::<String>()+1;let mut raw=Vec::new();var(n,&mut raw);var(n,&mut raw);raw.resize(raw.len()+n,0);raw}
     fn dump()->Vec<u8>{let mut raw=vec![1];raw.extend(names());raw.extend_from_slice(&[1,0,0,0,0,0]);raw}
     #[test]
-    fn plain_name_slots_are_bounded_before_reservation(){let raw=dump();let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&raw,None));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+    fn plain_name_slots_are_bounded_before_reservation(){let raw=dump();let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&raw,None));assert!(r.as_ref().err().unwrap().to_string().contains("name table exceeds the storage ceiling"));assert!(largest<16<<20,"reserved {largest} bytes for names");}
     #[test]
-    fn compressed_name_slots_are_bounded_before_reservation(){let packed=zstd::bulk::compress(&dump(),19).unwrap();let n=packed.len();let mut file=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];file.extend(packed);let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+    fn compressed_name_slots_are_bounded_before_reservation(){let packed=zstd::bulk::compress(&dump(),19).unwrap();let n=packed.len();let mut file=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];file.extend(packed);let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));assert!(r.as_ref().err().unwrap().to_string().contains("name table exceeds the storage ceiling"));assert!(largest<16<<20,"reserved {largest} bytes for names");}
     #[test]
-    fn shared_name_slots_are_bounded_before_reservation(){let mut file=vec![0;40];file.extend(zstd::bulk::compress(&names(),19).unwrap());let (r,largest)=crate::alloc_probe::largest_allocation(||SharedContext::from_namemap(&file));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+    fn shared_name_slots_are_bounded_before_reservation(){let mut file=vec![0;40];file.extend(zstd::bulk::compress(&names(),19).unwrap());let (r,largest)=crate::alloc_probe::largest_allocation(||SharedContext::from_namemap(&file));assert!(r.as_ref().err().unwrap().to_string().contains("name table exceeds the storage ceiling"));assert!(largest<16<<20,"reserved {largest} bytes for names");}
     #[test]
     fn name_slots_share_the_quota_with_output_fields(){
         let mut file=vec![6];var(1000,&mut file);var(1000,&mut file);file.resize(file.len()+1000,0);
@@ -899,6 +900,40 @@ mod name_table_storage {
         file.extend_from_slice(&[0,0]);var(1000,&mut file);file.push(1);
         for _ in 0..1000{file.extend_from_slice(&[0,2,0,0]);}
         let error=parse(&file,None).unwrap_err();assert!(error.to_string().contains("storage byte budget"));
+    }
+
+    #[test]
+    fn name_slot_ceiling_accepts_its_last_complete_slot() {
+        let count=(64<<20)/std::mem::size_of::<String>();
+        let mut raw=Vec::new();var(count,&mut raw);var(count,&mut raw);raw.resize(raw.len()+count,0);
+        let mut budget=parameter_storage_budget(raw.len());
+        let names=read_names(&mut Reader::new(&raw),&mut budget).unwrap();
+        assert_eq!(names.len(),count);
+        assert_eq!(budget,parameter_storage_budget(raw.len())-count*std::mem::size_of::<String>());
+    }
+    #[test]
+    fn name_payload_bytes_are_charged_at_the_exact_boundary() {
+        let raw=[1,5,b'a',b'b',b'c',b'd',0];
+        let slots=std::mem::size_of::<String>();let mut budget=slots+4;
+        assert_eq!(read_names(&mut Reader::new(&raw),&mut budget).unwrap(),["abcd"]);
+        assert_eq!(budget,0);
+        let mut budget=slots+3;
+        let error=read_names(&mut Reader::new(&raw),&mut budget).unwrap_err();
+        assert!(error.to_string().contains("copied text exceeds the byte budget"));
+    }
+    #[test]
+    fn shared_names_receive_the_dump_storage_budget() {
+        let raw=[1,2,b'x',0];let mut file=vec![0;40];file.extend(zstd::bulk::compress(&raw,3).unwrap());
+        let (result,budget)=crate::alloc_probe::name_budget(||SharedContext::from_namemap(&file));
+        assert_eq!(result.unwrap().0.names(),["x"]);
+        assert_eq!(budget,64<<10);
+    }
+    #[test]
+    fn name_count_cannot_exceed_the_byte_area_even_for_empty_names() {
+        let mut budget=64<<10;
+        let error=read_names(&mut Reader::new(&[2,1,0]),&mut budget).unwrap_err();
+        assert!(error.to_string().contains("name count cannot fit in its byte area"));
+        assert_eq!(read_names(&mut Reader::new(&[1,1,0]),&mut budget).unwrap(),[""]);
     }
 
 }
@@ -941,6 +976,12 @@ mod storage_limit_contract {
     #[test]
     fn block_table_ceiling_has_exact_acceptance_and_rejection_boundaries(){
         let count=(256<<20)/block_storage_bytes();assert!(check_block_storage(count).is_ok());assert!(check_block_storage(count+1).is_err());
+    }
+    #[test]
+    fn aggregate_storage_floor_is_exact() {
+        let mut budget=parameter_storage_budget(0);
+        charge_storage(64<<10,&mut budget).unwrap();
+        assert!(charge_storage(1,&mut budget).unwrap_err().to_string().contains("storage byte budget"));
     }
     #[test]
     fn aggregate_storage_multiplier_and_ceiling_are_exact(){

@@ -102,3 +102,7 @@ pub fn storage_accounting<R>(f:impl FnOnce()->R)->(R,usize,usize){
 thread_local! {static PARAMETER_VISITS:Cell<usize>=const{Cell::new(0)};}
 pub fn record_parameter_visits(count:usize){PARAMETER_VISITS.with(|v|v.set(v.get().saturating_add(count)));}
 pub fn parameter_visits<R>(f:impl FnOnce()->R)->(R,usize){PARAMETER_VISITS.with(|v|v.set(0));let result=f();(result,PARAMETER_VISITS.with(Cell::get))}
+
+thread_local! {static NAME_BUDGET:Cell<usize>=const{Cell::new(usize::MAX)};}
+pub fn record_name_budget(bytes:usize){NAME_BUDGET.with(|v|v.set(bytes));}
+pub fn name_budget<R>(f:impl FnOnce()->R)->(R,usize){NAME_BUDGET.with(|v|v.set(usize::MAX));let result=f();(result,NAME_BUDGET.with(Cell::get))}

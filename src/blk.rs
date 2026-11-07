@@ -560,7 +560,7 @@ mod tests {
     fn a_deep_chain_is_an_error_instead_of_a_stack_overflow() {
         // 20,000 nested blocks overflowed an 8 MB stack in Drop and to_json
         let err = parse(&deep_chain(20_000), None).unwrap_err().to_string();
-        assert!(err.contains("nest") || err.contains("block tables"), "{err}");
+        assert!(err.contains("nest"), "{err}");
     }
 
     #[test]

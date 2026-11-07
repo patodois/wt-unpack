@@ -1857,3 +1857,27 @@ mod sized_quantum_contract {
     }
 }
 
+#[cfg(test)]
+mod preflight_decoder_agreement {
+    use super::*;
+    #[test]
+    fn byte_pair_headers_match_the_decoder_for_stored_and_memset_blocks() {
+        for a in 0..=255u8 {for b in 0..=255u8 {
+            for tail in [&[0x41][..],&[7,255,255,0x41][..]] {
+                let mut packed=vec![a,b];packed.extend_from_slice(tail);let mut out=[0];
+                assert_eq!(check_oodle_blocks(&packed,1).is_ok(),lztans::decode(&packed,&mut out).is_ok(),"header {a:02x} {b:02x} tail {tail:?}");
+            }
+        }}
+    }
+    #[test]
+    fn sized_rle_quantums_preserve_the_next_block_boundary() {
+        for codec in [6,0x0a,0x0c] {for reset in [0,0x80] {
+            let mut packed=vec![0x0c|reset,codec,0,0,11];
+            for value in [17,29] {packed.extend_from_slice(&[0x37,255,252,0,1,value]);}
+            packed.extend_from_slice(&[0x4c|reset,codec,b'A']);
+            let size=(256<<10)+1;let mut reference=vec![0;size];lztans::decode(&packed,&mut reference).unwrap();
+            assert!(check_oodle_blocks(&packed,size).is_ok());
+            assert_eq!(unpack(2,&packed,Some(size)).unwrap(),reference);
+        }}
+    }
+}

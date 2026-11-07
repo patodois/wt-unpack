@@ -1,5 +1,6 @@
 
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -281,17 +282,16 @@ fn list(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn render(data: &[u8], shared: Option<&SharedContext>, format: BlkFormat) -> Result<Vec<u8>> {
-    let root = blk::parse(data, shared)?;
-    Ok(match format {
-        BlkFormat::Text => root.to_text().into_bytes(),
+fn render(root: &blk::Block, data: &[u8], format: BlkFormat, out: &mut impl Write) -> Result<()> {
+    match format {
+        BlkFormat::Text => root.write_text_to(out)?,
         BlkFormat::Json => {
-            let mut out = serde_json::to_vec_pretty(&root.to_json())?;
-            out.push(b'\n');
-            out
+            root.write_json_to(out)?;
+            out.write_all(b"\n")?;
         }
-        BlkFormat::Raw => data.to_vec(),
-    })
+        BlkFormat::Raw => out.write_all(data)?,
+    }
+    Ok(())
 }
 
 /// Rejects absolute paths and `..` so archive names cannot escape the output dir.
@@ -315,25 +315,31 @@ fn extract(path: &Path, out: &Path, format: BlkFormat, filter: Option<&str>) -> 
             eprintln!("skipping unsafe path {:?}", f.name);
             continue;
         };
-        let mut data = f.data.clone();
-        if f.name.ends_with(".blk") && blk::is_binary(&f.data) && !matches!(format, BlkFormat::Raw) {
-            match render(&f.data, shared.as_ref(), format) {
-                Ok(converted) => {
-                    data = converted;
+        let root = if f.name.ends_with(".blk") && blk::is_binary(&f.data) && !matches!(format, BlkFormat::Raw) {
+            match blk::parse(&f.data, shared.as_ref()) {
+                Ok(root) => {
                     if matches!(format, BlkFormat::Json) {
                         dest.set_extension("blk.json");
                     }
+                    Some(root)
                 }
                 Err(e) => {
                     eprintln!("{}: {e:#} (kept raw)", f.name);
                     failed += 1;
+                    None
                 }
             }
-        }
+        } else { None };
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&dest, data).with_context(|| format!("writing {}", dest.display()))?;
+        let mut writer = BufWriter::new(fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?);
+        if let Some(root) = root {
+            render(&root, &f.data, format, &mut writer)?;
+        } else {
+            writer.write_all(&f.data)?;
+        }
+        writer.flush().with_context(|| format!("writing {}", dest.display()))?;
         written += 1;
     }
     eprintln!("wrote {written} files to {} ({failed} BLK files could not be converted)", out.display());
@@ -349,9 +355,14 @@ fn cat(target: &str, format: BlkFormat) -> Result<()> {
         }
         None => (fs::read(target).with_context(|| format!("reading {target}"))?, None),
     };
-    let out = if blk::is_binary(&data) { render(&data, shared.as_ref(), format)? } else { data };
-    use std::io::Write;
-    std::io::stdout().write_all(&out)?;
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    if blk::is_binary(&data) {
+        let root = blk::parse(&data, shared.as_ref())?;
+        render(&root, &data, format, &mut out)?;
+    } else {
+        out.write_all(&data)?;
+    }
+    out.flush()?;
     Ok(())
 }
 

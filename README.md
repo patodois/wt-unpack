@@ -421,6 +421,16 @@ decoders are pure Rust.
   decompression alone. Parsing that accepted dump (6,381,900 parameters, 349,525 block records)
   peaked at 3,780,804,608 bytes; a related dump refused at 12,183,668 parameter templates still
   peaked at 3,223,437,312 bytes. These are measurements of those cases, not universal maxima.
+- `cat` and `extract` stream converted BLK text and pretty JSON through a buffered writer. They keep
+  the parsed BLK but no complete encoded document or JSON value tree. The additive library methods
+  `Block::write_text_to` and `Block::write_json_to` expose the same behavior. JSON still groups borrowed
+  entries by name to preserve ordering and repeated-name arrays: its auxiliary index grows with the
+  number of entries in each open block. Text needs only the block traversal and bounded numeric
+  formatting temporaries. There is no encoded-byte, elapsed-time or disk-space quota on either writer;
+  for example, one Matrix parameter can produce 527 text bytes from an 8-byte table entry. The legacy
+  `to_text()` and `to_json()` APIs still allocate their entire result, without an extra conversion quota;
+  callers needing bounded output buffering should use the writer methods. Manually constructed
+  `Block` trees are not subject to the parser's depth or storage limits.
 - Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
   256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six
   bytes is accepted when its declared sizes are right.

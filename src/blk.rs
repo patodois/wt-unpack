@@ -946,3 +946,5 @@ mod storage_limit_contract {
     }
 }
 
+#[path="blk_output.rs"]
+mod streaming_output;

@@ -31,10 +31,6 @@ const IS_NAMEMAP_ID: u32 = 0x8000_0000;
 /// at most this deep, which is what keeps `Drop`, `to_text` and `to_json` (all recursive) off the stack limit.
 pub const MAX_DEPTH: usize = 128;
 
-/// Parameters the blocks of a dump may hold in total, counting the copies that format 6 makes when blocks
-/// share a range, unless 16 times the stored parameters is more. Every real file stores each parameter once.
-const MAX_COPIED_PARAMS: usize = 1 << 20;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Str(String),
@@ -160,6 +156,7 @@ struct BlockInfo {
 
 fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
     let mut text_budget = r.remaining().saturating_add(shared_text).saturating_mul(16).clamp(64 << 10,256 << 20);
+    let copy_budget = text_budget / std::mem::size_of::<(String, Value)>();
     let own_names = read_names(r)?;
     let name = |id: u32| -> Result<&str> {
         let id = id as usize;
@@ -189,13 +186,13 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
         let v = u32::from_le_bytes(raw[4..].try_into().unwrap());
         let (name_id, ty) = (head & 0x00FF_FFFF, (head >> 24) as u8);
+        charge_text(std::mem::size_of::<(String,Value)>(),&mut text_budget)?;
         params.push(Some((copy_text(name(name_id)?, &mut text_budget)?, decode_value(ty, v, complex, shared_names, &own_names, &mut text_budget)?)));
     }
 
     let mut uses=vec![0usize;params_count];
     let mut infos = Vec::with_capacity(blocks_count);
     let mut next_param = 0usize;
-    let copy_budget = MAX_COPIED_PARAMS.max(params_count.saturating_mul(16));
     let mut copied = 0usize;
     for _ in 0..blocks_count {
         let name_id = r.varint()?;
@@ -231,7 +228,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
                 params[index].take().context("parameter already moved")?
             } else {
                 let (key,value)=params[index].as_ref().context("parameter already moved")?;
-                charge_text(key.len()+if let Value::Str(s)=value{s.len()}else{0},&mut text_budget)?;
+                charge_text(std::mem::size_of::<(String,Value)>()+key.len()+if let Value::Str(s)=value{s.len()}else{0},&mut text_budget)?;
                 (key.clone(),value.clone())
             };
             fields.push(field);
@@ -747,4 +744,25 @@ mod text_copy_contract {
         assert!(parse(&file,None).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod numeric_copy_budget {
+    use super::*;
+    fn var(mut n:usize,out:&mut Vec<u8>) {loop {let mut b=(n&127) as u8;n>>=7;if n>0{b|=128;}out.push(b);if n==0{break;}}}
+    fn numeric(params:usize,blocks:usize)->Vec<u8> {
+        let mut file=vec![6,1,1,0];var(blocks+1,&mut file);var(params,&mut file);var(0,&mut file);
+        for _ in 0..params {file.extend_from_slice(&(2u32<<24).to_le_bytes());file.extend_from_slice(&0u32.to_le_bytes());}
+        file.extend_from_slice(&[0,0]);var(blocks,&mut file);var(1,&mut file);
+        for _ in 0..blocks {file.push(0);var(params,&mut file);file.extend_from_slice(&[0,0]);}
+        file
+    }
+    #[test]
+    fn empty_numeric_keys_still_pay_for_parameter_storage() {
+        let file=numeric(64,64);
+        let (result,total)=crate::alloc_probe::total_allocation(||parse(&file,None));
+        assert!(result.is_err(),"accepted {} bytes with {total} allocated bytes",file.len());
+        assert!(total<file.len()*128,"allocated {total} bytes before rejecting copies");
+        let small=numeric(2,8);let block=parse(&small,None).unwrap();assert_eq!(block.blocks.len(),8);
+    }
 }

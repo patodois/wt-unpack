@@ -91,3 +91,10 @@ pub fn count_allocations<R>(size:usize,f:impl FnOnce()->R)->(R,usize){
     let out=f();WATCH.with(|v|v.set(usize::MAX));
     (out,COUNT.with(Cell::get))
 }
+
+thread_local! {static STORAGE_CHARGED:Cell<usize>=const{Cell::new(0)};}
+pub fn record_storage_charge(bytes:usize){STORAGE_CHARGED.with(|v|v.set(v.get().saturating_add(bytes)));}
+pub fn storage_accounting<R>(f:impl FnOnce()->R)->(R,usize,usize){
+    STORAGE_CHARGED.with(|v|v.set(0));let (result,total)=total_allocation(f);
+    (result,total,STORAGE_CHARGED.with(Cell::get))
+}

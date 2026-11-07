@@ -164,9 +164,11 @@ struct BlockInfo {
 }
 
 fn text_copy_budget(bytes:usize)->usize {bytes.saturating_mul(16).clamp(64 << 10,256 << 20)}
-fn parameter_storage_budget(bytes:usize)->usize {bytes.saturating_mul(16).clamp(64 << 10,1 << 30)}
+fn parameter_storage_budget(bytes:usize)->usize {bytes.saturating_mul(32).clamp(64 << 10,1 << 30)}
 fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
-    *remaining=remaining.checked_sub(bytes).context("parameter copies expand beyond the storage byte budget")?;Ok(())
+    *remaining=remaining.checked_sub(bytes).context("parameter copies expand beyond the storage byte budget")?;
+    #[cfg(test)] crate::alloc_probe::record_storage_charge(bytes);
+    Ok(())
 }
 
 fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize, source_bytes:usize) -> Result<Block> {
@@ -200,7 +202,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
     let block_bytes=std::mem::size_of::<BlockInfo>()+std::mem::size_of::<Option<Block>>()+std::mem::size_of::<usize>()+std::mem::size_of::<Block>();
     let block_limit=source_bytes.saturating_mul(1024).clamp(64<<10,1<<30)/block_bytes;
     ensure!(blocks_count<=block_limit,"block tables expand beyond the {block_limit}-block storage budget");
-    let parameter_bytes=params_count.checked_mul(std::mem::size_of::<(String,Value)>()).context("parameter storage overflow")?;
+    let parameter_bytes=params_count.checked_mul(std::mem::size_of::<Option<(String,Value)>>() + std::mem::size_of::<usize>()).context("parameter storage overflow")?;
     charge_storage(parameter_bytes,&mut storage_budget)?;
     let mut params = Vec::with_capacity(params_count);
     for raw in param_table.chunks_exact(8) {
@@ -237,8 +239,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
     for i in (0..blocks_count).rev() {
         let info = &mut infos[i];
         let block_name = if info.name_id == 0 { String::new() } else { copy_text(name(info.name_id - 1)?, &mut text_budget)? };
-        let extra_copies=info.params.clone().filter(|&index|uses[index]>1).count();
-        charge_storage(extra_copies*std::mem::size_of::<(String,Value)>(),&mut storage_budget)?;
+        charge_storage(info.params.len()*std::mem::size_of::<(String,Value)>(),&mut storage_budget)?;
         let mut fields=Vec::with_capacity(info.params.len());
         for index in info.params.clone() {
             uses[index]-=1;
@@ -804,6 +805,15 @@ mod numeric_copy_budget {
     #[test]
     fn stored_parameter_tables_above_the_text_ceiling_remain_valid() {
         let file=numeric(4_000_000,1);let root=parse(&file,None).unwrap();assert_eq!(root.blocks[0].params.len(),4_000_000);
+    }
+
+    #[test]
+    fn storage_charge_covers_the_live_template_and_output_slots() {
+        let file=numeric(1_000_000,1);
+        let (result,total,charged)=crate::alloc_probe::storage_accounting(||parse(&file,None));
+        let root=result.unwrap();assert_eq!(root.blocks[0].params.len(),1_000_000);
+        println!("input_bytes={} allocated_bytes={total} charged_storage_bytes={charged}",file.len());
+        assert!(total<=charged+4096,"allocated {total} bytes but charged only {charged}");
     }
 
 }

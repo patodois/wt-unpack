@@ -409,8 +409,8 @@ decoders are pure Rust.
   These are allocation accounting limits, not a bound on process RSS or a guarantee against running
   out of memory. Decoder buffers, the decoded dump, templates and the result can overlap in memory;
   allocator overhead and the caller's input are additional costs.
-  BLK text and storage have separate quotas. Name-table slots and block-table storage each have
-  a 64 MiB ceiling checked before reservation; compressing a block tree better does not lower its limit.
+  BLK text and storage have separate quotas. Name-table slots have a 64 MiB ceiling and block-table storage a 256 MiB ceiling checked before reservation; compressing a block tree better does not lower its limit.
+  The block ceiling allows 1,398,101 records on 64-bit targets, 8.45 times the largest measured real table (165,374).
   Parameter templates, use counters, name storage and all output fields share a quota of 32 times
   the decoded dump size, with a 64 KiB floor and a 1 GiB ceiling. Copied strings have a separate
   16-times quota, with a 64 KiB floor and 256 MiB ceiling. A compressed dump can reach 1 GiB before

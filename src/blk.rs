@@ -171,7 +171,7 @@ fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
     Ok(())
 }
 
-const MAX_BLOCK_TABLE_STORAGE:usize=64<<20;
+const MAX_BLOCK_TABLE_STORAGE:usize=256<<20;
 fn block_storage_bytes()->usize {std::mem::size_of::<BlockInfo>()+std::mem::size_of::<Option<Block>>()+std::mem::size_of::<usize>()+std::mem::size_of::<Block>()}
 fn check_block_storage(count:usize)->Result<()> {
     ensure!(count<=MAX_BLOCK_TABLE_STORAGE/block_storage_bytes(),"block tables expand beyond the storage ceiling");Ok(())
@@ -859,10 +859,10 @@ mod dense_parameter_storage {
     }
     #[test]
     fn compressed_block_tables_are_checked_before_reservation() {
-        let blocks=400_000;let mut raw=vec![1,0];var(blocks,&mut raw);var(0,&mut raw);var(0,&mut raw);raw.resize(raw.len()+3*blocks,0);
+        let blocks=1_500_000;let mut raw=vec![1,0];var(blocks,&mut raw);var(0,&mut raw);var(0,&mut raw);raw.resize(raw.len()+3*blocks,0);
         let packed=zstd::bulk::compress(&raw,19).unwrap();let n=packed.len();let mut f=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];f.extend_from_slice(&packed);
         let (result,largest)=crate::alloc_probe::largest_allocation(||parse(&f,None));
-        assert!(result.is_err(),"accepted {} bytes declaring {blocks} block records",f.len());assert!(largest<4<<20,"reserved {largest} bytes before checking block tables");
+        assert!(result.is_err(),"accepted {} bytes declaring {blocks} block records",f.len());assert!(largest<16<<20,"reserved {largest} bytes before checking block tables");
     }
 }
 
@@ -918,7 +918,7 @@ mod compressed_block_equivalence {
         let mut shared_plain=vec![3];shared_plain.extend_from_slice(&raw[1..]);assert_eq!(parse(&shared_plain,Some(&ctx)).unwrap(),expected);
     }
     fn oversized(format:u8){
-        let blocks=400_000;let mut raw=vec![0];var(blocks,&mut raw);raw.extend_from_slice(&[0,0]);raw.resize(raw.len()+3*blocks,0);
+        let blocks=1_500_000;let mut raw=vec![0];var(blocks,&mut raw);raw.extend_from_slice(&[0,0]);raw.resize(raw.len()+3*blocks,0);
         let mut ctx=SharedContext::default();let packed=if format==5 {
             let samples:Vec<_>=(0..300).map(|i|format!("dictionary {i}: synthetic block sample {}",i*3).into_bytes()).collect();let dict=zstd::dict::from_samples(&samples,4096).unwrap();
             let packed=zstd::bulk::Compressor::with_dictionary(19,&dict).unwrap().compress(&raw).unwrap();ctx.dict=Some(dict);packed
@@ -937,7 +937,7 @@ mod storage_limit_contract {
     use super::*;
     #[test]
     fn block_table_ceiling_has_exact_acceptance_and_rejection_boundaries(){
-        let count=(64<<20)/block_storage_bytes();assert!(check_block_storage(count).is_ok());assert!(check_block_storage(count+1).is_err());
+        let count=(256<<20)/block_storage_bytes();assert!(check_block_storage(count).is_ok());assert!(check_block_storage(count+1).is_err());
     }
     #[test]
     fn aggregate_storage_multiplier_and_ceiling_are_exact(){
@@ -945,3 +945,4 @@ mod storage_limit_contract {
         let mut large=parameter_storage_budget(128<<20);charge_storage(1<<30,&mut large).unwrap();assert!(charge_storage(1,&mut large).is_err());
     }
 }
+

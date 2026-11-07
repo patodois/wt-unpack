@@ -1814,3 +1814,29 @@ mod block_header_preflight {
 
 }
 
+#[cfg(test)]
+mod minimum_block_encoding {
+    use super::*;
+    fn fill(b:u8)->[u8;6]{[0x0c,6,7,255,255,b]}
+    const BLOCK_SIZE:usize=256<<10;
+    #[test]
+    fn the_minimum_is_exact_for_memset_blocks_and_a_stored_tail() {
+        let one = fill(7);
+        assert_eq!(unpack(2, &one, Some(BLOCK_SIZE)).unwrap(), vec![7; BLOCK_SIZE]);
+        let two = [fill(1), fill(2)].concat();
+        let out = unpack(2, &two, Some(2 * BLOCK_SIZE)).unwrap();
+        assert_eq!(out.len(), 2 * BLOCK_SIZE);
+        let tail = [&fill(3)[..], &[0x4c, 0x06, b'A']].concat();
+        let out = unpack(2, &tail, Some(BLOCK_SIZE + 1)).unwrap();
+        assert_eq!(out[BLOCK_SIZE], b'A');
+        assert!(format!("{:#}", unpack(2, &one[..5], Some(BLOCK_SIZE)).unwrap_err()).contains("needs at least 6"));
+        assert!(format!("{:#}", unpack(2, &tail[..8], Some(BLOCK_SIZE + 1)).unwrap_err()).contains("needs at least 9"));
+    }
+    #[test]
+    fn a_large_memset_extent_is_validated_without_an_output_buffer() {
+        let packed=vec![fill(17);4096].concat();
+        let (result,largest)=crate::alloc_probe::largest_allocation(||check_oodle_blocks(&packed,1<<30));
+        assert!(result.is_ok());assert_eq!(largest,0);
+    }
+
+}

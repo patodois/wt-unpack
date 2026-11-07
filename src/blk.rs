@@ -100,27 +100,27 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
     let format = r.u8()?;
     let need_shared = || shared.context("this BLK uses a shared name map; read it from inside its vromfs");
     match format {
-        1 => parse_dump(&mut r, &[], false,0,data.len()),
-        6 => parse_dump(&mut r, &[], true,0,data.len()),
+        1 => parse_dump(&mut r, &[], false,0),
+        6 => parse_dump(&mut r, &[], true,0),
         2 => {
             let size = r.bytes(3)?;
             let size = usize::from(size[0]) | usize::from(size[1]) << 8 | usize::from(size[2]) << 16;
             let raw = crate::unzstd::decode(r.bytes(size)?, None, MAX_BLK)?;
             // The unpacked stream repeats the format byte of a plain full BLK
             ensure!(raw.first() == Some(&1), "packed BLK does not unpack to format 1");
-            parse_dump(&mut Reader::new(&raw[1..]), &[], false,0,data.len())
+            parse_dump(&mut Reader::new(&raw[1..]), &[], false,0)
         }
-        3 => parse_dump(&mut r, &need_shared()?.names, false,need_shared()?.name_bytes,data.len()),
+        3 => parse_dump(&mut r, &need_shared()?.names, false,need_shared()?.name_bytes),
         4 => {
             let raw = crate::unzstd::decode(r.rest(), None, MAX_BLK)?;
-            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false,need_shared()?.name_bytes,data.len())
+            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false,need_shared()?.name_bytes)
         }
         5 => {
             let ctx = need_shared()?;
             let dict = ctx.dict.as_deref().context("this BLK needs the archive's zstd dictionary")?;
             // The unpacked size is not stored and the ratio has no upper bound: the output grows with the stream
             let raw = crate::unzstd::decode(r.rest(), Some(dict), MAX_BLK)?;
-            parse_dump(&mut Reader::new(&raw), &ctx.names, false,ctx.name_bytes,data.len())
+            parse_dump(&mut Reader::new(&raw), &ctx.names, false,ctx.name_bytes)
         }
         other => bail!("not a binary BLK (format byte {other:#04x})"),
     }
@@ -171,7 +171,13 @@ fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
     Ok(())
 }
 
-fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize, source_bytes:usize) -> Result<Block> {
+const MAX_BLOCK_TABLE_STORAGE:usize=64<<20;
+fn block_storage_bytes()->usize {std::mem::size_of::<BlockInfo>()+std::mem::size_of::<Option<Block>>()+std::mem::size_of::<usize>()+std::mem::size_of::<Block>()}
+fn check_block_storage(count:usize)->Result<()> {
+    ensure!(count<=MAX_BLOCK_TABLE_STORAGE/block_storage_bytes(),"block tables expand beyond the storage ceiling");Ok(())
+}
+
+fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
     let input_bytes=r.remaining();
     let mut text_budget = text_copy_budget(input_bytes.saturating_add(shared_text));
     let mut storage_budget=parameter_storage_budget(input_bytes);
@@ -199,9 +205,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         r.remaining()
     );
 
-    let block_bytes=std::mem::size_of::<BlockInfo>()+std::mem::size_of::<Option<Block>>()+std::mem::size_of::<usize>()+std::mem::size_of::<Block>();
-    let block_limit=source_bytes.saturating_mul(1024).clamp(64<<10,1<<30)/block_bytes;
-    ensure!(blocks_count<=block_limit,"block tables expand beyond the {block_limit}-block storage budget");
+    check_block_storage(blocks_count)?;
     let parameter_bytes=params_count.checked_mul(std::mem::size_of::<Option<(String,Value)>>() + std::mem::size_of::<usize>()).context("parameter storage overflow")?;
     charge_storage(parameter_bytes,&mut storage_budget)?;
     let mut params = Vec::with_capacity(params_count);
@@ -855,10 +859,10 @@ mod dense_parameter_storage {
     }
     #[test]
     fn compressed_block_tables_are_checked_before_reservation() {
-        let blocks=4096;let mut raw=vec![1,0];var(blocks,&mut raw);var(0,&mut raw);var(0,&mut raw);raw.resize(raw.len()+3*blocks,0);
+        let blocks=400_000;let mut raw=vec![1,0];var(blocks,&mut raw);var(0,&mut raw);var(0,&mut raw);raw.resize(raw.len()+3*blocks,0);
         let packed=zstd::bulk::compress(&raw,19).unwrap();let n=packed.len();let mut f=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];f.extend_from_slice(&packed);
         let (result,largest)=crate::alloc_probe::largest_allocation(||parse(&f,None));
-        assert!(result.is_err(),"accepted {} bytes declaring {blocks} block records",f.len());assert!(largest<256<<10,"reserved {largest} bytes before checking block tables");
+        assert!(result.is_err(),"accepted {} bytes declaring {blocks} block records",f.len());assert!(largest<4<<20,"reserved {largest} bytes before checking block tables");
     }
 }
 
@@ -884,4 +888,26 @@ mod name_table_storage {
     fn compressed_name_slots_are_bounded_before_reservation(){let packed=zstd::bulk::compress(&dump(),19).unwrap();let n=packed.len();let mut file=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];file.extend(packed);let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
     #[test]
     fn shared_name_slots_are_bounded_before_reservation(){let mut file=vec![0;40];file.extend(zstd::bulk::compress(&names(),19).unwrap());let (r,largest)=crate::alloc_probe::largest_allocation(||SharedContext::from_namemap(&file));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+}
+
+#[cfg(test)]
+mod compressed_block_equivalence {
+    use super::*;
+    fn var(mut n:usize,out:&mut Vec<u8>){loop{let mut b=(n&127) as u8;n>>=7;if n>0{b|=128;}out.push(b);if n==0{break;}}}
+    fn plain()->Vec<u8>{let mut d=vec![1,0];var(342,&mut d);d.extend_from_slice(&[0,0,0,0]);var(341,&mut d);d.push(1);d.resize(d.len()+341*3,0);d}
+    fn verify(format:u8){
+        let raw=plain();let expected=parse(&raw,None).unwrap();assert_eq!(expected.blocks.len(),341);
+        let mut ctx=SharedContext::default();let file=match format {
+            2=>{let p=zstd::bulk::compress(&raw,19).unwrap();let n=p.len();let mut f=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];f.extend(p);f},
+            4=>{let mut f=vec![4];f.extend(zstd::bulk::compress(&raw[1..],19).unwrap());f},
+            5=>{let samples:Vec<_>=(0..300).map(|i|format!("synthetic name={i} parameter={} block-data",i*7).into_bytes()).collect();let dict=zstd::dict::from_samples(&samples,4096).unwrap();let p=zstd::bulk::Compressor::with_dictionary(19,&dict).unwrap().compress(&raw[1..]).unwrap();ctx.dict=Some(dict);let mut f=vec![5];f.extend(p);f},
+            _=>unreachable!()
+        };
+        println!("format={format} packed_bytes={} decoded_bytes={} blocks=342",file.len(),raw.len());
+        assert_eq!(parse(&file,Some(&ctx)).unwrap(),expected);
+        let mut shared_plain=vec![3];shared_plain.extend_from_slice(&raw[1..]);assert_eq!(parse(&shared_plain,Some(&ctx)).unwrap(),expected);
+    }
+    #[test]fn compressed_full_tree_keeps_valid_children(){verify(2);}
+    #[test]fn compressed_shared_tree_keeps_valid_children(){verify(4);}
+    #[test]fn compressed_dictionary_tree_keeps_valid_children(){verify(5);}
 }

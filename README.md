@@ -406,8 +406,12 @@ decoders are pure Rust.
 - Archives and BLK files are read with total limits: the names and file ranges copied out of a VROMFS table, parameter storage, block tables and text
   copied out of a BLK, and the window of a zstd stream (at most the greater of 8 MiB or twice the remaining output limit) are checked
   before they are allocated, so a damaged file fails with an error instead of exhausting memory.
-  BLK text and parameter storage have separate quotas. Block tables use the packed file length,
-  with a factor of 1,024, a 64 KiB floor and a 1 GiB ceiling.
+  BLK text and storage have separate quotas. Name-table slots and block-table storage each have
+  a 64 MiB ceiling checked before reservation; compressing a block tree better does not lower its limit.
+  Parameter templates, use counters, name storage and all output fields share a quota of 32 times
+  the decoded dump size, with a 64 KiB floor and a 1 GiB ceiling. Compressed input still has to be
+  decoded before these counts can be checked: that buffer may grow to the separate 1 GiB decoded-size
+  limit, and allocator overhead and the caller's input also contribute to RSS.
 - Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
   256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six
   bytes is accepted when its declared sizes are right.

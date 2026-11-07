@@ -99,27 +99,27 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
     let format = r.u8()?;
     let need_shared = || shared.context("this BLK uses a shared name map; read it from inside its vromfs");
     match format {
-        1 => parse_dump(&mut r, &[], false,0),
-        6 => parse_dump(&mut r, &[], true,0),
+        1 => parse_dump(&mut r, &[], false,0,data.len()),
+        6 => parse_dump(&mut r, &[], true,0,data.len()),
         2 => {
             let size = r.bytes(3)?;
             let size = usize::from(size[0]) | usize::from(size[1]) << 8 | usize::from(size[2]) << 16;
             let raw = crate::unzstd::decode(r.bytes(size)?, None, MAX_BLK)?;
             // The unpacked stream repeats the format byte of a plain full BLK
             ensure!(raw.first() == Some(&1), "packed BLK does not unpack to format 1");
-            parse_dump(&mut Reader::new(&raw[1..]), &[], false,0)
+            parse_dump(&mut Reader::new(&raw[1..]), &[], false,0,data.len())
         }
-        3 => parse_dump(&mut r, &need_shared()?.names, false,need_shared()?.name_bytes),
+        3 => parse_dump(&mut r, &need_shared()?.names, false,need_shared()?.name_bytes,data.len()),
         4 => {
             let raw = crate::unzstd::decode(r.rest(), None, MAX_BLK)?;
-            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false,need_shared()?.name_bytes)
+            parse_dump(&mut Reader::new(&raw), &need_shared()?.names, false,need_shared()?.name_bytes,data.len())
         }
         5 => {
             let ctx = need_shared()?;
             let dict = ctx.dict.as_deref().context("this BLK needs the archive's zstd dictionary")?;
             // The unpacked size is not stored and the ratio has no upper bound: the output grows with the stream
             let raw = crate::unzstd::decode(r.rest(), Some(dict), MAX_BLK)?;
-            parse_dump(&mut Reader::new(&raw), &ctx.names, false,ctx.name_bytes)
+            parse_dump(&mut Reader::new(&raw), &ctx.names, false,ctx.name_bytes,data.len())
         }
         other => bail!("not a binary BLK (format byte {other:#04x})"),
     }
@@ -160,7 +160,7 @@ fn charge_storage(bytes:usize,remaining:&mut usize)->Result<()> {
     *remaining=remaining.checked_sub(bytes).context("parameter copies expand beyond the storage byte budget")?;Ok(())
 }
 
-fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
+fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize, source_bytes:usize) -> Result<Block> {
     let input_bytes=r.remaining();
     let mut text_budget = text_copy_budget(input_bytes.saturating_add(shared_text));
     let mut storage_budget=parameter_storage_budget(input_bytes);
@@ -188,6 +188,9 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         r.remaining()
     );
 
+    let block_bytes=std::mem::size_of::<BlockInfo>()+std::mem::size_of::<Option<Block>>()+std::mem::size_of::<usize>()+std::mem::size_of::<Block>();
+    let block_limit=source_bytes.saturating_mul(1024).clamp(64<<10,1<<30)/block_bytes;
+    ensure!(blocks_count<=block_limit,"block tables expand beyond the {block_limit}-block storage budget");
     let parameter_bytes=params_count.checked_mul(std::mem::size_of::<(String,Value)>()).context("parameter storage overflow")?;
     charge_storage(parameter_bytes,&mut storage_budget)?;
     let mut params = Vec::with_capacity(params_count);
@@ -539,7 +542,7 @@ mod tests {
     fn a_deep_chain_is_an_error_instead_of_a_stack_overflow() {
         // 20,000 nested blocks overflowed an 8 MB stack in Drop and to_json
         let err = parse(&deep_chain(20_000), None).unwrap_err().to_string();
-        assert!(err.contains("nest"), "{err}");
+        assert!(err.contains("nest") || err.contains("block tables"), "{err}");
     }
 
     #[test]
@@ -818,7 +821,13 @@ mod dense_parameter_storage {
             let f=file(params,name,string);let root=parse(&f,None).unwrap();assert_eq!(root.params.len(),params);
         }
     }
-
+    #[test]
+    fn compressed_block_tables_are_checked_before_reservation() {
+        let blocks=4096;let mut raw=vec![1,0];var(blocks,&mut raw);var(0,&mut raw);var(0,&mut raw);raw.resize(raw.len()+3*blocks,0);
+        let packed=zstd::bulk::compress(&raw,19).unwrap();let n=packed.len();let mut f=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];f.extend_from_slice(&packed);
+        let (result,largest)=crate::alloc_probe::largest_allocation(||parse(&f,None));
+        assert!(result.is_err(),"accepted {} bytes declaring {blocks} block records",f.len());assert!(largest<256<<10,"reserved {largest} bytes before checking block tables");
+    }
 }
 
 #[cfg(test)]

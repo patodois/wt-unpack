@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
         mode => {
             let names = (0..32).map(|i| format!("name{i}")).collect();
             let (body, dict) = if mode == 1 { (rest, &rest[..0]) } else { rest.split_at(rest.len() / 2) };
-            let ctx = SharedContext { names, dict: (mode != 1).then(|| dict.to_vec()) };
+            let ctx = SharedContext::new(names, (mode != 1).then(|| dict.to_vec()));
             blk::parse(body, Some(&ctx))
         }
     };

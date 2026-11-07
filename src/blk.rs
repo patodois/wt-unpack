@@ -888,6 +888,16 @@ mod name_table_storage {
     fn compressed_name_slots_are_bounded_before_reservation(){let packed=zstd::bulk::compress(&dump(),19).unwrap();let n=packed.len();let mut file=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];file.extend(packed);let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
     #[test]
     fn shared_name_slots_are_bounded_before_reservation(){let mut file=vec![0;40];file.extend(zstd::bulk::compress(&names(),19).unwrap());let (r,largest)=crate::alloc_probe::largest_allocation(||SharedContext::from_namemap(&file));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+    #[test]
+    fn name_slots_share_the_quota_with_output_fields(){
+        let mut file=vec![6];var(1000,&mut file);var(1000,&mut file);file.resize(file.len()+1000,0);
+        var(1001,&mut file);var(2,&mut file);file.push(0);
+        for _ in 0..2{file.extend_from_slice(&(2u32<<24).to_le_bytes());file.extend_from_slice(&0u32.to_le_bytes());}
+        file.extend_from_slice(&[0,0]);var(1000,&mut file);file.push(1);
+        for _ in 0..1000{file.extend_from_slice(&[0,2,0,0]);}
+        let error=parse(&file,None).unwrap_err();assert!(error.to_string().contains("storage byte budget"));
+    }
+
 }
 
 #[cfg(test)]

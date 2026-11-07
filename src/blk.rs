@@ -835,7 +835,7 @@ mod independent_budget_boundaries {
     use super::*;
     #[test]
     fn the_text_ceiling_still_allows_more_than_128_mebibytes() {
-        let mut budget=text_copy_budget(16<<20);charge_text((128<<20)+1,&mut budget).unwrap();
+        let mut budget=text_copy_budget(32<<20);charge_text((128<<20)+1,&mut budget).unwrap();
         assert_eq!(budget,(128<<20)-1);
     }
 }

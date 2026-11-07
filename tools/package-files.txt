@@ -30,6 +30,7 @@ samples/live/tank_indicators.json
 samples/live/tank_state.json
 src/alloc_probe.rs
 src/blk.rs
+src/blk_output.rs
 src/bridge.rs
 src/bytes.rs
 src/camo.rs
@@ -58,6 +59,7 @@ src/unzstd.rs
 src/vehicle.rs
 src/vromfs.rs
 tests/cli.rs
+tests/conversion.rs
 tests/game_data.rs
 tests/live.rs
 tests/memory.rs

@@ -153,13 +153,13 @@ fn type_size(ty: u8) -> Option<usize> {
 
 struct BlockInfo {
     name_id: u32,
-    params: Vec<(String, Value)>,
+    params: std::ops::Range<usize>,
     blocks_count: usize,
     first_block: usize,
 }
 
 fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:usize) -> Result<Block> {
-    let mut text_budget = r.remaining().saturating_add(shared_text).saturating_mul(16).min(256 << 20);
+    let mut text_budget = r.remaining().saturating_add(shared_text).saturating_mul(16).clamp(64 << 10,256 << 20);
     let own_names = read_names(r)?;
     let name = |id: u32| -> Result<&str> {
         let id = id as usize;
@@ -189,9 +189,10 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         let head = u32::from_le_bytes(raw[..4].try_into().unwrap());
         let v = u32::from_le_bytes(raw[4..].try_into().unwrap());
         let (name_id, ty) = (head & 0x00FF_FFFF, (head >> 24) as u8);
-        params.push((copy_text(name(name_id)?, &mut text_budget)?, decode_value(ty, v, complex, shared_names, &own_names, &mut text_budget)?));
+        params.push(Some((copy_text(name(name_id)?, &mut text_budget)?, decode_value(ty, v, complex, shared_names, &own_names, &mut text_budget)?)));
     }
 
+    let mut uses=vec![0usize;params_count];
     let mut infos = Vec::with_capacity(blocks_count);
     let mut next_param = 0usize;
     let copy_budget = MAX_COPIED_PARAMS.max(params_count.saturating_mul(16));
@@ -208,17 +209,12 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
             next_param = next_param.saturating_add(pc);
             s
         };
-        let slice = start
-            .checked_add(pc)
-            .and_then(|end| params.get(start..end))
-            .context("block params out of range")?;
-        copied += slice.len();
+        let end=start.checked_add(pc).filter(|&end|end<=params_count).context("block params out of range")?;
+        copied += pc;
         ensure!(copied <= copy_budget, "the blocks' shared parameter ranges expand to more than {copy_budget} parameters");
         ensure!(bc == 0 || first_block.checked_add(bc).is_some_and(|end| end <= blocks_count), "block children out of range");
-        for (key, value) in slice {
-            charge_text(key.len() + if let Value::Str(s) = value { s.len() } else { 0 }, &mut text_budget)?;
-        }
-        infos.push(BlockInfo { name_id, params: slice.to_vec(), blocks_count: bc, first_block });
+        for count in &mut uses[start..end] { *count+=1; }
+        infos.push(BlockInfo { name_id, params: start..end, blocks_count: bc, first_block });
     }
 
     // Children always come after their parent, so build the tree back to front.
@@ -227,6 +223,19 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
     for i in (0..blocks_count).rev() {
         let info = &mut infos[i];
         let block_name = if info.name_id == 0 { String::new() } else { copy_text(name(info.name_id - 1)?, &mut text_budget)? };
+        let mut fields=Vec::with_capacity(info.params.len());
+        for index in info.params.clone() {
+            uses[index]-=1;
+            let field=if uses[index]==0 {
+                // Move the original on its last use; only additional copies consume more budget.
+                params[index].take().context("parameter already moved")?
+            } else {
+                let (key,value)=params[index].as_ref().context("parameter already moved")?;
+                charge_text(key.len()+if let Value::Str(s)=value{s.len()}else{0},&mut text_budget)?;
+                (key.clone(),value.clone())
+            };
+            fields.push(field);
+        }
         let mut children = Vec::with_capacity(info.blocks_count);
         for c in info.first_block..info.first_block + info.blocks_count {
             ensure!(c > i, "block {i} references earlier block {c}");
@@ -234,7 +243,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
             ensure!(depth[i] <= MAX_DEPTH, "blocks nest deeper than {MAX_DEPTH} levels");
             children.push(built[c].take().context("block used twice")?);
         }
-        built[i] = Some(Block { name: block_name, params: std::mem::take(&mut info.params), blocks: children });
+        built[i] = Some(Block { name: block_name, params: fields, blocks: children });
     }
     Ok(built[0].take().unwrap())
 }
@@ -708,5 +717,25 @@ mod tests {
             blocks: vec![],
         };
         assert_eq!(blk.to_json().to_string(), r#"{"gun":["a","b"],"pos":[1.0,2.0]}"#);
+    }
+}
+
+#[cfg(test)]
+mod text_copy_contract {
+    use super::*;
+    fn var(mut n:usize,out:&mut Vec<u8>) {loop{let mut b=(n&127) as u8;n>>=7;if n>0{b|=128;}out.push(b);if n==0{break;}}}
+    fn repeated_plain_string(length:usize,count:usize)->Vec<u8> {
+        let mut file=vec![1,1,2,b'x',0];var(1,&mut file);var(count,&mut file);var(length+1,&mut file);
+        file.resize(file.len()+length,b'A');file.push(0);
+        for _ in 0..count {file.extend_from_slice(&(1u32<<24).to_le_bytes());file.extend_from_slice(&0u32.to_le_bytes());}
+        file.push(0);var(count,&mut file);file.push(0);file
+    }
+    #[test]
+    fn ordinary_aliased_strings_are_copied_once_with_a_small_input_floor() {
+        for (length,count,expected_len) in [(1000,15,1133),(130,20,303),(1000,40,1333)] {
+            let file=repeated_plain_string(length,count);assert_eq!(file.len(),expected_len);
+            let root=parse(&file,None).unwrap();assert_eq!(root.params.len(),count);
+            assert!(root.params.iter().all(|(name,value)|name=="x" && *value==Value::Str("A".repeat(length))));
+        }
     }
 }

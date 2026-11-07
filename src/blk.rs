@@ -737,6 +737,17 @@ mod text_copy_contract {
         }
     }
     #[test]
+    fn copied_text_obeys_the_multiplier_above_the_floor() {
+        assert!(parse(&repeated_plain_string(5000,15),None).is_ok());
+        assert!(parse(&repeated_plain_string(5000,18),None).is_err());
+    }
+    #[test]
+    fn copied_text_stops_at_the_small_input_floor() {
+        let cost=1001+std::mem::size_of::<(String,Value)>();let count=(64<<10)/cost;
+        assert!(parse(&repeated_plain_string(1000,count),None).is_ok());
+        assert!(parse(&repeated_plain_string(1000,count+1),None).is_err());
+    }
+    #[test]
     fn repeated_parameter_slices_charge_each_additional_text_copy() {
         let mut file=vec![6,1,2,b'x',0];var(129,&mut file);var(1,&mut file);var(8193,&mut file);
         file.resize(file.len()+8192,b'A');file.push(0);file.extend_from_slice(&(1u32<<24).to_le_bytes());file.extend_from_slice(&0u32.to_le_bytes());

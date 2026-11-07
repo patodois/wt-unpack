@@ -404,7 +404,7 @@ decoders are pure Rust.
   The `names` field is no longer public: the context adds up the bytes of the names once, and that total would be wrong
   if the list could change afterwards.
 - Archives and BLK files are read with total limits: the names and file ranges copied out of a VROMFS table, parameter storage and text
-  copied out of a BLK, and the window of a zstd stream (at most the greater of 8 MiB or twice the output) are checked
+  copied out of a BLK, and the window of a zstd stream (at most the greater of 8 MiB or twice the remaining output limit) are checked
   before they are allocated, so a damaged file fails with an error instead of exhausting memory.
 - Textures that are reduced to fit a size limit keep shrinking after one side reaches a single pixel: a texture of
   256 by 1 limited to 128 now comes out 128 by 1 instead of staying 256 by 1. A stored Oodle block shorter than six

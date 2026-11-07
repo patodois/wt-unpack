@@ -242,6 +242,10 @@ pub(crate) fn unpack_sized(codec: u8, packed: &[u8]) -> Result<Vec<u8>> {
 
 /// Decode once into the declared output size, already validated by `unpack`.
 fn oodle(packed: &[u8], size: usize) -> Result<Vec<u8>> {
+    // A complete 256 KiB block needs six packed bytes; a partial tail needs at least three.
+    let block=256<<10;
+    let minimum=(size/block)*6 + if size%block==0 {0} else {3};
+    ensure!(packed.len()>=minimum,"Oodle payload has {} bytes, needs at least {minimum} for {size} bytes of output",packed.len());
     let mut out=Vec::new();
     out.try_reserve_exact(size).context("reserving Oodle output")?;
     out.resize(size,0);
@@ -1746,5 +1750,20 @@ mod single_pass_oodle {
         let (result,allocated)=crate::alloc_probe::total_allocation(||oodle(&packed,size));
         assert_eq!(result.unwrap(),vec![42;size]);
         assert!(allocated<size+(128<<10), "allocated {allocated} bytes for {size} bytes of output");
+    }
+}
+
+#[cfg(test)]
+mod oodle_size_preflight {
+    use super::*;
+    #[test]
+    fn impossible_claims_are_rejected_before_reserving_output() {
+        let packed=[0u8;15];
+        let (result,largest)=crate::alloc_probe::largest_allocation(||unpack(2,&packed,Some(1<<30)));
+        assert!(result.is_err());assert!(largest<1<<20,"reserved {largest} bytes for an impossible claim");
+    }
+    #[test]
+    fn stored_partial_blocks_keep_their_short_valid_form() {
+        assert_eq!(unpack(2,&[0x4c,0x06,b'A'],Some(1)).unwrap(),b"A");
     }
 }

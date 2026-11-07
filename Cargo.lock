@@ -3735,9 +3735,9 @@ dependencies = [
 
 [[package]]
 name = "lztans"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fc7649bf3856d229a61455247f87acde5b0ff15aa3ef840840cd5213b041a1c"
+checksum = "4bad6ebd0a522f78e2889049a78d31ec62cd646a37524215fa00ea548b20bed0"
 
 [[package]]
 name = "mach2"

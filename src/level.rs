@@ -246,11 +246,36 @@ fn oodle(packed: &[u8], size: usize) -> Result<Vec<u8>> {
     let block=256<<10;
     let minimum=(size/block)*6 + if size.is_multiple_of(block) {0} else {3};
     ensure!(packed.len()>=minimum,"Oodle payload has {} bytes, needs at least {minimum} for {size} bytes of output",packed.len());
+    check_oodle_blocks(packed,size)?;
     let mut out=Vec::new();
     out.try_reserve_exact(size).context("reserving Oodle output")?;
     out.resize(size,0);
     lztans::decode(packed,&mut out).map_err(|e|anyhow::anyhow!("Oodle: {e:?}"))?;
     Ok(out)
+}
+
+// Walk block and quantum extents without decoding or allocating output. Keep this layout in sync
+// with lztans::decode: stored blocks, sized quantum payloads and one-byte memset payloads.
+fn check_oodle_blocks(packed:&[u8],size:usize)->Result<()> {
+    let mut r=Reader::new(packed);
+    let mut remaining=size;
+    while remaining>0 {
+        let left=remaining.min(256<<10);
+        let header=r.bytes(2)?;
+        ensure!(header[0]&0x3f==0x0c,"Oodle: bad block header");
+        ensure!(matches!(header[1],0x06|0x0a|0x0c),"Oodle: unsupported codec or checksum");
+        if header[0]&0x40!=0 {r.skip(left)?;} else {
+            let q=r.bytes(3)?;
+            let v=(usize::from(q[0])<<16)|(usize::from(q[1])<<8)|usize::from(q[2]);
+            let length=v&0x3ffff;
+            if length!=0x3ffff {r.skip(length+1)?;} else {
+                ensure!(v>>18==1,"Oodle: bad quantum header");
+                r.skip(1)?;
+            }
+        }
+        remaining-=left;
+    }
+    Ok(())
 }
 
 /// Reads a patchable table header: offset into the dump and element count
@@ -1767,3 +1792,25 @@ mod oodle_size_preflight {
         assert_eq!(unpack(2,&[0x4c,0x06,b'A'],Some(1)).unwrap(),b"A");
     }
 }
+
+#[cfg(test)]
+mod block_header_preflight {
+    use super::*;
+    #[test]
+    fn minimum_length_junk_is_rejected_before_output_reservation() {
+        let junk=vec![0;24576];
+        let (result,largest)=crate::alloc_probe::largest_allocation(||unpack(2,&junk,Some(1<<30)));
+        assert!(result.is_err());
+        assert!(largest<1<<20,"reserved {largest} bytes before checking block headers");
+    }
+    #[test]
+    fn later_stored_extents_and_quantum_headers_are_checked_before_reserving() {
+        for tail in [vec![0x4c,6,0,0,0,0],vec![0x0c,6,3,255,255,0],vec![0x0c,5,7,255,255,0],vec![0x0c,6,0,0,9,0]] {
+            let mut packed=vec![0x0c,6,7,255,255,17];packed.extend(tail);
+            let (result,largest)=crate::alloc_probe::largest_allocation(||unpack(2,&packed,Some(512<<10)));
+            assert!(result.is_err());assert!(largest<256<<10,"reserved {largest} bytes before checking the next extent");
+        }
+    }
+
+}
+

@@ -89,7 +89,8 @@ impl SharedContext {
         ensure!(nm.len() >= 40, "shared name map is too short");
         let dict_name = format!("{}.dict", hex(&nm[8..40]));
         let raw = crate::unzstd::decode(&nm[40..], None, MAX_BLK).context("shared name map is not valid zstd")?;
-        let names = read_names(&mut Reader::new(&raw))?;
+        let mut storage_budget=parameter_storage_budget(raw.len());
+        let names = read_names(&mut Reader::new(&raw),&mut storage_budget)?;
         Ok((SharedContext::new(names,None), dict_name))
     }
 }
@@ -125,14 +126,22 @@ pub fn parse(data: &[u8], shared: Option<&SharedContext>) -> Result<Block> {
     }
 }
 
-fn read_names(r: &mut Reader) -> Result<Vec<String>> {
+const MAX_NAME_TABLE_STORAGE:usize=64<<20;
+fn read_names(r: &mut Reader, storage_budget:&mut usize) -> Result<Vec<String>> {
     let count = r.varint()? as usize;
-    if count == 0 {
-        return Ok(Vec::new());
+    if count == 0 {return Ok(Vec::new());}
+    let size=r.varint()? as usize;
+    let raw=r.bytes(size)?;
+    ensure!(count<=size,"name count cannot fit in its byte area");
+    let slots=count.checked_mul(std::mem::size_of::<String>()).context("name table storage overflow")?;
+    ensure!(slots<=MAX_NAME_TABLE_STORAGE,"name table exceeds the storage ceiling");
+    charge_storage(slots,storage_budget)?;
+    let mut names=Vec::with_capacity(count);let mut area=Reader::new(raw);
+    for _ in 0..count {
+        let rest=&raw[area.pos()..];let length=rest.iter().position(|&b|b==0).context("unterminated name")?;
+        names.push(copy_cstr(rest,storage_budget)?);area.skip(length+1)?;
     }
-    let size = r.varint()? as usize;
-    let mut area = Reader::new(r.bytes(size)?);
-    (0..count).map(|_| area.cstr()).collect()
+    Ok(names)
 }
 
 fn type_size(ty: u8) -> Option<usize> {
@@ -164,7 +173,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
     let input_bytes=r.remaining();
     let mut text_budget = text_copy_budget(input_bytes.saturating_add(shared_text));
     let mut storage_budget=parameter_storage_budget(input_bytes);
-    let own_names = read_names(r)?;
+    let own_names = read_names(r,&mut storage_budget)?;
     let name = |id: u32| -> Result<&str> {
         let id = id as usize;
         shared_names
@@ -838,4 +847,18 @@ mod independent_budget_boundaries {
         let mut budget=text_copy_budget(32<<20);charge_text((128<<20)+1,&mut budget).unwrap();
         assert_eq!(budget,(128<<20)-1);
     }
+}
+
+#[cfg(test)]
+mod name_table_storage {
+    use super::*;
+    fn var(mut n:usize,out:&mut Vec<u8>){loop{let mut b=(n&127) as u8;n>>=7;if n>0{b|=128;}out.push(b);if n==0{break;}}}
+    fn names()->Vec<u8>{let n=(64<<20)/std::mem::size_of::<String>()+1;let mut raw=Vec::new();var(n,&mut raw);var(n,&mut raw);raw.resize(raw.len()+n,0);raw}
+    fn dump()->Vec<u8>{let mut raw=vec![1];raw.extend(names());raw.extend_from_slice(&[1,0,0,0,0,0]);raw}
+    #[test]
+    fn plain_name_slots_are_bounded_before_reservation(){let raw=dump();let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&raw,None));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+    #[test]
+    fn compressed_name_slots_are_bounded_before_reservation(){let packed=zstd::bulk::compress(&dump(),19).unwrap();let n=packed.len();let mut file=vec![2,n as u8,(n>>8) as u8,(n>>16) as u8];file.extend(packed);let (r,largest)=crate::alloc_probe::largest_allocation(||parse(&file,None));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
+    #[test]
+    fn shared_name_slots_are_bounded_before_reservation(){let mut file=vec![0;40];file.extend(zstd::bulk::compress(&names(),19).unwrap());let (r,largest)=crate::alloc_probe::largest_allocation(||SharedContext::from_namemap(&file));assert!(r.is_err());assert!(largest<16<<20,"reserved {largest} bytes for names");}
 }

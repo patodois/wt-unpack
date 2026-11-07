@@ -244,7 +244,7 @@ pub(crate) fn unpack_sized(codec: u8, packed: &[u8]) -> Result<Vec<u8>> {
 fn oodle(packed: &[u8], size: usize) -> Result<Vec<u8>> {
     // A complete 256 KiB block needs six packed bytes; a partial tail needs at least three.
     let block=256<<10;
-    let minimum=(size/block)*6 + if size%block==0 {0} else {3};
+    let minimum=(size/block)*6 + if size.is_multiple_of(block) {0} else {3};
     ensure!(packed.len()>=minimum,"Oodle payload has {} bytes, needs at least {minimum} for {size} bytes of output",packed.len());
     let mut out=Vec::new();
     out.try_reserve_exact(size).context("reserving Oodle output")?;

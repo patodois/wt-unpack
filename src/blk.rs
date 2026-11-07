@@ -907,7 +907,31 @@ mod compressed_block_equivalence {
         assert_eq!(parse(&file,Some(&ctx)).unwrap(),expected);
         let mut shared_plain=vec![3];shared_plain.extend_from_slice(&raw[1..]);assert_eq!(parse(&shared_plain,Some(&ctx)).unwrap(),expected);
     }
+    fn oversized(format:u8){
+        let blocks=400_000;let mut raw=vec![0];var(blocks,&mut raw);raw.extend_from_slice(&[0,0]);raw.resize(raw.len()+3*blocks,0);
+        let mut ctx=SharedContext::default();let packed=if format==5 {
+            let samples:Vec<_>=(0..300).map(|i|format!("dictionary {i}: synthetic block sample {}",i*3).into_bytes()).collect();let dict=zstd::dict::from_samples(&samples,4096).unwrap();
+            let packed=zstd::bulk::Compressor::with_dictionary(19,&dict).unwrap().compress(&raw).unwrap();ctx.dict=Some(dict);packed
+        }else{zstd::bulk::compress(&raw,19).unwrap()};
+        let mut file=vec![format];file.extend(packed);let error=parse(&file,Some(&ctx)).unwrap_err();assert!(error.to_string().contains("block tables"));
+    }
+    #[test]fn shared_compression_keeps_the_absolute_table_ceiling(){oversized(4);}
+    #[test]fn dictionary_compression_keeps_the_absolute_table_ceiling(){oversized(5);}
     #[test]fn compressed_full_tree_keeps_valid_children(){verify(2);}
     #[test]fn compressed_shared_tree_keeps_valid_children(){verify(4);}
     #[test]fn compressed_dictionary_tree_keeps_valid_children(){verify(5);}
+}
+
+#[cfg(test)]
+mod storage_limit_contract {
+    use super::*;
+    #[test]
+    fn block_table_ceiling_has_exact_acceptance_and_rejection_boundaries(){
+        let count=(64<<20)/block_storage_bytes();assert!(check_block_storage(count).is_ok());assert!(check_block_storage(count+1).is_err());
+    }
+    #[test]
+    fn aggregate_storage_multiplier_and_ceiling_are_exact(){
+        let mut small=parameter_storage_budget(4096);charge_storage(128<<10,&mut small).unwrap();assert!(charge_storage(1,&mut small).is_err());
+        let mut large=parameter_storage_budget(128<<20);charge_storage(1<<30,&mut large).unwrap();assert!(charge_storage(1,&mut large).is_err());
+    }
 }

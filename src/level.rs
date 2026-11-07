@@ -1891,3 +1891,12 @@ mod nested_rle_level_regression {
         assert_eq!(unpack(2,&packed,Some(64)).unwrap(),[b'A';64]);
     }
 }
+
+#[cfg(test)]
+mod quantum_payload_boundary {
+    use super::*;
+    #[test]
+    fn a_four_byte_quantum_payload_is_valid_at_the_minimum(){
+        let packed=[0x0c,6,0,0,3,0,0,1,b'A'];let mut reference=[0];lztans::decode(&packed,&mut reference).unwrap();assert_eq!(reference,[b'A']);assert_eq!(unpack(2,&packed,Some(1)).unwrap(),reference);
+    }
+}

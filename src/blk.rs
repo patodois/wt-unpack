@@ -215,6 +215,7 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
     let mut uses=vec![0usize;params_count];
     let mut infos = Vec::with_capacity(blocks_count);
     let mut next_param = 0usize;
+    let mut output_bytes=0usize;
     for _ in 0..blocks_count {
         let name_id = r.varint()?;
         let pc = r.varint()? as usize;
@@ -229,6 +230,9 @@ fn parse_dump(r: &mut Reader, shared_names: &[String], dedup: bool, shared_text:
         };
         let end=start.checked_add(pc).filter(|&end|end<=params_count).context("block params out of range")?;
         ensure!(bc == 0 || first_block.checked_add(bc).is_some_and(|end| end <= blocks_count), "block children out of range");
+        output_bytes=pc.checked_mul(std::mem::size_of::<(String,Value)>()).and_then(|bytes|output_bytes.checked_add(bytes)).context("parameter copy storage overflow")?;
+        ensure!(output_bytes<=storage_budget,"parameter copies expand beyond the storage byte budget");
+        #[cfg(test)] crate::alloc_probe::record_parameter_visits(pc);
         for count in &mut uses[start..end] { *count+=1; }
         infos.push(BlockInfo { name_id, params: start..end, blocks_count: bc, first_block });
     }
@@ -814,6 +818,15 @@ mod numeric_copy_budget {
         let root=result.unwrap();assert_eq!(root.blocks[0].params.len(),1_000_000);
         println!("input_bytes={} allocated_bytes={total} charged_storage_bytes={charged}",file.len());
         assert!(total<=charged+4096,"allocated {total} bytes but charged only {charged}");
+    }
+
+    #[test]
+    fn alias_reference_work_is_rejected_before_visiting_over_budget_ranges() {
+        let file=numeric(1024,1024);
+        let (result,visits)=crate::alloc_probe::parameter_visits(||parse(&file,None));
+        assert!(result.is_err());let bound=parameter_storage_budget(file.len())/std::mem::size_of::<(String,Value)>();
+        println!("input_bytes={} visited_parameters={visits} permitted_visits={bound}",file.len());
+        assert!(visits<=bound,"visited {visits} parameters before enforcing a {bound}-copy bound");
     }
 
 }

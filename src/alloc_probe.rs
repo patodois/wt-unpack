@@ -98,3 +98,7 @@ pub fn storage_accounting<R>(f:impl FnOnce()->R)->(R,usize,usize){
     STORAGE_CHARGED.with(|v|v.set(0));let (result,total)=total_allocation(f);
     (result,total,STORAGE_CHARGED.with(Cell::get))
 }
+
+thread_local! {static PARAMETER_VISITS:Cell<usize>=const{Cell::new(0)};}
+pub fn record_parameter_visits(count:usize){PARAMETER_VISITS.with(|v|v.set(v.get().saturating_add(count)));}
+pub fn parameter_visits<R>(f:impl FnOnce()->R)->(R,usize){PARAMETER_VISITS.with(|v|v.set(0));let result=f();(result,PARAMETER_VISITS.with(Cell::get))}

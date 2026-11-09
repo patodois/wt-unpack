@@ -3,8 +3,7 @@
 [![rewrite-bridge on crates.io](https://img.shields.io/crates/v/rewrite-bridge.svg?label=rewrite-bridge)](https://crates.io/crates/rewrite-bridge)
 [![rewrite-bridge docs](https://img.shields.io/docsrs/rewrite-bridge?label=docs.rs)](https://docs.rs/rewrite-bridge)
 
-Rust tools for reading War Thunder's game data (Dagor Engine) from your own installation, and turning it into
-things other software understands: glTF models, PNG textures, level scenes, sounds.
+wt-unpack provides Rust tools for asset-tool and game-rewrite developers to read War Thunder's Dagor Engine data from their own installation and export models, textures, level scenes and sounds.
 
 It is for people who want to look at, convert or study War Thunder's assets, and for people who write a **game
 rewrite**: a new engine for an old game that loads the original's assets, possibly mixed with another game's

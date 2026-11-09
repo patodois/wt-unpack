@@ -3,6 +3,7 @@
 .github/workflows/release.yml
 .gitignore
 .public-tree.cfg
+AGENTS.md
 Cargo.lock
 Cargo.toml
 Cargo.toml.orig

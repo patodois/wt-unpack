@@ -230,16 +230,21 @@ impl<W: Write> OggWriter<W> {
 
     fn packet(&mut self, data: &[u8], granule: u64, eos: bool) -> Result<()> {
         let mut rest = data;
+        // Whether part of this packet is already on a page
+        let mut started = false;
         loop {
             if self.segments.len() == 255 {
                 self.flush()?;
-                self.continued = true;
+                // Only a page that begins inside this packet continues one: when the full page ended with the
+                // previous packet, this one starts fresh, and a reader would drop it if the flag said otherwise
+                self.continued = started;
             }
             // A packet ends with a segment shorter than 255 bytes, which may be empty
             let n = rest.len().min(255);
             self.segments.push(n as u8);
             self.body.extend_from_slice(&rest[..n]);
             rest = &rest[n..];
+            started = true;
             if n < 255 {
                 break;
             }
@@ -298,10 +303,14 @@ fn ogg_crc(data: &[u8]) -> u32 {
     data.iter().fold(0, |crc, &b| crc << 8 ^ table[((crc >> 24) as u8 ^ b) as usize])
 }
 
-/// Splits an Ogg stream back into its packets, checking the page CRCs.
+/// Splits an Ogg stream back into its packets as a reader that follows the Ogg rules does, checking the page
+/// CRCs: a page flagged "continued" with no packet open loses its segments up to the end of that packet, and
+/// an open packet is dropped when the next page is not flagged. Also returns each page's flag.
 #[cfg(test)]
-fn read_ogg(mut data: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let (mut packets, mut partial) = (Vec::new(), Vec::new());
+fn read_ogg(mut data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<bool>)> {
+    let (mut packets, mut partial, mut flags) = (Vec::new(), Vec::new(), Vec::new());
+    // A packet is open when the last segment read was a full one
+    let mut open = false;
     while !data.is_empty() {
         ensure!(data.len() >= 27 && &data[..4] == b"OggS", "bad page");
         let n = usize::from(data[26]);
@@ -312,16 +321,29 @@ fn read_ogg(mut data: &[u8]) -> Result<Vec<Vec<u8>>> {
         zeroed[22..26].fill(0);
         ensure!(ogg_crc(&zeroed) == u32::from_le_bytes(page[22..26].try_into().unwrap()), "page CRC mismatch");
         let mut body = &page[27 + n..];
+        let continued = page[5] & 1 != 0;
+        flags.push(continued);
+        // The rest of a packet whose start was never seen is skipped
+        let mut skipping = continued && !open;
+        if !continued && open {
+            partial.clear();
+        }
         for &l in lacing {
-            partial.extend_from_slice(&body[..usize::from(l)]);
+            if !skipping {
+                partial.extend_from_slice(&body[..usize::from(l)]);
+            }
             body = &body[usize::from(l)..];
-            if l < 255 {
-                packets.push(std::mem::take(&mut partial));
+            open = l == 255;
+            if !open {
+                if !skipping {
+                    packets.push(std::mem::take(&mut partial));
+                }
+                skipping = false;
             }
         }
         data = &data[page.len()..];
     }
-    Ok(packets)
+    Ok((packets, flags))
 }
 
 #[cfg(test)]
@@ -377,11 +399,36 @@ mod tests {
         for (i, p) in packets.iter().enumerate() {
             ogg.packet(p, i as u64, i + 1 == packets.len()).unwrap();
         }
-        assert_eq!(read_ogg(&out).unwrap(), packets);
+        let (read, flags) = read_ogg(&out).unwrap();
+        assert_eq!(read.len(), packets.len());
+        assert_eq!(read, packets);
+        // Four pages: the first seven packets, the 65,000 bytes (exactly 255 segments), then the 65,535 bytes
+        // (258 segments), whose last three segments continue on the page that also holds the last packet
+        assert_eq!(flags, [false, false, false, true]);
         // The last page carries the end-of-stream flag and the last granule
         let last = out.windows(4).rposition(|w| w == b"OggS").unwrap();
         assert_eq!(out[last + 5] & 4, 4);
         assert_eq!(u64::from_le_bytes(out[last + 6..last + 14].try_into().unwrap()), 9);
+    }
+
+    #[test]
+    fn a_page_break_between_two_packets_is_not_flagged_as_a_continuation() {
+        // 255 packets of 16 bytes fill a page's 255 segments long before its 4 KB target, so the page ends
+        // exactly where packet 255 ends; packet 256 starts the next page and continues nothing. Then a
+        // 600-byte packet that does cross a page: 254 small ones leave one segment free.
+        let mut packets: Vec<Vec<u8>> = (0..256usize).map(|i| vec![i as u8; 16]).collect();
+        packets.extend((0..253usize).map(|i| vec![i as u8; 3]));
+        packets.push(vec![0xEE; 600]);
+        packets.push(vec![0x11; 5]);
+        let mut out = Vec::new();
+        let mut ogg = OggWriter::new(&mut out, 7);
+        for (i, p) in packets.iter().enumerate() {
+            ogg.packet(p, i as u64, i + 1 == packets.len()).unwrap();
+        }
+        let (read, flags) = read_ogg(&out).unwrap();
+        assert_eq!(flags, [false, false, true], "continued flags of the pages");
+        assert_eq!(read.len(), packets.len(), "packets a reader gets back");
+        assert_eq!(read, packets);
     }
 
     #[test]

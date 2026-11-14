@@ -395,6 +395,12 @@ decoders are pure Rust.
   (BSD-3-Clause), the sound formats the community documentation of vgmstream and python-fsb5; no code was copied
   (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
 
+## Changes since 0.5.1
+
+- Sounds: an `.ogg` page that begins exactly at a packet boundary is no longer flagged as continuing a packet.
+  The wrong flag appeared after 255 packets of 16 bytes or less in a row (a long silence) and made players that
+  follow the Ogg rules drop one packet. Extract again any `.ogg` you keep from an earlier version.
+
 ## Changes in 0.5.1
 
 - Archives and BLK files have accounting limits for parsing: names and file ranges copied out of a

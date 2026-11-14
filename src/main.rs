@@ -17,7 +17,7 @@ use wt_formats::{
 use wt_unpack::level::Level;
 use wt_unpack::terrain::{self, HeightGrid};
 use wt_unpack::sound::{self, Codec, Fsb5};
-use wt_unpack::{blk, gltf, vehicle, vromfs};
+use wt_unpack::{blk, gltf, paths, vehicle, vromfs};
 
 #[derive(Parser)]
 #[command(version, about = "Read Dagor Engine vromfs archives and binary BLK files")]
@@ -440,7 +440,7 @@ fn grp_cmd(path: &Path, model: Option<&str>) -> Result<()> {
 fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Result<()> {
     let vehicle = vehicle::load(game, pack, name, lod)?;
     gltf::write(&vehicle, out)?;
-    eprintln!("wrote {}", out.join(format!("{name}.gltf")).display());
+    eprintln!("wrote {}", out.join(paths::file_name(name, "gltf")).display());
     Ok(())
 }
 
@@ -532,7 +532,7 @@ fn level_cmd(
             // Texture names end in '*' and may carry "?options"; keep a file-system-safe stem
             let stem: String = name.split(['*', '?']).next().unwrap_or("texture").chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
             fs::create_dir_all(dir)?;
-            let out = dir.join(format!("{stem}.png"));
+            let out = dir.join(paths::file_name(&stem, "png"));
             fs::write(&out, png)?;
             eprintln!("wrote {}", out.display());
         }
@@ -621,7 +621,7 @@ fn level_cmd(
         if let Some(dir) = gltf_dir {
             let model = terrain::to_model(&name, &mesh);
             gltf::write(&model, dir)?;
-            eprintln!("wrote {} ({} vertices, {} triangles)", dir.join(format!("{name}.gltf")).display(), mesh.positions.len(), mesh.indices.len() / 3);
+            eprintln!("wrote {} ({} vertices, {} triangles)", dir.join(paths::file_name(&name, "gltf")).display(), mesh.positions.len(), mesh.indices.len() / 3);
         }
     }
 
@@ -1049,12 +1049,12 @@ fn sound_list(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A file name from a sample name: path separators and control characters become `_`.
+/// The name of a sample's file, without its extension, from the sample's name in the bank: `paths::stem`
+/// makes it safe (separators, colons and control characters become `_`; on Windows a device name such as
+/// `NUL` gets a `_` in front). The extension is added where the file is made.
 fn sample_file_name(name: Option<&str>, fsb: usize, index: usize) -> String {
     match name {
-        Some(n) if !n.is_empty() && n != "." && n != ".." => {
-            n.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c }).collect()
-        }
+        Some(n) if !n.is_empty() && n != "." && n != ".." => paths::stem(n),
         _ => format!("sample_{fsb}_{index}"),
     }
 }

@@ -45,6 +45,7 @@ src/lib.rs
 src/live.rs
 src/main.rs
 src/memory.rs
+src/paths.rs
 src/rendinst.rs
 src/rig.rs
 src/rodb.rs

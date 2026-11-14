@@ -91,3 +91,83 @@ fn a_write_failing_midway_names_the_file_and_is_fatal() {
     let err=String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("writing out"),"{err}");
 }
+
+/// A sound bank with one PCM16 FSB5 holding a one-frame mono sample per name
+fn bank(names: &[&[u8]]) -> Vec<u8> {
+    let n = names.len();
+    let (mut headers, mut table, mut strings) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, name) in names.iter().enumerate() {
+        // rate index 8 (44,100 Hz), mono, data offset in units of 32 bytes, one frame
+        headers.extend_from_slice(&(8u64 << 1 | (i as u64) << 7 | 1u64 << 34).to_le_bytes());
+        table.extend_from_slice(&((4 * n + strings.len()) as u32).to_le_bytes());
+        strings.extend_from_slice(name);
+        strings.push(0);
+    }
+    table.extend(strings);
+    let mut fsb = b"FSB5".to_vec();
+    for v in [1, n as u32, headers.len() as u32, table.len() as u32, 32 * n as u32, 2, 0, 0] {
+        fsb.extend_from_slice(&v.to_le_bytes());
+    }
+    fsb.resize(0x3C, 0);
+    fsb.extend(headers);
+    fsb.extend(table);
+    fsb.resize(fsb.len() + 32 * n, 0);
+    // RIFF "FEV " with one SND chunk; the FSB5 starts at the chunk's first offset that is a multiple of 32
+    let mut body = b"FEV SND ".to_vec();
+    body.extend_from_slice(&((12 + fsb.len()) as u32).to_le_bytes());
+    body.extend_from_slice(&[0; 12]);
+    body.extend(fsb);
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
+/// The files under `dir`, relative to it with `/`, sorted
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+            if e.path().is_dir() { walk(&e.path(), &format!("{name}/"), out) } else { out.push(name) }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn sound_extract_makes_sample_names_safe_and_leaves_ordinary_ones_alone() {
+    let temp = Scratch::new();
+    fs::create_dir_all(temp.0.join("work/deep")).unwrap();
+    // A drive, a parent folder in both spellings and a stream; then ordinary names, three of which are devices
+    // on Windows or end in a dot or a space
+    let names: [&[u8]; 9] = [b"c:boom", b"../../up", b"..\\..\\back", b"shot:1", b"dshk_close", b"NUL", b"aux", b"ends.", b"two words"];
+    fs::write(temp.0.join("work/deep/x.assets.bank"), bank(&names)).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_wt-unpack")).current_dir(temp.0.join("work/deep")).args(["sound", "extract", "x.assets.bank", "-o", "out"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(stderr.contains("wrote 9 samples"), "{stderr}");
+    // Ordinary names give `<name>.wav`, as they always did; only Windows, where `NUL` and `aux` are devices,
+    // puts a `_` in front of those two
+    let (nul, aux) = if cfg!(windows) { ("_NUL", "_aux") } else { ("NUL", "aux") };
+    let mut expected: Vec<String> = [".._.._back", ".._.._up", "c_boom", "shot_1", "dshk_close", nul, aux, "ends.", "two words"].iter().map(|n| format!("work/deep/out/{n}.wav")).collect();
+    expected.push("work/deep/x.assets.bank".into());
+    expected.sort();
+    assert_eq!(files_under(&temp.0), expected);
+}
+
+#[test]
+fn extract_keeps_refusing_paths_that_leave_the_output_folder() {
+    // `extract` is unchanged: it writes what the system's own path rules call a plain relative path
+    let temp = Scratch::new();
+    fs::create_dir_all(temp.0.join("work/deep")).unwrap();
+    let members: &[(&[u8], &[u8])] = &[(b"ok/a.txt", b"1"), (b"../up.txt", b"2"), (b"/abs.txt", b"3"), (b"ok/../../back.txt", b"4"), (b"ok/b c.txt", b"5")];
+    fs::write(temp.0.join("work/deep/test.vromfs.bin"), archive(members)).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_wt-unpack")).current_dir(temp.0.join("work/deep")).args(["extract", "test.vromfs.bin", "--out", "out"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("skipping unsafe path").count(), 3, "{stderr}");
+    assert_eq!(files_under(&temp.0), ["work/deep/out/ok/a.txt", "work/deep/out/ok/b c.txt", "work/deep/test.vromfs.bin"]);
+}

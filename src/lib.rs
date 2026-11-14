@@ -14,6 +14,7 @@ pub mod gltf;
 pub mod landclass;
 pub mod level;
 pub mod memory;
+pub mod paths;
 pub mod rendinst;
 pub mod rig;
 pub mod rodb;

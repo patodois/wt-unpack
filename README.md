@@ -400,6 +400,13 @@ decoders are pure Rust.
 - Sounds: an `.ogg` page that begins exactly at a packet boundary is no longer flagged as continuing a packet.
   The wrong flag appeared after 255 packets of 16 bytes or less in a row (a long silence) and made players that
   follow the Ogg rules drop one packet. Extract again any `.ogg` you keep from an earlier version.
+- Output file names: sample names (`sound extract`), texture and model names (`model`, `level --gltf`) and the
+  names of a level's own textures (`level --textures`) go through one function, `wt_unpack::paths`, before they
+  name a file. Path separators, colons and control characters become `_`: a sample named `c:boom` is written as
+  `c_boom.wav` (on Windows it used to land in the current folder of drive C), and a texture named `../../x` as
+  `.._.._x.png` inside `-o` instead of two folders above it. On Windows a device name such as `NUL` gets a `_`
+  in front. Every other name gives the file it always gave. `extract` is unchanged: it already refused paths
+  that leave the output folder.
 
 ## Changes in 0.5.1
 

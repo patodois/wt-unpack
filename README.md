@@ -118,9 +118,9 @@ A first look takes a few seconds:
 ```sh
 GAME="/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game"   # your game folder
 
-wt-unpack list $GAME/char.vromfs.bin | head
-wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp
-wt-unpack model $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman -o out/sherman
+wt-unpack list "$GAME/char.vromfs.bin" | head
+wt-unpack grp "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp"
+wt-unpack model "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" m4a1_76w_sherman -o out/sherman
 ```
 
 `-o` is a **folder**: `out/sherman` is created and gets the glTF, its `.bin` and the PNG textures (about 40
@@ -129,50 +129,52 @@ Godot. (`level --heightmap` takes a file name, `level --gltf` a folder.)
 
 ## Usage
 
-`$GAME` is the game folder (see Prerequisites). Commands marked **heavy** read a lot of the game; times are
-from a Mac with an SSD and 16 GB, on War Thunder 2.59.0.80.
+`$GAME` is the game folder (see Prerequisites); it is quoted below because the usual Windows and Linux folders
+have a space in their name (`War Thunder`). Commands marked **heavy** read a lot of the game; times are
+from a Mac with an SSD and 16 GB, on War Thunder 2.59.0.80. Output can be piped to `head` or a pager: when the
+reader stops, the program ends quietly with exit status 0.
 
 ```sh
 # Archives and BLKs
-wt-unpack list $GAME/char.vromfs.bin
-wt-unpack extract $GAME/aces.vromfs.bin -o out/aces --blk json --filter tankmodels
-wt-unpack cat $GAME/char.vromfs.bin:config/wpcost.blk | head   # it is 1.16 million lines: pipe it
+wt-unpack list "$GAME/char.vromfs.bin"
+wt-unpack extract "$GAME/aces.vromfs.bin" -o out/aces --blk json --filter tankmodels
+wt-unpack cat "$GAME/char.vromfs.bin:config/wpcost.blk" | head   # it is 1.16 million lines: pipe it
 
 # What a .grp pack holds, and the LODs, vertex layouts and skeleton of one model
-wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp
-wt-unpack grp $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp --model m4a1_76w_sherman
+wt-unpack grp "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp"
+wt-unpack grp "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" --model m4a1_76w_sherman
 
 # Export a vehicle to glTF with its textures, into the folder given with -o
-wt-unpack model $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman -o out/sherman
+wt-unpack model "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" m4a1_76w_sherman -o out/sherman
 
 # HEAVY: parse every model in a folder and summarise failures (a regression check): the tanks take 40 s and 0.14 GB
-wt-unpack check $GAME/content/base/res/tanks
+wt-unpack check "$GAME/content/base/res/tanks"
 
 # The blocks of a level, its terrain as a 16-bit PNG (plus a JSON with its world placement) and as glTF,
 # and its placed objects
-wt-unpack level $GAME/levels/avg_berlin.bin
-wt-unpack level $GAME/levels/arcade_alps.bin --heightmap out/alps.png --gltf out/alps
-wt-unpack level $GAME/levels/avg_berlin.bin --terrain landmesh --heightmap out/berlin_wide.png
-wt-unpack level $GAME/levels/avg_berlin.bin --objects
+wt-unpack level "$GAME/levels/avg_berlin.bin"
+wt-unpack level "$GAME/levels/arcade_alps.bin" --heightmap out/alps.png --gltf out/alps
+wt-unpack level "$GAME/levels/avg_berlin.bin" --terrain landmesh --heightmap out/berlin_wide.png
+wt-unpack level "$GAME/levels/avg_berlin.bin" --objects
 
 # The level as a rewrite-bridge scene (needs --features bridge): the models, the instances, the memory
 # estimate, and what is not in the scene. Berlin takes about 7 s and 1.3 GB.
-wt-unpack level $GAME/levels/avg_berlin.bin --scene-stats
+wt-unpack level "$GAME/levels/avg_berlin.bin" --scene-stats
 
 # HEAVY: parse every level and summarise what decodes: 10 s, 0.4 GB
-wt-unpack check-levels $GAME/levels
+wt-unpack check-levels "$GAME/levels"
 
 # Sound banks: list the samples, then extract some (Vorbis to .ogg, FADPCM to .wav; --format wav decodes all)
-wt-unpack sound list $GAME/sound/tanks_engines.assets.bank
-wt-unpack sound extract $GAME/sound/tanks_weapons.assets.bank --filter dshk_close -o out/dshk
-wt-unpack sound check $GAME/sound            # headers of every bank: under a second
-wt-unpack sound check $GAME/sound --decode   # HEAVY: decodes all 156,223 samples: 10 to 12 minutes, about 0.7 GB
+wt-unpack sound list "$GAME/sound/tanks_engines.assets.bank"
+wt-unpack sound extract "$GAME/sound/tanks_weapons.assets.bank" --filter dshk_close -o out/dshk
+wt-unpack sound check "$GAME/sound"            # headers of every bank: under a second
+wt-unpack sound check "$GAME/sound" --decode   # HEAVY: decodes all 156,223 samples: 10 to 12 minutes, about 0.7 GB
 
 # Open a vehicle in 3D: drag to orbit, scroll to zoom, Q/E turn the turret, R/F elevate the gun
-wt-viewer $GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp pzkpfw_V_ausf_g_panther --game $GAME
+wt-viewer "$GAME/content/base/res/tanks/germ_pzkpfw_v_ausf_g_panther.grp" pzkpfw_V_ausf_g_panther --game "$GAME"
 
 # Drive it on flat ground with WASD; the camera follows and the speed shows in a corner
-wt-viewer $GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp m4a1_76w_sherman --drive
+wt-viewer "$GAME/content/base/res/tanks/usa_m4a1_76w_sherman.grp" m4a1_76w_sherman --drive
 
 # Save a picture and close: turret 60 degrees left, gun 10 degrees up; or after a scripted drive
 wt-viewer --turret 60 --gun 10 --screenshot sherman.png
@@ -212,7 +214,7 @@ pivoting with one track in first gear at a standstill. How wheels, tracks and ma
 | Command | Expected |
 |---|---|
 | `check <folder>/tanks` | 3,656 of 3,656 models parse (aircraft 1,695 of 1,695, ships 1,925 of 1,925, with every skeleton) |
-| `check-levels $GAME/levels` | 160 of 160 levels parse fully; terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
+| `check-levels "$GAME/levels"` | 160 of 160 levels parse fully; terrain from `HM2` in 86, from a land ray tracer in 158; 8,717,713 placed objects |
 | `sound check --decode` | 156,223 samples decode (148,743 Vorbis, 7,480 FADPCM) |
 
 If your numbers are far from these, the game has been updated; open an issue with the version.
@@ -309,8 +311,8 @@ Details and the JSON log are in [docs/LIVE.md](docs/LIVE.md).
 ```sh
 cargo test                                     # unit tests; no game files needed
 cargo test --features live,bridge              # also the live telemetry client (against a mock server) and the bridge
-WT_GAME_DIR=$GAME cargo test --release         # also runs the tests that read your installed game
-WT_GAME_DIR=$GAME cargo test --release --features live,bridge   # all of it: the Sherman's rig and sockets, every
+WT_GAME_DIR="$GAME" cargo test --release         # also runs the tests that read your installed game
+WT_GAME_DIR="$GAME" cargo test --release --features live,bridge   # all of it: the Sherman's rig and sockets, every
                                                # collision resource, Berlin's scene and collision, and the
                                                # memory check (tests/memory.rs)
 ```
@@ -413,6 +415,9 @@ decoders are pure Rust.
 - `model` writes every texture of the export. It used to keep any PNG of the same name already in the folder,
   so an export into a folder used before could reference textures of an older game version or a half-written
   file of an interrupted run.
+- A closed output ends the program quietly with success: `wt-unpack list ... | head` used to panic
+  ("failed printing to stdout") and `cat ... | head` to print `Error: Broken pipe` with status 1. The README's
+  commands quote `"$GAME"`, as the Steam folders on Windows and Linux have a space in their name.
 
 ## Changes in 0.5.1
 

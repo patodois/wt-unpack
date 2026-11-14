@@ -75,7 +75,7 @@ for (wheel, angle) in rig.gear.as_ref().unwrap().wheels.iter().zip(driving.wheel
 // driving.belt_offsets() are V offsets for the track meshes' UVs (rig.gear.belts[i].mesh)
 ```
 
-`cargo run --release --features bridge --example drive_tank -- $GAME` runs this loop headless and prints the
+`cargo run --release --features bridge --example drive_tank -- "$GAME"` runs this loop headless and prints the
 state. The axes are the bridge's (front +Z, left +X, up +Y); `wt_unpack::rig` says which way each rotation
 goes.
 

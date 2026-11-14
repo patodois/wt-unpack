@@ -82,7 +82,7 @@ memory, the baked ground pictures (2 m per pixel where the heightmap is finer th
 elsewhere, spacings growing together past 384 MB), the terrain vertex count, and the object textures
 (256 px on the longest side). Berlin (512,641 placements of 452 models) loads in about 7 s with about 850 MB
 of scene data and a peak near 1.3 GB (see [MEMORY.md](MEMORY.md)); the collision of the objects is separate
-(`load_level_collision`, see "Level collision" in [BRIDGE.md](BRIDGE.md#level-collision)). `cargo run --release --features bridge --example render_scene -- $GAME levels/avg_berlin.bin
+(`load_level_collision`, see "Level collision" in [BRIDGE.md](BRIDGE.md#level-collision)). `cargo run --release --features bridge --example render_scene -- "$GAME" levels/avg_berlin.bin
 out.png --eye 2150,90,1380 --at 2400,40,1560` draws a scene from a camera with a small software
 rasteriser (albedo with a headlight on a flat background, since the game's sun and sky are not in the
 data); `--leaves` adds the leaf cards, expanded for that camera.

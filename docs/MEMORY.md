@@ -35,7 +35,7 @@ numbers move between runs:
 | Live after dropping the scene | 0 MB | 26 MB (the indexes), 0 MB after `clear_caches()` |
 
 ```sh
-/usr/bin/time -l cargo run --release --features bridge --example scene_memory -- $GAME levels/avg_berlin.bin
+/usr/bin/time -l cargo run --release --features bridge --example scene_memory -- "$GAME" levels/avg_berlin.bin
 ```
 
 `examples/scene_memory.rs` prints the live, resident and footprint sizes at each step (and a hash of the whole

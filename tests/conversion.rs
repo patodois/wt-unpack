@@ -171,3 +171,42 @@ fn extract_keeps_refusing_paths_that_leave_the_output_folder() {
     assert_eq!(stderr.matches("skipping unsafe path").count(), 3, "{stderr}");
     assert_eq!(files_under(&temp.0), ["work/deep/out/ok/a.txt", "work/deep/out/ok/b c.txt", "work/deep/test.vromfs.bin"]);
 }
+
+/// Runs the program, reads `take` bytes of its standard output and closes the pipe, as `| head` does
+fn run_and_stop_reading(temp: &Scratch, args: &[&str], take: usize) -> (std::process::ExitStatus, Vec<u8>, String) {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wt-unpack")).current_dir(&temp.0).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = vec![0; take];
+    stdout.read_exact(&mut first).unwrap();
+    drop(stdout);
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    (child.wait().unwrap(), first, stderr)
+}
+
+#[test]
+fn a_reader_that_stops_early_ends_list_and_cat_quietly_with_success() {
+    // The README's first commands are `list ... | head` and `cat ... | head`. Both outputs here are far larger
+    // than a pipe holds (20,000 lines, 2 MB), so the program is still writing when the reader goes away.
+    let temp = Scratch::new();
+    let names: Vec<String> = (0..20_000).map(|i| format!("gamedata/some/folder/file_number_{i:05}.txt")).collect();
+    let text = "a line of a large text file\n".repeat(80_000);
+    let mut files: Vec<(&[u8], &[u8])> = names.iter().map(|n| (n.as_bytes(), &b"x"[..])).collect();
+    files.push((b"big.txt", text.as_bytes()));
+    fs::write(temp.0.join("test.vromfs.bin"), archive(&files)).unwrap();
+
+    let (status, first, stderr) = run_and_stop_reading(&temp, &["list", "test.vromfs.bin"], 8);
+    assert_eq!((first.as_slice(), stderr.as_str()), (&b"target: "[..], ""), "list: {status}");
+    assert!(status.success(), "list: {status}");
+
+    let (status, first, stderr) = run_and_stop_reading(&temp, &["cat", "test.vromfs.bin:big.txt"], 6);
+    assert_eq!((first.as_slice(), stderr.as_str()), (&b"a line"[..], ""), "cat: {status}");
+    assert!(status.success(), "cat: {status}");
+
+    // Read to the end, nothing changes: the whole listing, and success
+    let all = temp.run(&["list", "test.vromfs.bin"]);
+    assert!(all.status.success());
+    assert_eq!(String::from_utf8_lossy(&all.stdout).lines().count(), 4 + 20_001);
+}

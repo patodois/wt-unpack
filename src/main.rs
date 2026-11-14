@@ -19,6 +19,48 @@ use wt_unpack::terrain::{self, HeightGrid};
 use wt_unpack::sound::{self, Codec, Fsb5};
 use wt_unpack::{blk, gltf, paths, vehicle, vromfs};
 
+/// Standard output of the commands. When whoever reads it has gone away (`wt-unpack list ... | head`), the
+/// program ends at once, quietly and with success, as command-line tools do; Rust ignores the signal that
+/// would otherwise end it, so the write fails instead and std's `println!` would panic on it.
+struct Stdout(std::io::StdoutLock<'static>);
+
+impl Stdout {
+    fn lock() -> Self {
+        Stdout(std::io::stdout().lock())
+    }
+
+    /// Ends the program when the error says the reader is gone; any other error is the caller's
+    fn or_end(result: std::io::Result<()>) -> std::io::Result<()> {
+        if result.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
+            std::process::exit(0);
+        }
+        result
+    }
+}
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `write_all`, so that a line is written whole or the program has ended
+        Self::or_end(self.0.write_all(buf)).map(|()| buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Self::or_end(self.0.flush())
+    }
+}
+
+/// `println!` for this file: the same, through [`Stdout`]. Every line the commands print goes through here,
+/// so a closed pipe never panics.
+macro_rules! println {
+    () => { println!("") };
+    ($($arg:tt)*) => {{
+        let mut out = Stdout::lock();
+        if let Err(e) = out.write_fmt(format_args!($($arg)*)).and_then(|()| out.write_all(b"\n")) {
+            panic!("failed printing to stdout: {e}");
+        }
+    }};
+}
+
 #[derive(Parser)]
 #[command(version, about = "Read Dagor Engine vromfs archives and binary BLK files")]
 struct Cli {
@@ -361,7 +403,7 @@ fn cat(target: &str, format: BlkFormat) -> Result<()> {
         }
         None => (fs::read(target).with_context(|| format!("reading {target}"))?, None),
     };
-    let mut out = BufWriter::new(std::io::stdout().lock());
+    let mut out = BufWriter::new(Stdout::lock());
     if blk::is_binary(&data) {
         let root = blk::parse(&data, shared.as_ref())?;
         render(&root, &data, format, &mut out)?;
@@ -1202,7 +1244,7 @@ fn live_cmd(url: &str, hz: f64, log: Option<&Path>, mock: bool, count: Option<us
     let tty = std::io::stdout().is_terminal();
     let poller = Poller::new(Client::new(&url, Duration::from_millis(500)), hz);
     let (start, mut last_status) = (Instant::now(), None);
-    let mut out = std::io::stdout().lock();
+    let mut out = Stdout::lock();
     for snap in poller.take(count.unwrap_or(usize::MAX)) {
         if let Some(log) = &mut log {
             serde_json::to_writer(&mut *log, &snap.to_log_json(start.elapsed().as_secs_f64()))?;

@@ -219,6 +219,17 @@ pivoting with one track in first gear at a standstill. How wheels, tracks and ma
 
 If your numbers are far from these, the game has been updated; open an issue with the version.
 
+### Exit status
+
+| Status | Meaning |
+|---|---|
+| 0 | The command did what it was asked. For `check`, `check-levels`, `sound check` and `check-bridge`: nothing they checked failed. Also when the reader of the output stopped early (`... \| head`). |
+| 1 | The command could not finish (`Error: ...` on standard error), or a check command found a failure: its summary is printed in full first, then `Error: N ... failed (listed above)`. `check-conformance`: an asset has an error. |
+| 2 | The arguments were not understood. |
+
+`extract` and `sound extract` are not checks: they exit with 0 when they could write their output, even if some BLK
+files were kept unconverted or some samples failed, and say how many on standard error.
+
 ## Using it from another game
 
 With the `bridge` feature, `wt_unpack::bridge::WarThunder` implements rewrite-bridge's `Provider`: vehicles
@@ -418,6 +429,8 @@ decoders are pure Rust.
 - A closed output ends the program quietly with success: `wt-unpack list ... | head` used to panic
   ("failed printing to stdout") and `cat ... | head` to print `Error: Broken pipe` with status 1. The README's
   commands quote `"$GAME"`, as the Steam folders on Windows and Linux have a space in their name.
+- `check`, `check-levels`, `sound check` and `check-bridge` exit with status 1 when something they check fails
+  (they always exited with 0, so a script had to read the summary). See [Exit status](#exit-status).
 
 ## Changes in 0.5.1
 

@@ -106,7 +106,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         lod: usize,
     },
-    /// Parse every DynModel and skeleton in the .grp packs of a folder and summarise failures
+    /// Parse every DynModel and skeleton in the .grp packs of a folder and summarise failures (exit status 1
+    /// when any fails)
     Check { dir: PathBuf },
     /// List the blocks of a level file (levels/*.bin), or export its terrain and placed objects
     Level {
@@ -137,9 +138,10 @@ enum Command {
         #[arg(long)]
         lod_distance: Option<f32>,
     },
-    /// Parse every level file in a folder and summarise what decodes
+    /// Parse every level file in a folder and summarise what decodes (exit status 1 when a level fails)
     CheckLevels { dir: PathBuf },
-    /// Load every tank, aircraft and ship through the rewrite-bridge provider and validate it
+    /// Load every tank, aircraft and ship through the rewrite-bridge provider and validate it (exit status 1
+    /// when a vehicle fails)
     #[cfg(feature = "bridge")]
     CheckBridge {
         #[arg(long, default_value = "/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game")]
@@ -238,7 +240,8 @@ enum SoundCommand {
         #[arg(long, value_enum, default_value_t = AudioFormat::Auto)]
         format: AudioFormat,
     },
-    /// Parse every bank in a folder and count samples per codec; `--decode` also decodes them all
+    /// Parse every bank in a folder and count samples per codec; `--decode` also decodes them all (exit status
+    /// 1 when a bank or a sample fails)
     Check {
         dir: PathBuf,
         #[arg(long)]
@@ -486,6 +489,13 @@ fn model_cmd(pack: &Path, name: &str, game: &Path, out: &Path, lod: usize) -> Re
     Ok(())
 }
 
+/// How a regression command ends: after its summary is printed, an error (exit status 1) when something it
+/// checked failed, so a script can rely on the status instead of reading the summary
+fn check_outcome(failed: usize, what: &str) -> Result<()> {
+    anyhow::ensure!(failed == 0, "{failed} {what} failed (listed above)");
+    Ok(())
+}
+
 fn check_cmd(dir: &Path) -> Result<()> {
     let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let (mut models, mut ok, mut skeletons, mut tris) = (0, 0, 0, 0usize);
@@ -536,7 +546,7 @@ fn check_cmd(dir: &Path) -> Result<()> {
     for (msg, list) in &errors {
         println!("{:>5}  {msg}\n       e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
     }
-    Ok(())
+    check_outcome(errors.values().map(Vec::len).sum(), "pack or model")
 }
 
 fn level_cmd(
@@ -763,7 +773,7 @@ fn check_levels(dir: &Path) -> Result<()> {
         paths.len()
     );
     println!("ground weights: {legacy_maps} levels with per-cell weight textures, {packed_maps} with a packed atlas; {inline_classes} land classes stored inline; {palette_pools} rotation-palette pools");
-    Ok(())
+    check_outcome(paths.len() - full, &format!("of {} levels", paths.len()))
 }
 
 fn ensure_counts(counts: &[usize], decoded: usize) -> Result<()> {
@@ -1007,7 +1017,7 @@ fn check_bridge(game: &Path, filter: &str, list_only: bool, limit: Option<usize>
         start.elapsed().as_secs_f32(),
         peak_rss() >> 20
     );
-    Ok(())
+    check_outcome(failed, &format!("of {} vehicles", ok + failed))
 }
 
 #[cfg(feature = "bridge")]
@@ -1215,7 +1225,7 @@ fn sound_check(dir: &Path, decode: bool) -> Result<()> {
     for (msg, list) in &errors {
         println!("{:>6}  {msg}\n        e.g. {}", list.len(), list.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
     }
-    Ok(())
+    check_outcome(errors.values().map(Vec::len).sum(), "bank or sample")
 }
 
 #[cfg(not(feature = "live"))]

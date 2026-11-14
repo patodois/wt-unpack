@@ -210,3 +210,42 @@ fn a_reader_that_stops_early_ends_list_and_cat_quietly_with_success() {
     assert!(all.status.success());
     assert_eq!(String::from_utf8_lossy(&all.stdout).lines().count(), 4 + 20_001);
 }
+
+#[test]
+fn the_regression_commands_exit_with_1_when_something_fails() {
+    let temp = Scratch::new();
+    for dir in ["good", "bad", "empty"] {
+        fs::create_dir(temp.0.join(dir)).unwrap();
+    }
+    // Good: a bank whose samples decode. Bad: files of the right names that are not what they say.
+    fs::write(temp.0.join("good/a.assets.bank"), bank(&[b"one", b"two"])).unwrap();
+    for name in ["x.grp", "x.bin", "x.bank"] {
+        fs::write(temp.0.join("bad").join(name), b"not a game file, long enough to be read as a header ........").unwrap();
+    }
+    fs::write(temp.0.join("bad/a.assets.bank"), bank(&[b"one"])).unwrap();
+
+    let run = |args: &[&str]| {
+        let out = temp.run(args);
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    // Nothing to check, or everything fine: 0
+    for args in [&["check", "empty"][..], &["check-levels", "empty"], &["sound", "check", "empty"], &["sound", "check", "good"], &["sound", "check", "good", "--decode"]] {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, Some(0), "{args:?}: {stdout}{stderr}");
+    }
+    // A failure: the summary still comes out in full, then status 1 with one line on standard error
+    for (args, summary, error) in [
+        (&["check", "bad"][..], "0/0 DynModels parsed", "1 pack or model failed"),
+        (&["check-levels", "bad"], "0/1 levels parse fully", "1 of 1 levels failed"),
+        (&["sound", "check", "bad"], "2 banks, 1 with sample data", "1 bank or sample failed"),
+        (&["sound", "check", "bad", "--decode"], "decoded 1 samples", "1 bank or sample failed"),
+    ] {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, Some(1), "{args:?}: {stdout}{stderr}");
+        assert!(stdout.contains(summary), "{args:?}: {stdout}");
+        assert!(stderr.contains(error), "{args:?}: {stderr}");
+    }
+    // A folder that cannot be read is an error as before (1), and arguments that are not understood are 2
+    assert_eq!(run(&["check-levels", "absent"]).0, Some(1));
+    assert_eq!(run(&["check-levels"]).0, Some(2));
+}

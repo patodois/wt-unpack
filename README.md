@@ -56,7 +56,10 @@ the checksum of every archive (`shasum -a 256 -c SHA256SUMS` on macOS, `sha256su
 `Get-FileHash` on Windows). They are built with the `live` and `bridge` features, so `wt-unpack live` and the rewrite-bridge commands are included. The 3D viewer (`wt-viewer`) is not in the archives: it needs extra system libraries to build on Linux, so build it from source (see [Build](#build)).
 
 `SHA256SUMS.sig` on the same release signs `SHA256SUMS` with the project's Ed25519 release key, so you can also check
-that the list itself came from here. With the downloads in one folder (needs OpenSSL 3):
+that the list itself came from here. The release workflow builds and publishes the archives and `SHA256SUMS`; the
+signature is not made there (the key is not in the workflow) and is added to the release afterwards. The script that
+checks it is in this repository, not in the archives: from a checkout, or with
+[`tools/verify-release.sh`](tools/verify-release.sh) saved by itself, and the downloads in one folder (needs OpenSSL 3):
 
 ```sh
 sh tools/verify-release.sh wt-unpack v0.5.1 path/to/folder
@@ -192,7 +195,7 @@ wt-viewer --drive --auto W:30,WA:3 --turret 90 --screenshot drive.png
 | `--orbit <yaw,pitch,dist>`, `--target <x,y,z>` | starting camera: angles in degrees and distance in metres; the point it looks at (model space, metres) |
 | `--lift <node=metres>` | raise a skeleton node, to see the skinned tracks follow it (comma-separate several) |
 | `--drive` | drive on flat ground with WASD |
-| `--auto <script>` | drive by script (with `--drive`): `W:20,WA:3,S:2` holds W for 20 s, then W and A for 3 s, then S for 2 s |
+| `--auto <script>` | drive by script (needs `--drive`, and is refused without it): `W:20,WA:3,S:2` holds W for 20 s, then W and A for 3 s, then S for 2 s |
 | `--screenshot <file.png>` | save one frame (after the script, if any) and close; a relative path lands in the folder you ran it from |
 | `-h`, `--help` | print this list |
 
@@ -431,6 +434,10 @@ decoders are pure Rust.
   commands quote `"$GAME"`, as the Steam folders on Windows and Linux have a space in their name.
 - `check`, `check-levels`, `sound check` and `check-bridge` exit with status 1 when something they check fails
   (they always exited with 0, so a script had to read the summary). See [Exit status](#exit-status).
+- Smaller fixes: `live --hz nan` is refused instead of panicking; a level whose landmesh origin is at the edge
+  of the 32-bit range no longer overflows; the per-pixel buffer of an `HM2` heightmap (up to 256 MiB) is no
+  longer reserved before any of its data has been read; `wt-viewer --auto` without `--drive` is refused, as its
+  help says, instead of ignored.
 
 ## Changes in 0.5.1
 

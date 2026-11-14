@@ -208,8 +208,8 @@ enum Command {
         /// Server to poll
         #[arg(long, default_value = wt_unpack::live::DEFAULT_URL)]
         url: String,
-        /// Polls per second during a match
-        #[arg(long, default_value_t = 5.0)]
+        /// Polls per second during a match (kept between 0.1 and 100)
+        #[arg(long, default_value_t = 5.0, value_parser = parse_hz)]
         hz: f64,
         /// Also append one JSON line per poll to this file
         #[arg(long)]
@@ -247,6 +247,14 @@ enum SoundCommand {
         #[arg(long)]
         decode: bool,
     },
+}
+
+/// The value of `live --hz`: any number (the poller keeps it in its range), but not `nan`
+fn parse_hz(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(hz) if !hz.is_nan() => Ok(hz),
+        _ => Err("expected a number of polls per second".to_string()),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]

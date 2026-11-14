@@ -77,6 +77,10 @@ Not in the scene, and why:
 - **Blocks not decoded:** `SCN`, `FRT`, `Obj`, `Wire`, splines, `wt3d`, `lmct`, and the scatter of
   objects by land class (`obj_plant_generate`), which the game generates at load time.
 
+The `HM2` heightmap states the size of its blocks as a shift (3 in War Thunder: 8 by 8 pixels). The reader
+handles shifts up to 5 and reads a larger one as 5 instead of refusing it; whether any real level has a shift
+above 5 has not been measured.
+
 The conversion is bounded by budgets that are not game data and live in `SceneOptions`: the colour map
 memory, the baked ground pictures (2 m per pixel where the heightmap is finer than the landmesh, 16 m
 elsewhere, spacings growing together past 384 MB), the terrain vertex count, and the object textures

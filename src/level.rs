@@ -836,7 +836,8 @@ fn parse_lts4(raw: &[u8]) -> Result<TriMesh> {
 /// version 0/1: one nested block of u16 heights (version 1: deltas along each row)
 /// ```
 ///
-/// Version 2 is compressed like BC4: the map is cut into square blocks (8x8 in War Thunder) with a
+/// Version 2 is compressed like BC4: the map is cut into square blocks (8x8 in War Thunder; a block shift
+/// above 5 is read as 5, see `decode_cblock`) with a
 /// u16 minimum and u16 range each, and one byte per pixel interpolating in that range. The bytes of
 /// a block are stored as deltas from the previous one. A pixel's height in metres is
 /// `height_min + height_scale * raw / 65535`; pixel (x, y) sits at
@@ -900,6 +901,9 @@ impl Heightmap {
 
 /// Decodes a version 2 (block-compressed, delta-coded) heightmap
 fn decode_cblock(r: &mut Reader, w: usize, h: usize, chunk_info: u32) -> Result<Vec<u16>> {
+    // A shift above 5 is read as 5 (blocks of 32 pixels a side; the game's are 8). That decodes a map the
+    // header does not describe, but it is what this reader has always done, and whether any real level has
+    // such a shift is unmeasured: refusing it waits for a run over the game's levels.
     let shift = (chunk_info & 0xFF).min(5) as usize;
     let hrb_sub = if chunk_info & 0xF00 != 0 { 1usize << ((chunk_info >> 8) & 0xF) } else { 0 };
     let chunk_bytes = (chunk_info & !0xFFF) as usize;
@@ -914,23 +918,25 @@ fn decode_cblock(r: &mut Reader, w: usize, h: usize, chunk_info: u32) -> Result<
     let levels = if hrb_sub > 0 { (w / hrb_sub).trailing_zeros() } else { 0 };
     let hrb_bytes = ((1usize << (2 * levels)) - 1) / 3 * 16;
 
-    let mut variance = vec![0u8; blocks * block_size];
-    let headers = if chunk_bytes == 0 {
+    // One byte per pixel, up to 256 MiB for the largest map. The buffer is made once the block before it has
+    // unpacked to its full size, not before any data is read: a header without its data reserves nothing.
+    // What is read, in which order, and how much is held at once are as they were.
+    let vlen = blocks * block_size;
+    let (headers, mut variance) = if chunk_bytes == 0 {
         let (codec, packed) = sub_block(r)?;
-        let vlen = variance.len();
         let raw = unpack(codec, packed, Some(header_bytes + vlen + hrb_bytes))?;
-        variance.copy_from_slice(&raw[header_bytes..header_bytes + vlen]);
-        raw[..header_bytes].to_vec()
+        (raw[..header_bytes].to_vec(), raw[header_bytes..header_bytes + vlen].to_vec())
     } else {
         let per_chunk = chunk_bytes / block_size;
         ensure!(per_chunk > 0, "heightmap chunk smaller than a block");
         let (codec, packed) = sub_block(r)?;
         let raw = unpack(codec, packed, Some(header_bytes + hrb_bytes))?;
+        let mut variance = vec![0u8; vlen];
         for chunk in variance.chunks_mut(per_chunk * block_size) {
             let (codec, packed) = sub_block(r)?;
             chunk.copy_from_slice(&unpack(codec, packed, Some(chunk.len()))?);
         }
-        raw[..header_bytes].to_vec()
+        (raw[..header_bytes].to_vec(), variance)
     };
 
     let mut out = vec![0u16; w * h];
@@ -1431,6 +1437,32 @@ mod tests {
                 let hm = Heightmap::parse(&hm_with(version, cell_size, true)).unwrap_or_else(|e| panic!("v{version} {cell_size:e}: {e}"));
                 assert_eq!((hm.version, hm.cell_size), (version, cell_size));
             }
+        }
+    }
+
+    #[test]
+    fn a_block_shift_above_5_is_read_as_5() {
+        // 64 by 64 samples stored as 32-pixel blocks (shift 5), under a header that says 64-pixel blocks (6).
+        // The reader lowers the shift to 5, so this decodes as if the header had said 5. It is kept that way
+        // until the game's levels have been checked for such a shift; this test is where to change it.
+        let data: Vec<u16> = (0..64 * 64).map(|i| (i % 251) as u16).collect();
+        let (headers, variance) = encode_cblock(&data, 64, 64, 5);
+        let body = nested(1, &zstd::bulk::compress(&[headers, variance].concat(), 3).unwrap());
+        for stated in [5, 6, 200] {
+            let file = [hm2_header(64, 64, stated), body.clone()].concat();
+            assert_eq!(Heightmap::parse(&file).unwrap().data, data, "shift {stated}");
+        }
+    }
+
+    #[test]
+    fn a_heightmap_without_its_data_reserves_nothing_for_it() {
+        // The largest size the header may claim, 16384 by 16384, and then no data at all: the 256 MiB of
+        // per-pixel bytes used to be zero-filled before the first byte of the block was looked at
+        for chunk_info in [3, 3 | 64 << 12] {
+            let header = hm2_header(16384, 16384, chunk_info);
+            let (result, largest) = crate::alloc_probe::largest_allocation(|| Heightmap::parse(&header).map(|_| ()));
+            assert!(result.is_err());
+            assert!(largest < 1 << 20, "chunk info {chunk_info:#x}: asked for {largest} bytes");
         }
     }
 

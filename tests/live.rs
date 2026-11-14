@@ -354,6 +354,20 @@ mod client {
     }
 
     #[test]
+    fn a_rate_that_is_no_number_does_not_panic() {
+        // `1.0 / NaN` is NaN, which `Duration::from_secs_f64` panics on; `clamp` passes NaN through
+        let client = || Client::new("http://127.0.0.1:9", Duration::from_millis(1));
+        assert_eq!(Poller::new(client(), f64::NAN).interval, Duration::from_secs(10), "the slowest rate");
+        assert_eq!(Poller::new(client(), f64::INFINITY).interval, Duration::from_millis(10));
+        assert_eq!(Poller::new(client(), -3.0).interval, Duration::from_secs(10));
+        assert_eq!(Poller::new(client(), 20.0).interval, Duration::from_millis(50));
+        // and the command line refuses it as an argument error
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wt-unpack")).args(["live", "--mock", "--hz", "nan", "--count", "1"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--hz"), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
     fn poller_keeps_its_rate() {
         let server = MockServer::start(mock::tank_match).unwrap();
         let t = Instant::now();

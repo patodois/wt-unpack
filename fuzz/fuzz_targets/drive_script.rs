@@ -1,5 +1,5 @@
 #![no_main]
-//! `tank::parse_script`: the `--script` text of a scripted drive.
+//! `tank::parse_script`: the text of a scripted drive (the viewer's `--auto`).
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

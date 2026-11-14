@@ -386,6 +386,16 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_with_no_channels_is_refused_before_anything_divides_by_them() {
+        // A channels chunk can say 0. `sound check --decode` divides the decoded length by the channel count
+        // right after this call, so it must not succeed
+        let s = Sample { name: None, rate: 48000, channels: 0, frames: 1, loop_points: None, vorbis_setup: Some(0xA722_97FF), data: 0..0 };
+        let err = decode(&s, &[]).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(err.contains("header"), "{err:?}");
+        assert!(write_ogg(&s, &[], std::io::sink()).is_err());
+    }
+
+    #[test]
     fn ogg_crc_check_value() {
         assert_eq!(ogg_crc(b"123456789"), 0x89A1_897F);
     }

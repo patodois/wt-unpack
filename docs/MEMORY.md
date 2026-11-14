@@ -18,10 +18,11 @@ them. What the provider does about it:
   so the footprint of a process that loaded a level stays near its peak. `drop(scene); wt.clear_caches();` is
   what a consumer should do when it is done with a level;
 - the peak is lower. The loader no longer keeps a second copy of every object texture (a texture is decoded once
-  and the later materials copy it from the first that holds it), parses only the needed entries of `riDesc.bin`
-  instead of holding its whole tree (about 200 MB), shares the paths of the texture index, and trims the meshes'
-  spare capacity. The scene is byte for byte the same (checked with a hash of every mesh, image and
-  transform).
+  and the later materials copy it from the first that holds it), keeps only the entries of `riDesc.bin` the
+  level needs instead of holding its whole tree (about 200 MB) for the rest of the load (the file is still parsed
+  in full; the other entries are dropped before the models are built), shares the paths of the texture index,
+  and trims the meshes' spare capacity. The scene is byte for byte the same (checked with a hash of every
+  mesh, image and transform).
 
 Berlin, measured with `/usr/bin/time -l` on a Mac that was also busy with other work, so the OS-reported
 numbers move between runs:

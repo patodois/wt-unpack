@@ -636,6 +636,14 @@ fn level_real(settings: &Block, key: &str) -> Option<f32> {
     settings.params.iter().find(|(n, _)| n == key).and_then(|(_, v)| if let Value::Real(r) = v { Some(*r) } else { None })
 }
 
+/// World rectangle `[x0, z0, x1, z1]` of a landmesh cell: `origin` is the first cell in cells, `size` a cell in metres
+fn landmesh_tile(origin: [i32; 2], cell: [i32; 2], size: f32) -> [f32; 4] {
+    // In 64 bits: the origin is whatever the file says, and origin + cell must not overflow
+    let corner = |k: usize| (i64::from(origin[k]) + i64::from(cell[k])) as f32 * size;
+    let (x0, z0) = (corner(0), corner(1));
+    [x0, z0, x0 + size, z0 + size]
+}
+
 /// The ground: one mesh per landmesh cell, textured when the ground material can be read
 fn build_terrain(
     level: &Level,
@@ -672,8 +680,7 @@ fn build_terrain(
             let mut t = Vec::new();
             for cz in 0..lm.cells[1] {
                 for cx in 0..lm.cells[0] {
-                    let (x0, z0) = ((lm.origin[0] + cx) as f32 * s, (lm.origin[1] + cz) as f32 * s);
-                    t.push([x0, z0, x0 + s, z0 + s]);
+                    t.push(landmesh_tile(lm.origin, [cx, cz], s));
                 }
             }
             t
@@ -1121,6 +1128,15 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!((m[0].class.as_str(), m[0].color.as_deref(), m[0].atest, m[0].two_sided), ("rendinst_simple", Some("b*"), Some(127), true));
         assert!(skipped_class("rendinst_deferred_decal") && skipped_class("rendinst_baked_impostor") && skipped_class("rendinst_facing_leaves") && !skipped_class("rendinst_simple") && !skipped_class("rendinst_tree"));
+    }
+
+    #[test]
+    fn landmesh_tiles_of_an_origin_at_the_edge_of_i32_do_not_overflow() {
+        // The origin is an i32 of the file; origin + cell overflowed (a panic in debug builds)
+        assert_eq!(landmesh_tile([-2, 3], [1, 0], 64.0), [-64.0, 192.0, 0.0, 256.0]);
+        let far = landmesh_tile([i32::MAX, i32::MIN], [5, 0], 2.0);
+        assert_eq!(far[0], (i64::from(i32::MAX) + 5) as f32 * 2.0);
+        assert_eq!(far[1], i32::MIN as f32 * 2.0);
     }
 
     #[test]

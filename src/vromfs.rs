@@ -6,7 +6,7 @@
 //! u32 label        "VRFs" or "VRFx"
 //! u32 target       platform tag, e.g. "\0\0PC"
 //! u32 full_size    size of the unpacked body
-//! u32 hw32         bits 0..30 packed size (0 = stored), bit 30 zstd, bit 31 signed
+//! u32 hw32         bits 0 to 29 packed size (0 = stored), bit 30 zstd, bit 31 signed
 //! [VRFx only] u16 ext_size, u16 flags, u32 version, ...   (ext_size bytes total)
 //! body             packed_size (or full_size when stored) bytes
 //! [16] md5         digest of the unpacked body

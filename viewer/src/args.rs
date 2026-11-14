@@ -87,6 +87,20 @@ pub fn check(args: &[String]) -> Result<Action, String> {
             i += 1;
         }
     }
+    // A script only does something in drive mode: said here instead of being read and ignored
+    let has = |flag: &str| {
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == flag {
+                return true;
+            }
+            i += if VALUE_FLAGS.contains(&args[i].as_str()) { 2 } else { 1 };
+        }
+        false
+    };
+    if has("--auto") && !has("--drive") {
+        return Err("--auto needs --drive".to_string());
+    }
     match positional {
         0 | 2 => Ok(Action::Run),
         n => Err(format!(
@@ -124,6 +138,17 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn a_script_without_drive_mode_is_refused() {
+        // The help says `--auto` needs `--drive`; without it the script used to be read and then ignored
+        assert_eq!(check_line("--auto W:20"), Err("--auto needs --drive".to_string()));
+        assert_eq!(check_line("pack.grp model --auto W:20 --turret 60"), Err("--auto needs --drive".to_string()));
+        assert_eq!(check_line("--auto W:20 --drive"), Ok(Action::Run));
+        assert_eq!(check_line("--drive pack.grp model --auto W:20"), Ok(Action::Run));
+        // The value of another option is not the option
+        assert_eq!(check_line("--unit --auto"), Ok(Action::Run));
     }
 
     #[test]

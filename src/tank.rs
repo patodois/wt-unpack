@@ -360,7 +360,8 @@ fn pick_unit<'a>(model: &str, candidates: impl Iterator<Item = (&'a str, &'a str
 }
 
 /// Which unit uses which 3D model, read once from `aces.vromfs.bin`: a few kilobytes, so a program that
-/// looks up many vehicles scans the units once instead of for every lookup.
+/// looks up many vehicles scans the units once instead of for every lookup. The index holds names only:
+/// [`load_unit`] reads the archive again for each unit's data.
 #[derive(Debug, Clone, Default)]
 pub struct UnitIndex {
     /// `(unit, model)`, sorted by unit

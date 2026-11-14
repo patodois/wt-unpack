@@ -34,7 +34,7 @@ wt-unpack check-conformance --filter germ_he_115 -v             # rewrite-bridge
 ## Using wt-unpack from another game (rewrite-bridge)
 
 A game rewrite that wants a War Thunder tank to drive, with its turret, wheels and tracks working from the
-game's data, needs no knowledge of Dagor's formats. `WarThunder` gives it three things, all from the player's
+game's data, needs no knowledge of Dagor's formats. `WarThunder` gives it four things, all from the player's
 installed copy:
 
 - **The model and its sockets.** `load_animated(id)` returns the model plus a `Socket` for every node worth

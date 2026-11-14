@@ -808,9 +808,11 @@ pub struct Poller {
 
 #[cfg(feature = "live")]
 impl Poller {
-    /// `rate_hz` polls per second in a match.
+    /// `rate_hz` polls per second in a match, kept between 0.1 and 100; a rate that is not a number polls at
+    /// the slowest.
     pub fn new(client: Client, rate_hz: f64) -> Self {
-        let interval = Duration::from_secs_f64(1.0 / rate_hz.clamp(0.1, 100.0));
+        // `max` and `min` drop a NaN where `clamp` would pass it on to a `Duration` that panics on it
+        let interval = Duration::from_secs_f64(1.0 / rate_hz.max(0.1).min(100.0));
         Self {
             client,
             interval,

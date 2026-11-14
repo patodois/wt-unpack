@@ -410,6 +410,9 @@ decoders are pure Rust.
 - Textures: a patched texture pack (`patch/content/...`) now wins on Windows too. The test looked for the text
   `/patch/` in the path, which Windows writes with `\`, and it took a game installed below any folder named
   `patch` for all patched.
+- `model` writes every texture of the export. It used to keep any PNG of the same name already in the folder,
+  so an export into a folder used before could reference textures of an older game version or a half-written
+  file of an interrupted run.
 
 ## Changes in 0.5.1
 

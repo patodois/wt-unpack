@@ -94,10 +94,9 @@ pub fn write(vehicle: &Vehicle, out_dir: &Path) -> Result<()> {
             file = format!("{safe}_{n}.png");
             n += 1;
         }
-        let path = out_dir.join(&file);
-        if !path.exists() {
-            write_png(&path, img)?;
-        }
+        // Always written: a file of that name already in the folder is from another run (an older game or tool
+        // version, or an export that was interrupted), not this texture
+        write_png(&out_dir.join(&file), img)?;
         by_name.insert(texture, images.len());
         images.push(json!({ "uri": file }));
         Ok(images.len() - 1)
@@ -211,6 +210,25 @@ mod tests {
                 .collect(),
             nodes: vec![Node { name: String::new(), parent: None, pivot: [0.0; 3] }],
         }
+    }
+
+    #[test]
+    fn textures_left_by_an_earlier_export_are_written_again() {
+        let out = std::env::temp_dir().join(format!("wt-unpack-gltf-stale-{}", std::process::id()));
+        fs::create_dir_all(&out).unwrap();
+        // An older export, or one that was interrupted, left files under the names this one will use
+        fs::write(out.join("paint_c.png"), b"half a PNG").unwrap();
+        fs::write(out.join("paint_n_normal.png"), b"").unwrap();
+        // Two materials share the textures: they are still written once and referenced twice
+        let vehicle = textured("box", &[("paint_c", Some("paint_n")), ("paint_c", Some("paint_n"))]);
+        write(&vehicle, &out).unwrap();
+        let decodes = |file: &str| png::Decoder::new(std::io::BufReader::new(fs::File::open(out.join(file)).unwrap())).read_info().is_ok();
+        let all = ["paint_c.png", "paint_n_metal_rough.png", "paint_n_normal.png"].map(decodes);
+        let doc: Value = serde_json::from_slice(&fs::read(out.join("box.gltf")).unwrap()).unwrap();
+        fs::remove_dir_all(&out).unwrap();
+        assert_eq!(all, [true; 3], "the files of this export must be the ones it wrote");
+        assert_eq!(doc["images"].as_array().unwrap().len(), 3);
+        assert_eq!(doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"], doc["materials"][1]["pbrMetallicRoughness"]["baseColorTexture"]["index"]);
     }
 
     /// Every file under `dir`, as paths relative to it with `/`

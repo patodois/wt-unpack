@@ -407,6 +407,9 @@ decoders are pure Rust.
   `.._.._x.png` inside `-o` instead of two folders above it. On Windows a device name such as `NUL` gets a `_`
   in front. Every other name gives the file it always gave. `extract` is unchanged: it already refused paths
   that leave the output folder.
+- Textures: a patched texture pack (`patch/content/...`) now wins on Windows too. The test looked for the text
+  `/patch/` in the path, which Windows writes with `\`, and it took a game installed below any folder named
+  `patch` for all patched.
 
 ## Changes in 0.5.1
 

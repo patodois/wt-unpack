@@ -178,7 +178,7 @@ pub fn texture_index(game: &Path) -> Result<TextureIndex> {
     let mut packs = Vec::new();
     walk(game, &mut packs);
     // Patched packs override the originals
-    packs.sort_by_key(|p| p.to_string_lossy().contains("/patch/"));
+    packs.sort_by_key(|p| is_patched(game, p));
     let mut index = HashMap::new();
     for path in packs {
         let mut f = fs::File::open(&path)?;
@@ -210,6 +210,14 @@ pub fn texture_index(game: &Path) -> Result<TextureIndex> {
         }
     }
     Ok(index)
+}
+
+/// Whether a pack found under the game folder is a patched copy: one of its folders below the game folder is
+/// `patch`. Path components are compared, not the path's text, which has `\` on Windows and may hold "patch"
+/// above the game folder.
+fn is_patched(game: &Path, pack: &Path) -> bool {
+    let below = pack.strip_prefix(game).unwrap_or(pack);
+    below.parent().is_some_and(|folders| folders.components().any(|c| c.as_os_str() == "patch"))
 }
 
 /// Maps a game file into memory. Packs reach 1.2 GB; mapped, only the pages actually read are loaded,
@@ -739,6 +747,55 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         assert!(err.contains("claims a header"), "{err}");
         assert!(largest < 1 << 24, "asked for {largest} bytes");
+    }
+
+    #[test]
+    fn a_pack_is_patched_by_its_folders_under_the_game_not_by_the_text_of_its_path() {
+        // Paths built with `join`, so the separators are the system's (`\` on Windows)
+        let game = Path::new("games").join("War Thunder");
+        let res = Path::new("content").join("base").join("res");
+        assert!(is_patched(&game, &game.join("patch").join(&res).join("a.dxp.bin")));
+        assert!(!is_patched(&game, &game.join(&res).join("a.dxp.bin")));
+        // A file or folder that merely has "patch" in its name is not the patch folder
+        assert!(!is_patched(&game, &game.join(&res).join("patch.dxp.bin")));
+        assert!(!is_patched(&game, &game.join("content").join("patch_notes").join("a.dxp.bin")));
+        // A game installed below a folder called "patch" does not make every pack a patched one
+        let game = Path::new("mnt").join("patch").join("game");
+        assert!(!is_patched(&game, &game.join(&res).join("a.dxp.bin")));
+        assert!(is_patched(&game, &game.join("patch").join(&res).join("a.dxp.bin")));
+    }
+
+    /// A texture pack with one texture `name`, as much of it as the index reads
+    fn tiny_pack(name: &str) -> Vec<u8> {
+        let mut dump = Vec::new();
+        for v in [24u32, 1, 0, 0, 32, 0] {
+            dump.extend_from_slice(&v.to_le_bytes()); // name table at 24, one entry, headers at 32
+        }
+        dump.extend_from_slice(&64u64.to_le_bytes()); // the name's offset
+        dump.extend_from_slice(&[1; 32]); // a header that is not a placeholder
+        dump.extend_from_slice(name.as_bytes());
+        dump.extend_from_slice(b"*\0");
+        let mut pack = b"DxP2".to_vec();
+        pack.extend_from_slice(&[0; 8]);
+        pack.extend_from_slice(&(dump.len() as u32).to_le_bytes());
+        pack.extend(dump);
+        pack
+    }
+
+    #[test]
+    fn the_patched_copy_of_a_texture_wins_wherever_the_game_is_installed() {
+        // The game folder sits under a folder named "patch", which used to mark every pack as patched and
+        // leave the winner to the order the folders happened to be listed in
+        let root = std::env::temp_dir().join(format!("wt-unpack-patch-test-{}", std::process::id()));
+        let game = root.join("patch").join("game");
+        let res = Path::new("content").join("base").join("res");
+        for dir in [game.join(&res), game.join("patch").join(&res), game.join("zz").join(&res)] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("a.dxp.bin"), tiny_pack("tex_c")).unwrap();
+        }
+        let index = texture_index(&game);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(&*index.unwrap()["tex_c"], game.join("patch").join(&res).join("a.dxp.bin"));
     }
 
     /// A skin vertex buffer of 8-byte vertices holding bone slots and weights as the E3DCOLORs of texture
